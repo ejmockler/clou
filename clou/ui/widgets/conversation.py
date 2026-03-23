@@ -12,6 +12,7 @@ and the tail is only re-rendered at most every 100 ms.
 
 from __future__ import annotations
 
+from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
 from textual.app import ComposeResult
@@ -49,6 +50,14 @@ _WORKING_TICKS_PER_FRAME = 2  # ticks between frame advances (tick = 100ms → 2
 _DRAG_SCROLL_EDGE = 3  # rows from container edge to trigger auto-scroll
 _DRAG_SCROLL_INTERVAL = 0.05  # seconds between scroll steps during drag
 _DRAG_SCROLL_SPEED = 2  # lines per scroll step
+
+
+def _md_to_text(source: str, width: int) -> Text:
+    """Render Markdown to a styled Text — preserves formatting, enables selection."""
+    console = Console(width=width, force_terminal=True, highlight=False)
+    with console.capture() as capture:
+        console.print(Markdown(source), end="")
+    return Text.from_ansi(capture.get())
 
 
 def _tool_summary(name: str, tool_input: dict[str, object]) -> str:
@@ -207,9 +216,19 @@ class ConversationWidget(Widget):
         history.scroll_end(animate=False)
 
     def _width(self) -> int:
-        """Return usable content width."""
+        """Return usable content width.
+
+        Falls back to app width when the history container hasn't
+        laid out yet (e.g. just transitioned from display: none).
+        """
         history = self.query_one("#history", VerticalScroll)
-        return history.content_size.width or history.size.width or 80
+        w = history.content_size.width or history.size.width
+        if not w:
+            try:
+                w = self.app.size.width - 4
+            except Exception:
+                pass
+        return w or 80
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -344,7 +363,7 @@ class ConversationWidget(Widget):
         self._end_initializing()
         self._stop_working()
         self._write_horizon()
-        self._append(Markdown(msg.text))
+        self._append(_md_to_text(msg.text, self._width()))
         self.query_one("#tail", Static).update("")
 
     def on_clou_stream_chunk(self, msg: ClouStreamChunk) -> None:
@@ -367,7 +386,7 @@ class ConversationWidget(Widget):
         self._last_completed_content = self._stream_buffer
         if self._stream_buffer:
             self._write_horizon()
-            self._append(Markdown(self._stream_buffer))
+            self._append(_md_to_text(self._stream_buffer, self._width()))
         self._stream_buffer = ""
         self._stream_uuid = ""
         self._stream_dirty = False
