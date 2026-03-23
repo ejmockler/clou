@@ -176,7 +176,8 @@ class WakeIndicator(Widget):
         self._lines: list[tuple[str, float]] = []  # (text, _) — kept for history promotion
 
     def compose(self) -> ComposeResult:
-        yield VerticalScroll(id="wake-activity")
+        with VerticalScroll(id="wake-activity"):
+            yield Static("", id="wake-spacer")
         yield WakeWave(id="wake-wave")
 
     @property

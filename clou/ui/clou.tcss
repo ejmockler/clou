@@ -86,6 +86,10 @@ Screen {
     scrollbar-size-vertical: 0;
 }
 
+#wake-spacer {
+    height: 1fr;
+}
+
 #wake-wave {
     height: 1;
     background: $surface-deep;
