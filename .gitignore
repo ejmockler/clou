@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# Clou runtime state (sessions, checkpoints — not source)
+.clou/active/
+.clou/sessions/
+.clou/milestones/
+.clou/requests.md
+.clou/exports/
+
+# Claude Code
+.claude/

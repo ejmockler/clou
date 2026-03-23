@@ -1,0 +1,292 @@
+"""Hook enforcement for Clou's orchestrator.
+
+Two enforcement mechanisms:
+1. Write boundary enforcement (PreToolUse) — each tier can only write
+   to specific .clou/ paths.
+2. Compose.py validation (PostToolUse) — after a coordinator writes to
+   compose.py, validate the call graph.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from clou.graph import validate
+
+type HookCallback = Callable[..., Awaitable[dict[str, Any]]]
+
+WRITE_PERMISSIONS: dict[str, list[str]] = {
+    "supervisor": [
+        "project.md",
+        "roadmap.md",
+        "requests.md",
+        "milestones/*/milestone.md",
+        "milestones/*/requirements.md",
+        "milestones/*/escalations/*.md",
+        "active/supervisor.md",
+    ],
+    "coordinator": [
+        "milestones/*/compose.py",
+        "milestones/*/status.md",
+        "milestones/*/decisions.md",
+        "milestones/*/escalations/*.md",
+        "milestones/*/phases/*/phase.md",
+        "active/coordinator.md",
+        "services/*/setup.md",
+        "services/*/.env.example",
+        "services/*/status.md",
+    ],
+    "worker": [
+        "milestones/*/phases/*/execution.md",
+    ],
+    "verifier": [
+        "milestones/*/phases/verification/execution.md",
+        "milestones/*/handoff.md",
+    ],
+    "assessor": [
+        "milestones/*/assessment.md",
+    ],
+}
+
+_WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit"})
+
+
+@dataclass(frozen=True, slots=True)
+class HookConfig:
+    """A hook configuration pairing a matcher pattern with callbacks."""
+
+    matcher: str | None
+    hooks: list[HookCallback]
+
+
+def _extract_file_path(tool_input: dict[str, Any]) -> str | None:
+    """Extract file_path from a tool's input dict."""
+    path: object = tool_input.get("file_path")
+    if isinstance(path, str):
+        return path
+    return None
+
+
+def _is_clou_path(file_path: str, project_dir: Path) -> str | None:
+    """If file_path is inside .clou/, return the relative path. Else None."""
+    clou_dir = project_dir / ".clou"
+    try:
+        resolved = Path(file_path).resolve()
+        relative = resolved.relative_to(clou_dir.resolve())
+    except ValueError:
+        return None
+    return str(relative)
+
+
+def _make_pre_hook(
+    tier: str,
+    project_dir: Path,
+    *,
+    milestone: str | None = None,
+    agent_tier_map: dict[str, str] | None = None,
+) -> HookCallback:
+    """Create a PreToolUse hook callback for write boundary enforcement.
+
+    When *agent_tier_map* is provided, subagent writes are enforced against
+    the subagent's own tier permissions (looked up via ``agent_type`` in the
+    hook input).  This closes the gap where ``AgentDefinition`` has no
+    ``hooks`` field — the coordinator's hook enforces on behalf of its
+    subagents using the correct tier.
+    """
+    lead_scoped = _scoped_permissions(tier, milestone)
+
+    # Pre-compute scoped permissions for each subagent tier.
+    sub_scoped: dict[str, list[str]] = {}
+    if agent_tier_map:
+        for agent_type, sub_tier in agent_tier_map.items():
+            sub_scoped[agent_type] = _scoped_permissions(sub_tier, milestone)
+
+    async def pre_hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        tool_name: object = input_data.get("tool_name")
+        if not isinstance(tool_name, str) or tool_name not in _WRITE_TOOLS:
+            return {}
+
+        tool_input: object = input_data.get("tool_input")
+        if not isinstance(tool_input, dict):
+            return {}
+
+        file_path = _extract_file_path(tool_input)
+        if file_path is None:
+            return {}
+
+        relative = _is_clou_path(file_path, project_dir)
+        if relative is None:
+            # Writes outside .clou/ are always allowed.
+            return {}
+
+        # Determine which tier's permissions to enforce.
+        # If agent_type is present (subagent context), enforce that tier's
+        # permissions.  Unknown agent types are DENIED (fail-closed) — not
+        # granted the lead agent's broader permissions.
+        agent_type = input_data.get("agent_type")
+        if isinstance(agent_type, str) and agent_type and sub_scoped:
+            # Subagent context with a configured tier map — enforce per-tier.
+            if agent_type in sub_scoped:
+                scoped = sub_scoped[agent_type]
+                effective_tier = agent_tier_map[agent_type]  # type: ignore[index]
+            else:
+                # Unknown subagent type — block all .clou/ writes.
+                return {
+                    "decision": "block",
+                    "reason": (
+                        f"Unknown agent type '{agent_type}' cannot write "
+                        f"to .clou/{relative}"
+                    ),
+                }
+        else:
+            # No agent_type, no tier map, or non-string — lead agent's permissions.
+            scoped = lead_scoped
+            effective_tier = tier
+
+        if any(fnmatch.fnmatch(relative, p) for p in scoped):
+            return {}
+
+        return {
+            "decision": "block",
+            "reason": f"{effective_tier} tier cannot write to .clou/{relative}",
+        }
+
+    return pre_hook
+
+
+def _make_post_hook(
+    project_dir: Path,
+) -> HookCallback:
+    """Create a PostToolUse hook callback for compose.py validation."""
+
+    async def post_hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        tool_name: object = input_data.get("tool_name")
+        if not isinstance(tool_name, str) or tool_name not in _WRITE_TOOLS:
+            return {}
+
+        tool_input: object = input_data.get("tool_input")
+        if not isinstance(tool_input, dict):
+            return {}
+
+        file_path = _extract_file_path(tool_input)
+        if file_path is None:
+            return {}
+
+        resolved = Path(file_path).resolve()
+        if resolved.name != "compose.py":
+            return {}
+
+        clou_dir = project_dir / ".clou"
+        try:
+            resolved.relative_to(clou_dir.resolve())
+        except ValueError:
+            return {}
+
+        # Read the file and validate.
+        try:
+            source = resolved.read_text()
+        except OSError:
+            return {}
+
+        errors = validate(source)
+        if not errors:
+            return {}
+
+        error_list = "\n".join(errors)
+        return {
+            "hookSpecificOutput": {
+                "message": "Composition errors:\n"
+                + error_list
+                + "\nFix the call graph."
+            }
+        }
+
+    return post_hook
+
+
+def _scoped_permissions(tier: str, milestone: str | None) -> list[str]:
+    """Return write permission patterns, optionally scoped to a milestone.
+
+    When *milestone* is provided, ``milestones/*`` patterns are narrowed to
+    ``milestones/{milestone}`` — preventing a coordinator from writing to
+    another milestone's golden context.
+    """
+    patterns = WRITE_PERMISSIONS.get(tier, [])
+    if milestone is None:
+        return patterns
+
+    scoped: list[str] = []
+    for p in patterns:
+        if p.startswith("milestones/*/"):
+            scoped.append(p.replace("milestones/*/", f"milestones/{milestone}/", 1))
+        else:
+            scoped.append(p)
+    return scoped
+
+
+#: Maps AgentDefinition keys to their enforcement tier.
+#: Used by the coordinator's PreToolUse hook to enforce subagent-specific
+#: write boundaries (since AgentDefinition has no ``hooks`` field).
+AGENT_TIER_MAP: dict[str, str] = {
+    "implementer": "worker",
+    "verifier": "verifier",
+    "assessor": "assessor",
+}
+
+
+def build_hooks(
+    tier: str,
+    project_dir: Path,
+    *,
+    milestone: str | None = None,
+) -> dict[str, list[HookConfig]]:
+    """Build tier-specific hooks for write boundary enforcement.
+
+    Args:
+        tier: Agent tier (supervisor, coordinator, worker, verifier).
+        project_dir: Project root directory.
+        milestone: When provided, write boundary patterns are scoped to this
+            milestone — ``milestones/*`` becomes ``milestones/{milestone}``.
+
+    Returns a hooks dict in the format expected by ClaudeAgentOptions:
+    {
+        "PreToolUse": [HookConfig(matcher=..., hooks=[callback])],
+        "PostToolUse": [HookConfig(matcher=..., hooks=[callback])],
+    }
+    """
+    # Coordinator hooks also enforce subagent write boundaries.
+    agent_map = AGENT_TIER_MAP if tier == "coordinator" else None
+
+    matcher = "Write|Edit|MultiEdit"
+    hooks: dict[str, list[HookConfig]] = {
+        "PreToolUse": [
+            HookConfig(
+                matcher=matcher,
+                hooks=[_make_pre_hook(
+                    tier, project_dir,
+                    milestone=milestone,
+                    agent_tier_map=agent_map,
+                )],
+            ),
+        ],
+    }
+
+    # Only add composition validation for coordinators.
+    if tier == "coordinator":
+        hooks["PostToolUse"] = [
+            HookConfig(matcher=matcher, hooks=[_make_post_hook(project_dir)]),
+        ]
+
+    return hooks
