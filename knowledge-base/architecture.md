@@ -1,0 +1,205 @@
+# Clou Architecture
+
+## Origin
+
+Clou emerged from a whiteboard with two halves:
+
+**Left side** — a hierarchical project scaffolding with three nested tiers (Project → Milestones → Phases), each with human-in-the-loop icons and recursive arrows suggesting self-similar structure. Each tier produces markdown artifacts and loops back into itself.
+
+**Right side** — an agent runtime reasoning loop: environment feeds into User Intention, which flows to scope determination, "what next?", task graph consultation, and "journey complete?" checking.
+
+The critical insight: **the planning layer is the bottleneck, not code generation.** The project management ontology (roadmaps, milestones, phases) should be a first-class, persistent, human-readable structure the agent maintains — not an ephemeral chain-of-thought that vanishes after execution.
+
+## System Structure
+
+```
+clou_orchestrator.py (Python, Claude Agent SDK)
+    │
+    ├─ ClaudeSDKClient → Supervisor (agent session, user-facing)
+    │                         │
+    │                         │ calls clou_spawn_coordinator MCP tool
+    │                         ↓
+    ├─ ClaudeSDKClient → Coordinator (agent session, per milestone)
+    │                         │
+    │                         │ native Agent Teams
+    │                         ↓
+    │                    Agent Teams (worker agents)
+    │
+    ├─ Hook enforcement (write boundaries per tier)
+    ├─ Token tracking (per session, cumulative)
+    ├─ Context exhaustion monitoring (restart from checkpoint)
+    └─ Custom MCP tools (clou_spawn_coordinator, clou_status, clou_init)
+```
+
+The orchestrator is a thin Python script (~500-800 lines) that manages session lifecycles via the Claude Agent SDK. It is invisible plumbing — the user interacts with the supervisor. See [Orchestrator](./integration/orchestrator.md) for implementation details.
+
+## Three-Tier Session Hierarchy
+
+### Tier 1: Supervisor
+
+The user's direct interface. An agent session that is always available for conversation.
+
+**Owns:** Project-level planning — roadmap, milestone creation, user request processing, milestone completion evaluation.
+
+**Does not:** Touch code. Manage agent teams. See inter-agent messages.
+
+**Produces:** `project.md`, `roadmap.md`, milestone directories with specs and requirements.
+
+**Key characteristic:** The supervisor's context window is preserved for strategic reasoning by delegating all implementation detail to the coordinator.
+
+### Tier 2: Coordinator
+
+An agent session scoped to a single milestone's lifecycle. Spawned by the supervisor when a milestone begins.
+
+**Owns:** Task planning (building the DAG), agent team orchestration, quality assessment (Brutalist), critical evaluation of feedback, escalation authoring, verification orchestration.
+
+**Overall: a judgment loop, not a dispatch loop.** The coordinator doesn't just assign work and collect results. It evaluates the evaluator (Brutalist), makes calls within its delegated authority, logs reasoning, and escalates what it can't resolve. The judgment is decomposed across cycle types: PLAN (decomposition), ASSESS (evaluation), VERIFY (experience assessment). EXECUTE is the one cycle where judgment is deliberately absent — it is a mechanical dispatch loop following compose.py's call graph (DB-10).
+
+**Produces:** `compose.py` (typed-function call graph), `decisions.md`, `status.md`, phase directories, escalations.
+
+**Exit condition:** ALL of: phases complete, acceptance criteria met, verification phase produced `handoff.md` with confirmed golden paths, no blocking escalations, dev environment running.
+
+### Tier 3: Agent Teams
+
+One agent per compose.py function, spawned by the coordinator via the SDK's Agent tool during EXECUTE cycles. Each agent gets a fresh context scoped to a single function signature.
+
+**Owns:** Code. Tests. Execution artifacts.
+
+**Communicates:** Stigmergic coordination through the filesystem only. Workers write code to the codebase and results to execution.md. No mailbox, no SendMessage, no TaskCreate, no inter-worker communication. The codebase IS the inter-agent communication channel — typed dependencies in compose.py mean each agent finds prior agents' artifacts via function argument types.
+
+**Produces:** `execution.md` within assigned phases, codebase changes.
+
+**Lifecycle:** Per-EXECUTE-cycle. Fresh agents each cycle. Teams end when the coordinator session exits at cycle boundary.
+
+**Key characteristic:** Agent teams are the only tier that touches the codebase directly.
+
+## Key Architectural Decisions
+
+These decisions were made during the design conversation and are settled (not open decision boundaries).
+
+### 1. The supervisor never sees inter-agent messages
+
+The coordinator compresses team activity into structured artifacts (decisions, escalations, execution results). This preserves the supervisor's context window for strategic reasoning. If the supervisor needs to understand why something went sideways, `decisions.md` is the interface — not raw message logs.
+
+**Exception:** Escalation. The coordinator can write structured escalations that the supervisor checks. But escalations are engineered artifacts with analysis and recommendations, not raw passthrough.
+
+### 2. Coordinators run synchronously by default
+
+Each milestone depends on the previous. The roadmap is a linked list. The architecture supports future parallel coordinators on milestones the supervisor deems independent, but this requires:
+- A dependency graph at the roadmap level (not yet specified)
+- Independence analysis by the supervisor
+- No direct coordinator-to-coordinator communication (by design)
+
+**Starting constraint:** Serial execution. Earn parallel.
+
+### 3. Brutalist is essential infrastructure
+
+Brutalist MCP is not advisory — it's a blocking requirement. If Brutalist is unavailable, the coordinator cannot proceed past ASSESS. This is a hard error that escalates to the supervisor and user. The coordinator critically evaluates Brutalist feedback (not deferential, not reflexive), but the evaluation requires Brutalist to be present.
+
+### 4. The coordinator builds the task DAG
+
+The supervisor says "here's the milestone, here are the requirements, here's the acceptance criteria." The coordinator reads the codebase (through its agent teams), figures out the actual dependency structure of the work, builds the task graph, and orchestrates execution.
+
+**Rationale:** The coordinator has access to the codebase through agent teams and can construct the graph empirically rather than speculatively. The supervisor would be guessing.
+
+### 5. Session-per-cycle with golden context as sole compaction
+
+Each coordinator cycle (PLAN, EXECUTE, ASSESS, VERIFY, EXIT) is a fresh `ClaudeSDKClient` session. The golden context is the only mechanism for transferring state between cycles — no reliance on SDK context compression, session persistence, or conversational continuity. The orchestrator reads `active/coordinator.md` between cycles, determines the next cycle type, constructs a targeted prompt with pointers to the specific golden context files needed, and spawns a fresh session. Git commits happen at phase completion boundaries.
+
+This unifies four roles of golden context: human-legibility surface, crash recovery, inter-cycle state transfer, and compaction. Same files, same format, four purposes.
+
+### 6. Light system prompts + per-cycle protocol files
+
+Each tier's system prompt is a small XML template (~800–2,000 tokens) containing an identity anchor, critical invariants, and a pointer to a protocol file. The full behavioral specification lives in protocol files the agent reads as its first action. The coordinator has per-cycle-type protocol files (PLAN, EXECUTE, ASSESS, VERIFY, EXIT) — each session reads exactly one.
+
+This is grounded in research (see [Research Foundations](./research-foundations.md)): system prompts have no architectural privilege, instruction density degrades past a threshold, decomposition outperforms monolithic prompts, and first tokens are architecturally privileged (attention sinks). No CLAUDE.md — all prompt content via SDK `system_prompt`.
+
+### 7. Brutalist is quality gate; coordinator is judge
+
+Brutalist MCP provides raw, unsweetened feedback from multiple model perspectives. The coordinator evaluates this feedback against the milestone's requirements and constraints:
+- Valid feedback → rework cycle
+- Invalid feedback → override logged in `decisions.md` with reasoning
+- Feedback exceeding coordinator authority → escalation to supervisor
+
+The coordinator's relationship with Brutalist is critical, not deferential.
+
+### 8. Verification is a full phase
+
+Not a step. Not a test suite. A complete phase with its own `phase.md`, agent team, and three stages:
+1. Environment materialization (real services, no mocks of your own infra)
+2. Agentic path walking (Playwright for web, HTTP for APIs, CLI invocation for tools)
+3. Handoff preparation (running environment, guided walk-through for the user)
+
+### 9. The orchestrator is invisible plumbing
+
+The user runs `python clou/orchestrator.py` (or a simple `clou` CLI entry point). This starts the supervisor session. The user interacts with the supervisor — they never see the orchestrator. Lifecycle commands (`clou_init`, `clou_status`) are MCP tools the supervisor calls, handled by the orchestrator in-process. The golden context structure, the protocols, and the prompts are the product. The orchestrator is infrastructure.
+
+### 10. Error recovery: fail loud, validate structure, coordinator-only commits
+
+Crashes and infrastructure failures escalate to the supervisor and user — no silent retries. The orchestrator validates golden context structure at cycle boundaries (revert and retry on failure). Agent teams write code but only the coordinator commits to git, ensuring tractable, reviewed deltas. 20-cycle milestone cap prevents runaway loops. Inter-phase smoke tests catch compositional failures at phase boundaries. See [DB-05](./decision-boundaries/05-error-recovery.md).
+
+### 11. Opus everywhere, token tracking, no budget limit
+
+All tiers use Opus — maximum quality at every tier. Cost control comes from the 20-cycle cap (DB-05) and the coordinator's critical evaluation of whether each cycle is productive, not from model downgrading. Cost is tracked in tokens (stable across pricing changes). No hard budget limit per milestone. The coordinator queries all Brutalist tools relevant to the implementation domain and critically evaluates all feedback for validity. Model selection is hardcoded; configurability deferred. See [DB-06](./decision-boundaries/06-token-economics.md).
+
+### 12. No mocks of your own infrastructure
+
+Mock at the boundary of your control, never within it. Your own services run real. Third-party services use their sandbox/test mode. The only acceptable mock is for external services that provide no testing infrastructure at all.
+
+## System Topology
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  clou_orchestrator.py (Python)                               │
+│    │                                                          │
+│    ├─ Hooks: write boundary enforcement per tier              │
+│    ├─ MCP: clou_spawn_coordinator, clou_status, clou_init  │
+│    ├─ Token tracking: per session, cumulative                 │
+│    ├─ Session-per-cycle: golden context as sole compaction     │
+│    │                                                          │
+│    ├─ ClaudeSDKClient ──────────────────────────────────┐     │
+│    │  User                                               │     │
+│    │    ↕ conversation (stdin/stdout)                     │     │
+│    │  Supervisor (agent session)                          │     │
+│    │    │ reads: .clou/project.md, roadmap.md, requests  │     │
+│    │    │ writes: project.md, roadmap.md, milestone specs │     │
+│    │    │ calls: clou_spawn_coordinator(milestone)       │     │
+│    │    └────────────────────────────────────────────────┘     │
+│    │                                                          │
+│    ├─ ClaudeSDKClient (spawned per milestone) ──────────┐     │
+│    │  Coordinator (agent session)                        │     │
+│    │    │ reads: milestone.md, requirements.md, project   │     │
+│    │    │ writes: compose.py, status.md, decisions.md       │     │
+│    │    │ invokes: Brutalist MCP                          │     │
+│    │    │                                                 │     │
+│    │    ↓ manages (native Agent Teams)                    │     │
+│    │  Agent Teams (worker agents)                         │     │
+│    │    │ reads: compose.py, phase.md, codebase            │     │
+│    │    │ writes: execution.md, code changes              │     │
+│    │    │                                                 │     │
+│    │    ↓ verification phase                              │     │
+│    │  Verification Agent (teammate)                       │     │
+│    │    │ materializes: dev environment                    │     │
+│    │    │ walks: golden paths (Playwright/HTTP/CLI)        │     │
+│    │    │ writes: handoff.md                               │     │
+│    │    └────────────────────────────────────────────────┘     │
+│    │                                                          │
+│    ↓ User receives handoff with running environment           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+## What Clou Adds Beyond Single-Session Agents
+
+| Capability | Single-session agent | Clou |
+|---|---|---|
+| Session hierarchy | 2-tier (lead → teammates) | 3-tier (supervisor → coordinator → teams) |
+| Session lifecycle | Manual | Orchestrator manages spawn, monitor, restart |
+| Persistent planning state | None (context window only) | `.clou/` golden context |
+| Quality gates | None | Brutalist MCP with critical evaluation |
+| Human-in-the-loop | Ad hoc conversation | Structured escalation protocol |
+| Verification | Manual | Agentic path walking + prepared handoff |
+| Third-party services | Manual setup | Credential management protocol |
+| Crash recovery | Session resume (experimental) | Session-per-cycle + golden context checkpoints |
+| Write boundary enforcement | None | Orchestrator hooks per tier |
+| Token tracking | Per-session only | Orchestrator tracks cumulative tokens per milestone |
+| Audit trail | Git history only | `decisions.md`, escalation dispositions |
