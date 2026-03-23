@@ -1,0 +1,261 @@
+/* Clou design tokens — generated from clou.ui.theme PALETTE */
+$surface-deep: #05070d;
+$surface: #0c1016;
+$surface-raised: #14181f;
+$surface-overlay: #1e2228;
+$border-subtle: #2b2e33;
+$border: #373b40;
+$border-bright: #44484e;
+$surface-bright: #52555b;
+$text-muted: #52565a;
+$text-dim: #7d8185;
+$text: #dbd7d0;
+$text-bright: #f0eeeb;
+$accent-gold: #d09945;
+$accent-gold-dim: #8a6b40;
+$accent-gold-bright: #ffbf55;
+$accent-blue: #79a7e2;
+$accent-blue-dim: #5a7394;
+$accent-blue-bright: #98d1ff;
+$accent-teal: #52b9a7;
+$accent-teal-dim: #487d73;
+$accent-teal-bright: #65e7d1;
+$accent-amber: #de8f57;
+$accent-amber-dim: #926648;
+$accent-amber-bright: #ffb36c;
+$accent-violet: #a998dd;
+$accent-violet-dim: #746b91;
+$accent-violet-bright: #d3beff;
+$accent-green: #72b875;
+$accent-green-dim: #577d57;
+$accent-green-bright: #8ee792;
+$accent-orange: #e9884d;
+$accent-orange-dim: #996243;
+$accent-orange-bright: #ffaa60;
+$accent-rose: #ef7d88;
+$accent-rose-dim: #9c5c62;
+$accent-rose-bright: #ff9caa;
+
+/* === Root === */
+Screen {
+    background: $surface-deep;
+    color: $text;
+}
+
+/* === Conversation widget === */
+#conversation {
+    height: 1fr;
+    background: $surface-deep;
+}
+
+#conversation #history {
+    background: $surface-deep;
+    scrollbar-size-vertical: 0;
+}
+
+/* === Breath widget — hidden by default, visible in breath/decision === */
+#breath-widget {
+    display: none;
+    height: 1fr;
+    background: $surface-deep;
+}
+
+/* === User input — inside conversation flow === */
+#user-input {
+    height: auto;
+    background: $surface-raised;
+    color: $text;
+    border-top: hkey $border-subtle;
+    padding: 0 1 1 1;
+}
+
+#user-input .prompt-char {
+    color: $accent-gold;
+}
+
+/* === Wake indicator — fills the void during initialization === */
+#wake-indicator {
+    display: none;
+    height: 1fr;
+    background: $surface-deep;
+}
+
+#wake-activity {
+    height: 1fr;
+    background: $surface-deep;
+    scrollbar-size-vertical: 0;
+}
+
+#wake-wave {
+    height: 1;
+    background: $surface-deep;
+}
+
+.wake-line {
+    padding: 0 0 0 2;
+}
+
+/* Initializing state — history recedes, wave fills, input hidden */
+ConversationWidget.initializing #history {
+    display: none;
+}
+
+ConversationWidget.initializing #wake-indicator {
+    display: block;
+}
+
+ConversationWidget.initializing #user-input {
+    display: none;
+}
+
+#user-input Input {
+    background: transparent;
+    border: none;
+}
+
+#user-input Input.-placeholder {
+    color: $text-muted;
+}
+
+/* === Status bar — bottom of natural flow === */
+#status-bar {
+    height: 1;
+    background: $surface-deep;
+    color: $text-dim;
+    padding: 0 1;
+}
+
+/* === Horizon rule === */
+.horizon {
+    color: $border;
+    margin: 0;
+    padding: 0;
+}
+
+/* === Text hierarchy classes === */
+.user-message {
+    color: $accent-gold;
+}
+
+.assistant-message {
+    color: $text;
+}
+
+.tool-use {
+    color: $text-dim;
+}
+
+.thinking {
+    color: $text-muted;
+}
+
+/* ================================================================
+   Mode-scoped rules
+   ================================================================ */
+
+/* === Dialogue mode — full presence === */
+ClouApp.dialogue #conversation {
+    background: $surface-deep;
+    color: $text;
+}
+
+ClouApp.dialogue .user-message {
+    color: $accent-gold;
+}
+
+ClouApp.dialogue .assistant-message {
+    color: $text;
+}
+
+ClouApp.dialogue .tool-use {
+    color: $text-dim;
+    background: $surface;
+}
+
+/* === Breath mode — conversation recedes, input stays present === */
+ClouApp.breath #conversation {
+    background: $surface-deep;
+    max-height: 30%;
+}
+
+ClouApp.breath #conversation #history {
+    opacity: 0.4;
+    overflow-y: hidden;
+}
+
+ClouApp.breath #user-input {
+    opacity: 1.0;
+}
+
+ClouApp.breath #breath-widget {
+    display: block;
+    background: $surface-deep;
+    color: $text-dim;
+}
+
+/* === Decision mode — breath pauses, card surfaces === */
+ClouApp.decision #breath-widget {
+    display: block;
+    opacity: 0.3;
+    color: $text-muted;
+}
+
+ClouApp.decision #conversation {
+    max-height: 30%;
+}
+
+ClouApp.decision #conversation #history {
+    opacity: 0.4;
+}
+
+ClouApp.decision #user-input {
+    opacity: 1.0;
+}
+
+ClouApp.decision #user-input {
+    opacity: 1.0;
+}
+
+/* === Handoff mode === */
+ClouApp.handoff {
+    background: $surface-deep;
+    color: $text;
+}
+
+ClouApp.handoff #breath-widget {
+    display: none;
+}
+
+/* === Handoff widget === */
+#handoff-widget {
+    display: none;
+    height: 1fr;
+    background: $surface-deep;
+    padding: 1 2;
+    overflow-y: auto;
+}
+
+ClouApp.handoff #handoff-widget {
+    display: block;
+}
+
+ClouApp.handoff #conversation {
+    height: 3;
+    dock: bottom;
+}
+
+ClouApp.handoff #conversation #history {
+    display: none;
+}
+
+/* === On-demand panel screens === */
+.panel-screen {
+    background: $surface;
+    padding: 1 2;
+}
+
+.panel-header {
+    color: $accent-gold;
+    text-style: bold;
+    padding-bottom: 1;
+}

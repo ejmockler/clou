@@ -1,0 +1,591 @@
+"""Slash command system — discoverable harness surface.
+
+Provides the Command abstraction, a static registry, and the dispatch
+function that intercepts ``/``-prefixed input before it reaches the
+supervisor session.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import UTC
+from typing import TYPE_CHECKING
+
+from rich.text import Text
+
+from clou.ui.mode import Mode
+from clou.ui.theme import PALETTE
+
+if TYPE_CHECKING:
+    from clou.ui.app import ClouApp
+
+_GOLD_HEX = PALETTE["accent-gold"].to_hex()
+_DIM_HEX = PALETTE["text-dim"].to_hex()
+_MUTED_HEX = PALETTE["text-muted"].to_hex()
+
+# All modes — default for commands with no restriction.
+_ALL_MODES: frozenset[Mode] = frozenset(Mode)
+
+# ---------------------------------------------------------------------------
+# Command protocol
+# ---------------------------------------------------------------------------
+
+#: Handler signature: async (app, args_string) -> None
+CommandHandler = Callable[["ClouApp", str], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class Command:
+    """A single slash command."""
+
+    name: str
+    description: str
+    handler: CommandHandler
+    shortcut: str = ""
+    modes: frozenset[Mode] = field(default_factory=lambda: _ALL_MODES)
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+_REGISTRY: dict[str, Command] = {}
+
+
+def register(cmd: Command) -> Command:
+    """Add a command to the registry."""
+    _REGISTRY[cmd.name] = cmd
+    return cmd
+
+
+def get(name: str) -> Command | None:
+    """Look up a command by name."""
+    return _REGISTRY.get(name)
+
+
+def all_commands() -> list[Command]:
+    """Return all registered commands sorted by name."""
+    return sorted(_REGISTRY.values(), key=lambda c: c.name)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+
+async def dispatch(app: ClouApp, text: str) -> bool:
+    """Try to dispatch *text* as a slash command.
+
+    Returns ``True`` if the text was handled (even if the command was
+    unknown — an error is rendered).  Returns ``False`` only when *text*
+    does not start with ``/``.
+    """
+    if not text.startswith("/"):
+        return False
+
+    parts = text[1:].split(None, 1)
+    name = parts[0].lower() if parts else ""
+    args = parts[1] if len(parts) > 1 else ""
+
+    if not name:
+        # Bare "/" — show help.
+        cmd = get("help")
+        if cmd is not None:
+            await cmd.handler(app, "")
+        return True
+
+    cmd = get(name)
+    if cmd is None:
+        _render_error(app, f"unknown command: /{name}")
+        return True
+
+    if app.mode not in cmd.modes:
+        mode_names = ", ".join(sorted(m.name.lower() for m in cmd.modes))
+        _render_error(app, f"/{name} is available in {mode_names} mode")
+        return True
+
+    await cmd.handler(app, args)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+
+def render_command_output(app: ClouApp, renderable: Text | str) -> None:
+    """Write command output into the conversation surface."""
+    from clou.ui.widgets.conversation import ConversationWidget
+
+    conv = app.query_one(ConversationWidget)
+    conv.add_command_output(renderable)
+
+
+def _render_error(app: ClouApp, text: str) -> None:
+    """Write a brief dim error into the conversation surface."""
+    from clou.ui.widgets.conversation import ConversationWidget
+
+    conv = app.query_one(ConversationWidget)
+    conv.add_command_error(text)
+
+
+# ---------------------------------------------------------------------------
+# Built-in commands
+# ---------------------------------------------------------------------------
+
+
+async def _cmd_help(app: ClouApp, args: str) -> None:
+    """List all available slash commands."""
+    lines: list[tuple[str, str, str]] = []
+    max_name = 0
+    max_desc = 0
+    for cmd in all_commands():
+        max_name = max(max_name, len(cmd.name) + 1)  # +1 for "/"
+        max_desc = max(max_desc, len(cmd.description))
+        lines.append((f"/{cmd.name}", cmd.description, cmd.shortcut))
+
+    result = Text()
+    for i, (name, desc, shortcut) in enumerate(lines):
+        if i > 0:
+            result.append("\n")
+        result.append(f"  {name:<{max_name + 2}}", style=f"bold {_GOLD_HEX}")
+        result.append(f"{desc}", style=_DIM_HEX)
+        if shortcut:
+            result.append(f"  {shortcut}", style=_MUTED_HEX)
+
+    render_command_output(app, result)
+
+
+async def _cmd_clear(app: ClouApp, args: str) -> None:
+    """Clear conversation history."""
+    app.action_clear()
+
+
+register(
+    Command(
+        name="help",
+        description="this list",
+        handler=_cmd_help,
+    )
+)
+
+register(
+    Command(
+        name="clear",
+        description="clear conversation",
+        handler=_cmd_clear,
+        shortcut="⌃L",
+    )
+)
+
+
+async def _cmd_cost(app: ClouApp, args: str) -> None:
+    """Show token usage and session cost."""
+    from clou.ui.widgets.status_bar import ClouStatusBar, format_cost, format_tokens
+
+    if args.strip() == "detail":
+        app.action_show_costs()
+        return
+
+    bar = app.query_one(ClouStatusBar)
+    elapsed = time.monotonic() - app._session_start_time
+    mins, secs = divmod(int(elapsed), 60)
+    hrs, mins = divmod(mins, 60)
+    duration = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
+
+    result = Text()
+    result.append("  input   ", style=_DIM_HEX)
+    result.append(format_tokens(bar.input_tokens))
+    result.append("\n  output  ", style=_DIM_HEX)
+    result.append(format_tokens(bar.output_tokens))
+    result.append("\n  cost    ", style=_DIM_HEX)
+    result.append(format_cost(bar.cost_usd), style=f"bold {_GOLD_HEX}")
+    result.append("\n  session ", style=_DIM_HEX)
+    result.append(duration)
+
+    render_command_output(app, result)
+
+
+register(
+    Command(
+        name="cost",
+        description="token usage and cost",
+        handler=_cmd_cost,
+        shortcut="⌃T",
+    )
+)
+
+
+async def _cmd_dag(app: ClouApp, args: str) -> None:
+    """Show the DAG viewer."""
+    app.action_show_dag()
+
+
+register(
+    Command(
+        name="dag",
+        description="task DAG viewer",
+        handler=_cmd_dag,
+        shortcut="⌃D",
+        modes=frozenset({Mode.BREATH, Mode.HANDOFF}),
+    )
+)
+
+
+async def _cmd_context(app: ClouApp, args: str) -> None:
+    """Show the golden context tree."""
+    app.action_show_context()
+
+
+register(
+    Command(
+        name="context",
+        description="golden context tree",
+        handler=_cmd_context,
+        shortcut="⌃G",
+    )
+)
+
+
+async def _cmd_diff(app: ClouApp, args: str) -> None:
+    """Show git diff output with syntax highlighting."""
+    import asyncio
+
+    from clou.ui.diff import render_diff
+
+    async def _run_git(*cmd: str) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            err = stderr.decode().strip()
+            if "not a git repository" in err.lower():
+                return ""
+            return ""
+        return stdout.decode()
+
+    parts = args.strip().split() if args.strip() else []
+    staged_only = "staged" in parts or "--staged" in parts
+    path_args = [p for p in parts if p not in ("staged", "--staged")]
+
+    if staged_only:
+        raw = await _run_git("diff", "--cached", "--no-color", *path_args)
+    else:
+        # Show both staged and unstaged.
+        unstaged = await _run_git("diff", "--no-color", *path_args)
+        staged = await _run_git("diff", "--cached", "--no-color", *path_args)
+        raw = unstaged + staged
+
+    if not raw.strip():
+        # Check if we're even in a git repo.
+        check = await _run_git("rev-parse", "--git-dir")
+        if not check.strip():
+            _render_error(app, "not a git repository")
+        else:
+            _render_error(app, "no changes")
+        return
+
+    rendered = render_diff(raw)
+    line_count = raw.count("\n")
+
+    if line_count > 50:
+        from clou.ui.screens.detail import DetailScreen
+
+        app.push_screen(DetailScreen(title="Diff", content=raw))
+    else:
+        render_command_output(app, rendered)
+
+
+register(
+    Command(
+        name="diff",
+        description="show git diff",
+        handler=_cmd_diff,
+    )
+)
+
+
+async def _cmd_export(app: ClouApp, args: str) -> None:
+    """Export conversation history to a Markdown file."""
+    from datetime import datetime
+    from pathlib import Path
+
+    from clou.ui.history import export_markdown
+
+    include_tools = "--full" in args
+    parts = [p for p in args.split() if p != "--full"]
+    if parts:
+        output_path = Path(parts[0]).expanduser()
+    else:
+        ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+        export_dir = app._project_dir / ".clou" / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        output_path = export_dir / f"conversation-{ts}.md"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    md = export_markdown(app._conversation_history, include_tools=include_tools)
+    output_path.write_text(md)
+    render_command_output(app, f"exported to {output_path}")
+
+
+register(
+    Command(
+        name="export",
+        description="export conversation to markdown",
+        handler=_cmd_export,
+    )
+)
+
+
+async def _cmd_status(app: ClouApp, args: str) -> None:
+    """Show current session status."""
+    from clou.ui.widgets.status_bar import ClouStatusBar, format_cost, format_tokens
+
+    bar = app.query_one(ClouStatusBar)
+
+    elapsed = time.monotonic() - app._session_start_time
+    mins, secs = divmod(int(elapsed), 60)
+    hrs, mins = divmod(mins, 60)
+    duration = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
+
+    result = Text()
+
+    if bar.milestone:
+        result.append("  milestone  ", style=_DIM_HEX)
+        result.append(bar.milestone, style=f"bold {_GOLD_HEX}")
+        if bar.cycle_type:
+            result.append("\n  cycle      ", style=_DIM_HEX)
+            result.append(f"{bar.cycle_type} #{bar.cycle_num}")
+        if bar.phase:
+            result.append("\n  phase      ", style=_DIM_HEX)
+            result.append(bar.phase)
+
+        # Task progress from DAG.
+        if app._dag_tasks:
+            done = sum(1 for t in app._dag_tasks if t.get("status") == "done")
+            total = len(app._dag_tasks)
+            result.append("\n  tasks      ", style=_DIM_HEX)
+            result.append(f"{done}/{total}")
+    else:
+        result.append("  no active milestone", style=_DIM_HEX)
+
+    result.append("\n  tokens     ", style=_DIM_HEX)
+    in_tok = format_tokens(bar.input_tokens)
+    out_tok = format_tokens(bar.output_tokens)
+    result.append(f"{in_tok} in / {out_tok} out")
+    result.append("\n  cost       ", style=_DIM_HEX)
+    result.append(format_cost(bar.cost_usd), style=f"bold {_GOLD_HEX}")
+    result.append("\n  session    ", style=_DIM_HEX)
+    result.append(duration)
+    result.append("\n  mode       ", style=_DIM_HEX)
+    result.append(app.mode.name.lower())
+
+    render_command_output(app, result)
+
+
+register(
+    Command(
+        name="status",
+        description="session status summary",
+        handler=_cmd_status,
+    )
+)
+
+
+async def _cmd_compact(app: ClouApp, args: str) -> None:
+    """Request context compaction of the supervisor session."""
+    import asyncio
+    from pathlib import Path
+
+    # Persist conversation history to disk.
+    history_path = app._project_dir / ".clou" / "active" / "supervisor-history.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    import json
+
+    with history_path.open("w") as f:
+        for entry in app._conversation_history:
+            f.write(
+                json.dumps(
+                    {
+                        "role": entry.role,
+                        "content": entry.content,
+                        "timestamp": entry.timestamp,
+                    }
+                )
+                + "\n"
+            )
+
+    # Signal the orchestrator.
+    app._compact_complete.clear()
+    app._compact_instructions = args.strip()
+    app._compact_requested.set()
+
+    render_command_output(app, Text("  compacting...", style=f"italic {_DIM_HEX}"))
+
+    # Wait for completion (with timeout).
+    try:
+        await asyncio.wait_for(app._compact_complete.wait(), timeout=30.0)
+    except TimeoutError:
+        _render_error(app, "compaction timed out")
+        return
+
+    # Show confirmation.
+    count = app._compaction_count
+    result = Text()
+    result.append("  compacted", style=f"bold {_GOLD_HEX}")
+    result.append(f"  (compaction #{count})", style=_DIM_HEX)
+
+    if count >= 3:
+        result.append(
+            f"\n  ⚠ {count} compactions — significant context loss likely",
+            style=f"bold {PALETTE['accent-rose'].to_hex()}",
+        )
+
+    render_command_output(app, result)
+
+
+register(
+    Command(
+        name="compact",
+        description="compact supervisor context",
+        handler=_cmd_compact,
+        modes=frozenset({Mode.DIALOGUE}),
+    )
+)
+
+
+_MODEL_ALIASES: dict[str, str] = {
+    "opus": "opus",
+    "sonnet": "sonnet",
+    "haiku": "haiku",
+}
+
+
+async def _cmd_model(app: ClouApp, args: str) -> None:
+    """Show or switch the model."""
+    if not args.strip():
+        result = Text()
+        result.append("  model  ", style=_DIM_HEX)
+        result.append(app._model, style=f"bold {_GOLD_HEX}")
+        render_command_output(app, result)
+        return
+
+    alias = args.strip().lower()
+    if alias not in _MODEL_ALIASES:
+        valid = ", ".join(sorted(_MODEL_ALIASES.keys()))
+        _render_error(app, f"unknown model: {alias} (valid: {valid})")
+        return
+
+    model = _MODEL_ALIASES[alias]
+    if model == app._model:
+        render_command_output(app, f"  already using {model}")
+        return
+
+    app._model = model
+    app._model_switch_requested = model
+    result = Text()
+    result.append(f"  model → {model}", style=f"bold {_GOLD_HEX}")
+    result.append(
+        "\n  takes effect on next supervisor message",
+        style=_DIM_HEX,
+    )
+    render_command_output(app, result)
+
+
+register(
+    Command(
+        name="model",
+        description="show or switch model",
+        handler=_cmd_model,
+        modes=frozenset({Mode.DIALOGUE}),
+    )
+)
+
+
+async def _cmd_exit(app: ClouApp, args: str) -> None:
+    """Exit clou."""
+    app.exit()
+
+
+register(
+    Command(
+        name="exit",
+        description="exit clou",
+        handler=_cmd_exit,
+    )
+)
+
+
+async def _cmd_sessions(app: ClouApp, args: str) -> None:
+    """List past sessions or show session details."""
+    from datetime import datetime
+
+    from clou.session import list_sessions, session_summary
+
+    if args.strip():
+        # Show details for a specific session.
+        sid = args.strip()
+        summary = session_summary(app._project_dir, sid)
+        if summary.get("message_count", 0) == 0:
+            _render_error(app, f"session not found: {sid}")
+            return
+
+        result = Text()
+        result.append("  session  ", style=_DIM_HEX)
+        result.append(str(summary["session_id"]), style=f"bold {_GOLD_HEX}")
+        result.append("\n  model    ", style=_DIM_HEX)
+        result.append(str(summary.get("model", "unknown")))
+        started = summary.get("started_at")
+        if isinstance(started, (int, float)):
+            ts = datetime.fromtimestamp(started, tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+            result.append("\n  started  ", style=_DIM_HEX)
+            result.append(ts)
+        duration = summary.get("duration_s")
+        if isinstance(duration, (int, float)) and duration > 0:
+            mins, secs = divmod(int(duration), 60)
+            hrs, mins = divmod(mins, 60)
+            dur_str = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
+            result.append("\n  duration ", style=_DIM_HEX)
+            result.append(dur_str)
+        result.append("\n  messages ", style=_DIM_HEX)
+        result.append(str(summary.get("message_count", 0)))
+        render_command_output(app, result)
+        return
+
+    # List recent sessions.
+    sessions = list_sessions(app._project_dir)
+    if not sessions:
+        _render_error(app, "no sessions found")
+        return
+
+    result = Text()
+    for i, info in enumerate(sessions[:10]):
+        if i > 0:
+            result.append("\n")
+        ts = datetime.fromtimestamp(info.started_at, tz=UTC).strftime("%m-%d %H:%M")
+        current = info.session_id == (app._session.session_id if app._session else "")
+        marker = " ●" if current else "  "
+        result.append(f"  {info.session_id}", style=f"bold {_GOLD_HEX}")
+        result.append(f"  {ts}  {info.model}", style=_DIM_HEX)
+        if current:
+            result.append(marker, style=f"bold {_GOLD_HEX}")
+
+    if len(sessions) > 10:
+        result.append(f"\n  ... and {len(sessions) - 10} more", style=_DIM_HEX)
+
+    render_command_output(app, result)
+
+
+register(
+    Command(
+        name="sessions",
+        description="list past sessions",
+        handler=_cmd_sessions,
+    )
+)
