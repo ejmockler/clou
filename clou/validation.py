@@ -77,6 +77,7 @@ def warnings_only(findings: list[ValidationFinding]) -> list[ValidationFinding]:
 _TASK_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
 _MILESTONE_STATUSES = frozenset({"pending", "in_progress", "completed", "blocked"})
 _PHASE_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
+_TERMINAL_STATUSES = frozenset({"completed", "failed"})
 
 # --- Checkpoint-tier validation (DB-12) ---
 # These fields drive the orchestrator's control flow.  Strict parsing
@@ -133,11 +134,10 @@ def validate_golden_context(
     if execution_flat.exists():
         findings += _validate_execution(execution_flat)
 
-    _TERMINAL_STATUSES = frozenset({"completed", "failed"})
     for execution_phase in sorted(milestone_dir.glob("phases/*/execution.md")):
         phase_findings = _validate_execution(execution_phase)
         phase_name = execution_phase.parent.name
-        if phase_statuses.get(phase_name) in _TERMINAL_STATUSES:
+        if phase_statuses.get(phase_name.lower()) in _TERMINAL_STATUSES:
             phase_findings = _downgrade_errors(phase_findings)
         findings += phase_findings
 
@@ -680,9 +680,9 @@ def _split_sections(content: str, header_pattern: str) -> list[str]:
 def _parse_phase_statuses(status_path: Path) -> dict[str, str]:
     """Read the Phase Progress table from status.md.
 
-    Returns a mapping of ``{phase_name: status_value}`` (lowercased status).
-    Returns an empty dict when the file does not exist or has no parseable
-    Phase Progress table.
+    Returns a mapping of ``{phase_name: status_value}`` with both keys
+    and values lowercased.  Returns an empty dict when the file does not
+    exist or has no parseable Phase Progress table.
     """
     if not status_path.exists():
         return {}

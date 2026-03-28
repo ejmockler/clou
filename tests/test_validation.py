@@ -1133,7 +1133,10 @@ status: completed
 
 
 def test_completed_phase_errors_downgraded_to_warning(tmp_path: Path) -> None:
-    """R4 regression: completed phase with missing '## Tasks' produces WARNING, not ERROR."""
+    """R4 regression: completed phase with missing '## Tasks'.
+
+    Produces WARNING, not ERROR.
+    """
     ms_dir = tmp_path / ".clou" / "milestones" / "m1"
     _write(ms_dir / "status.md", _STATUS_MD_SETUP_COMPLETED)
     _write(ms_dir / "phases" / "setup" / "execution.md", _BAD_EXECUTION_NO_TASKS)
@@ -1200,7 +1203,10 @@ cycle: 2
 
 
 def test_mixed_completed_and_pending_phases(tmp_path: Path) -> None:
-    """Mixed: completed phase bad execution.md -> WARNING; pending phase bad -> ERROR."""
+    """Mixed: completed phase bad execution.md -> WARNING.
+
+    Pending phase bad execution.md -> ERROR.
+    """
     status_md = """\
 # Status
 
