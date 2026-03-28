@@ -1,4 +1,0 @@
-{"role": "system", "content": "session_start", "timestamp": 1774676675.88859, "meta": {"session_id": "s1", "project_dir": "/Users/noot/clou/pytest-of-noot/pytest-39/test_summary_fields0", "model": "sonnet"}}
-{"role": "user", "content": "q1", "timestamp": 1774676675.888708, "meta": {}}
-{"role": "assistant", "content": "a1", "timestamp": 1774676675.888746, "meta": {}}
-{"role": "user", "content": "q2", "timestamp": 1774676675.88878, "meta": {}}

@@ -1442,6 +1442,8 @@ class TestCanUseTool:
             return PermissionResultAllow()
 
         result = await _can_use_tool(
-            "Read", {"file_path": "/tmp/f"}, ToolPermissionContext(signal=None, suggestions=[]),
+            "Read",
+            {"file_path": "/tmp/f"},
+            ToolPermissionContext(signal=None, suggestions=[]),
         )
         assert result.behavior == "allow"

@@ -183,7 +183,7 @@ class TestDagUpdateAfterCycle:
 
         assert result == "completed"
         dag_updates = _posted_of_type(app, ClouDagUpdate)
-        assert len(dag_updates) == 1
+        assert len(dag_updates) == 2
         task_names = {t["name"] for t in dag_updates[0].tasks}
         assert "setup" in task_names
 

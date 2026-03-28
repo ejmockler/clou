@@ -1,2 +1,0 @@
-# Coordinator
-Just some text.
