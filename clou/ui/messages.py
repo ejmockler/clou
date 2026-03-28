@@ -49,9 +49,12 @@ class ClouStreamChunk(Message):
 class ClouToolUse(Message):
     """Supervisor is using a tool."""
 
-    def __init__(self, name: str, tool_input: dict[str, object]) -> None:
+    def __init__(
+        self, name: str, tool_input: dict[str, object], tool_use_id: str = "",
+    ) -> None:
         self.name = name
         self.tool_input = tool_input
+        self.tool_use_id = tool_use_id
         super().__init__()
 
 
@@ -79,6 +82,19 @@ class ClouTurnComplete(Message):
         self.output_tokens = output_tokens
         self.cost_usd = cost_usd
         self.duration_ms = duration_ms
+        super().__init__()
+
+
+class ClouTurnContentReady(Message):
+    """Completed assistant content ready for persistence.
+
+    Posted by ConversationWidget after computing the turn's content
+    (streamed or non-streamed).  ClouApp persists it to session/history
+    without reaching into widget internals.
+    """
+
+    def __init__(self, content: str) -> None:
+        self.content = content
         super().__init__()
 
 

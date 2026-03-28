@@ -151,10 +151,11 @@ class TestCycleCompleteEmitted:
         assert len(completes) == 1
         assert completes[0].cycle_num == 3
         assert completes[0].cycle_type == "EXECUTE"
+        assert completes[0].next_step == "ASSESS"
 
 
-class TestDagUpdateAfterPlan:
-    """ClouDagUpdate posted after a PLAN cycle when compose.py exists."""
+class TestDagUpdateAfterCycle:
+    """ClouDagUpdate posted after every cycle type when compose.py exists."""
 
     async def test_dag_update_after_plan(self, tmp_path: Path) -> None:
         _setup_clou_dir(tmp_path)
@@ -226,6 +227,106 @@ class TestEscalationDetected:
         assert arrivals[0].issue == "Something broke"
         assert len(arrivals[0].options) == 2
         assert arrivals[0].options[0]["label"] == "Fix it"
+
+
+class TestSeenEscalationsPersisted:
+    """seen-escalations.txt prevents re-posting after restart."""
+
+    async def test_preexisting_seen_escalations_not_reposted(
+        self, tmp_path: Path
+    ) -> None:
+        _setup_clou_dir(tmp_path)
+        app = _mock_app()
+
+        # Create an escalation file
+        esc_dir = tmp_path / ".clou" / "milestones" / "test-ms" / "escalations"
+        esc_dir.mkdir(parents=True, exist_ok=True)
+        (esc_dir / "2026-01-01-test.md").write_text(
+            "## Classification\nblocking\n\n"
+            "## Issue\nSomething broke\n\n"
+            "## Options\n1. **Fix it**: repair the thing\n"
+            "2. **Skip it**: move on\n"
+        )
+
+        # Pre-populate seen-escalations.txt (simulates prior run)
+        seen_path = tmp_path / ".clou" / "active" / "seen-escalations.txt"
+        seen_path.write_text("2026-01-01-test.md\n")
+
+        with (
+            patch(
+                f"{_P}.determine_next_cycle",
+                side_effect=[
+                    ("EXECUTE", ["status.md"]),
+                    ("COMPLETE", []),
+                ],
+            ),
+            patch(f"{_P}.read_cycle_count", return_value=0),
+            patch(f"{_P}._run_single_cycle", return_value="ok"),
+            patch(f"{_P}.validate_golden_context", return_value=[]),
+            patch(f"{_P}.build_cycle_prompt", return_value="prompt"),
+        ):
+            result = await run_coordinator(tmp_path, "test-ms", app=app)
+
+        assert result == "completed"
+        # The escalation should NOT be re-posted
+        arrivals = _posted_of_type(app, ClouEscalationArrived)
+        assert len(arrivals) == 0
+
+    async def test_seen_escalations_written_to_disk(self, tmp_path: Path) -> None:
+        _setup_clou_dir(tmp_path)
+        app = _mock_app()
+
+        # Create an escalation file
+        esc_dir = tmp_path / ".clou" / "milestones" / "test-ms" / "escalations"
+        esc_dir.mkdir(parents=True, exist_ok=True)
+        (esc_dir / "2026-01-01-test.md").write_text(
+            "## Classification\nblocking\n\n"
+            "## Issue\nSomething broke\n\n"
+            "## Options\n1. **Fix it**: repair the thing\n"
+            "2. **Skip it**: move on\n"
+        )
+
+        seen_path = tmp_path / ".clou" / "active" / "seen-escalations.txt"
+
+        with (
+            patch(
+                f"{_P}.determine_next_cycle",
+                side_effect=[
+                    ("EXECUTE", ["status.md"]),
+                    # Don't COMPLETE — escalation_cycle_limit so we can
+                    # check that seen_path was written mid-run
+                    ("EXECUTE", ["status.md"]),
+                    ("COMPLETE", []),
+                ],
+            ),
+            patch(f"{_P}.read_cycle_count", return_value=0),
+            patch(f"{_P}._run_single_cycle", return_value="ok"),
+            patch(f"{_P}.validate_golden_context", return_value=[]),
+            patch(f"{_P}.build_cycle_prompt", return_value="prompt"),
+        ):
+            result = await run_coordinator(tmp_path, "test-ms", app=app)
+
+        assert result == "completed"
+        # seen-escalations.txt is cleaned up on completion, so it
+        # should not exist. But the escalation was posted exactly once.
+        assert not seen_path.exists()
+        arrivals = _posted_of_type(app, ClouEscalationArrived)
+        assert len(arrivals) == 1
+
+    async def test_seen_file_cleaned_on_completion(self, tmp_path: Path) -> None:
+        _setup_clou_dir(tmp_path)
+
+        seen_path = tmp_path / ".clou" / "active" / "seen-escalations.txt"
+        seen_path.write_text("old-escalation.md\n")
+
+        with patch(
+            f"{_P}.determine_next_cycle",
+            return_value=("COMPLETE", []),
+        ):
+            result = await run_coordinator(tmp_path, "test-ms")
+
+        assert result == "completed"
+        assert not seen_path.exists()
 
 
 class TestHandoffOnCompletion:

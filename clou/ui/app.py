@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from pathlib import Path
 from typing import ClassVar
 
@@ -21,6 +22,7 @@ from textual.timer import Timer
 from textual.widgets import Input
 from textual.worker import Worker, WorkerState
 
+from clou import telemetry
 from clou.session import Session
 from clou.ui.bridge import _strip_ansi
 from clou.ui.history import ConversationEntry
@@ -36,6 +38,7 @@ from clou.ui.messages import (
     ClouRateLimit,
     ClouStatusUpdate,
     ClouTurnComplete,
+    ClouTurnContentReady,
 )
 from clou.ui.mode import TIMING, BreathState, BreathStateMachine, Mode, get_transition
 from clou.ui.screens.context import ContextScreen
@@ -60,7 +63,11 @@ class ClouApp(App[None]):
     CSS_PATH = "clou.tcss"
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("ctrl+c", "quit", "Quit", priority=True),
+        # Copy-on-select handles clipboard via pbcopy on drag release.
+        # These priority no-ops prevent Screen.copy_text (non-priority)
+        # and Textual's default ctrl+c → quit from overwriting.
+        Binding("ctrl+c,super+c", "noop", show=False, priority=True),
+        Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("ctrl+l", "clear", "Clear"),
         Binding("ctrl+g", "show_context", "Context", show=False),
         Binding("ctrl+d", "show_dag", "DAG", show=False),
@@ -83,9 +90,9 @@ class ClouApp(App[None]):
         self._animation_timer: Timer | None = None
         self._animation_time: float = 0.0
         self._breath_machine = BreathStateMachine()
-        self._pending_escalation: (
-            tuple[Path, str, str, list[dict[str, object]]] | None
-        ) = None
+        self._escalation_queue: deque[
+            tuple[Path, str, str, list[dict[str, object]]]
+        ] = deque()
         self._release_start_time: float = 0.0
         self._release_start_value: float = 0.0
         self._settle_start_time: float = 0.0
@@ -99,9 +106,8 @@ class ClouApp(App[None]):
         self._compact_instructions: str = ""
         self._compact_complete: asyncio.Event = asyncio.Event()
         self._compaction_count: int = 0
-        # Model state: current model and pending switch.
+        # Model state.
         self._model: str = "opus"
-        self._model_switch_requested: str | None = None
         self._queue_count: int = 0
         # Session persistence — auto-append every turn to JSONL.
         self._session: Session | None = None
@@ -116,8 +122,9 @@ class ClouApp(App[None]):
         """Apply the initial mode CSS class and start the supervisor."""
         self.add_class(self.mode.name.lower())
         self.query_one("#user-input Input").focus()
-        # Start session persistence.
+        # Start session persistence and telemetry.
         self._session = Session(self._project_dir, model=self._model)
+        telemetry.init(self._session.session_id, self._project_dir)
         self.run_supervisor_worker()
 
     @work(exclusive=True)
@@ -131,42 +138,73 @@ class ClouApp(App[None]):
         await run_supervisor(self._project_dir, app=self)
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
-        """Detect supervisor worker crash and notify the user."""
-        if (
-            event.worker.name == "run_supervisor_worker"
-            and event.state == WorkerState.ERROR
-        ):
+        """Handle supervisor worker terminal states."""
+        if event.worker.name != "run_supervisor_worker":
+            return
+        if event.state == WorkerState.ERROR:
             error_msg = "Supervisor session ended unexpectedly"
             if event.worker.error:
                 error_msg += f": {_strip_ansi(str(event.worker.error))}"
             try:
                 conversation = self.query_one(ConversationWidget)
+                conversation._end_initializing()
                 conversation.add_error_message(error_msg)
-                conversation._stop_timer()
-                conversation._stream_buffer = ""
-                conversation._stream_dirty = False
+                conversation.reset_turn_state()
             except LookupError:
                 pass  # Widget may not be mounted yet
+            # Drain the dead queue and stale escalations.
+            while not self._user_input_queue.empty():
+                try:
+                    self._user_input_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            self._queue_count = 0
+            self._escalation_queue.clear()
+            try:
+                self.query_one(ConversationWidget).update_queue_count(0)
+            except LookupError:
+                pass
+            # Return to dialogue mode if in an ambient mode.
+            if self.mode in (Mode.BREATH, Mode.HANDOFF):
+                self.transition_mode(Mode.DIALOGUE)
+        elif event.state in (WorkerState.SUCCESS, WorkerState.CANCELLED):
+            # Normal exit or cancellation — the input task is dead, so any
+            # messages still in the queue will never be delivered.  Drain
+            # them and reset the queue indicator to avoid "stuck queued".
+            try:
+                self.query_one(ConversationWidget).reset_turn_state()
+            except LookupError:
+                pass
+            while not self._user_input_queue.empty():
+                try:
+                    self._user_input_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            self._queue_count = 0
+            try:
+                self.query_one(ConversationWidget).update_queue_count(0)
+            except LookupError:
+                pass
 
     # ------------------------------------------------------------------
     # Mode transitions
     # ------------------------------------------------------------------
 
     def _push_pending_escalation(self) -> None:
-        """Push the escalation modal if an escalation is pending."""
-        if self._pending_escalation is not None:
-            if self._has_screen(EscalationModal):
-                return  # Already showing an escalation
-            path, classification, issue, options = self._pending_escalation
-            self._pending_escalation = None
-            self.push_screen(
-                EscalationModal(
-                    path=path,
-                    classification=classification,
-                    issue=issue,
-                    options=options,
-                )
+        """Push the next queued escalation modal."""
+        if not self._escalation_queue:
+            return
+        if self._has_screen(EscalationModal):
+            return  # Already showing an escalation; next will fire on resolve
+        path, classification, issue, options = self._escalation_queue.popleft()
+        self.push_screen(
+            EscalationModal(
+                path=path,
+                classification=classification,
+                issue=issue,
+                options=options,
             )
+        )
 
     def transition_mode(self, target: Mode) -> bool:
         """Attempt a validated mode transition.
@@ -228,6 +266,9 @@ class ClouApp(App[None]):
 
         # --- HANDOFF -> BREATH ---
         elif old is Mode.HANDOFF and new is Mode.BREATH:
+            # Force-reset in case breath state is still RELEASING/SETTLING
+            # from a prior _stop_breathing() — ensures IDLE→BREATHING is legal.
+            self._force_stop_breathing()
             self._start_breathing()
 
         # --- HANDOFF -> DECISION ---
@@ -339,27 +380,138 @@ class ClouApp(App[None]):
     # Input handling
     # ------------------------------------------------------------------
 
+    def on_click(self) -> None:
+        """Clicking anywhere in the app refocuses the input."""
+        try:
+            self.query_one("#user-input Input").focus()
+        except LookupError:
+            pass
+
+    def copy_to_clipboard(self, text: str, *, notify: bool = True) -> None:
+        """Copy text to the system clipboard via platform tools.
+
+        Textual's default uses OSC 52 which doesn't work on macOS
+        Terminal.app.  We use pbcopy/xclip instead.
+        """
+        import subprocess
+        import sys
+
+        self._clipboard = text
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(
+                    ["pbcopy"], input=text.encode("utf-8"),
+                    check=True, timeout=3,
+                )
+            else:
+                subprocess.run(
+                    ["xclip", "-selection", "clipboard"],
+                    input=text.encode("utf-8"),
+                    check=True, timeout=3,
+                )
+        except (
+            subprocess.CalledProcessError, FileNotFoundError,
+            OSError, subprocess.TimeoutExpired,
+        ):
+            super().copy_to_clipboard(text)
+            return
+        if notify:
+            self.notify("Copied", timeout=1.5)
+
+    def on_text_selected(self) -> None:
+        """Copy-on-select — drag selection goes straight to the clipboard.
+
+        Terminal emulators intercept Cmd+C before TUI apps see it.
+        Rather than fighting the terminal, we copy the moment the
+        user finishes dragging.  Cmd+V just works.
+        """
+        try:
+            text = self.screen.get_selected_text()
+        except (IndexError, TypeError):
+            # Textual Selection.extract() can crash when the selection
+            # has end=None (incomplete drag) or when start_line exceeds
+            # the actual line count of a single-line widget.
+            return
+        if text:
+            self.copy_to_clipboard(text, notify=False)
+
+    def on_key(self, event) -> None:
+        """Route navigation keys to the command palette when visible."""
+        from clou.ui.widgets.command_palette import CommandPalette
+
+        try:
+            palette = self.query_one(CommandPalette)
+        except LookupError:
+            return
+        if not palette.is_visible:
+            return
+
+        if event.key == "up":
+            palette.navigate(-1)
+            event.stop()
+        elif event.key == "down":
+            palette.navigate(1)
+            event.stop()
+        elif event.key == "escape":
+            if not palette.back():
+                palette.hide()
+                try:
+                    self.query_one("#user-input Input").clear()
+                except LookupError:
+                    pass
+            event.stop()
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle user input — transition from BREATH to DIALOGUE if needed."""
         text = event.value.strip()
-        event.input.clear()
+
         if not text:
+            event.input.clear()
             return
 
         # Slash command dispatch — intercept before supervisor queue.
         if text.startswith("/"):
+            from clou.ui.widgets.command_palette import CommandPalette
+
+            try:
+                palette = self.query_one(CommandPalette)
+            except LookupError:
+                palette = None
+
+            # Palette-driven selection when no args are typed.
+            if palette and palette.is_visible:
+                parts = text[1:].split(None, 1)
+                has_args = len(parts) > 1 and parts[1].strip()
+                if not has_args:
+                    result = palette.select()
+                    if result is None:
+                        # Submenu opened — keep input intact.
+                        return
+                    event.input.clear()
+                    palette.hide()
+                    self._dispatch_command(result)
+                    return
+
+            event.input.clear()
+            if palette:
+                palette.hide()
             self._dispatch_command(text)
             return
+
+        event.input.clear()
 
         # If in breath or handoff mode, transition back to dialogue first.
         if self.mode in (Mode.BREATH, Mode.HANDOFF):
             self.transition_mode(Mode.DIALOGUE)
 
-        # Queue the message — it enters the conversation log when the model
-        # picks it up (ClouProcessingStarted), preserving temporal coherence.
+        # Show user message immediately — don't wait for model pickup.
+        # Only badge as "queued" when there are already messages ahead.
+        conversation = self.query_one(ConversationWidget)
+        conversation.add_user_message(text, queued=self._queue_count > 0)
+
+        # Queue for model processing.
         self._user_input_queue.put_nowait(text)
         self._queue_count += 1
-        conversation = self.query_one(ConversationWidget)
         conversation.update_queue_count(self._queue_count)
 
     @work(exclusive=False)
@@ -393,23 +545,82 @@ class ClouApp(App[None]):
         """Check if a screen of the given type is already on the stack."""
         return any(isinstance(s, screen_type) for s in self.screen_stack)
 
+    def action_noop(self) -> None:
+        """Intentional no-op — absorbs SkipAction from ctrl+c copy."""
+
     def action_clear(self) -> None:
         """Clear the conversation history and any active stream."""
-        from textual.widgets import Static
-
         conversation = self.query_one(ConversationWidget)
-        conversation._stop_working()
-        conversation._stop_timer()
-        conversation._stream_buffer = ""
-        conversation._stream_dirty = False
+        conversation.reset_turn_state()
         # Remove all message widgets, keep #tail.
         for widget in conversation.query(".msg"):
             widget.remove()
         try:
-            tail = conversation.query_one("#tail", Static)
-            tail.update("")
+            conversation._clear_tail()
         except LookupError:
             pass
+
+    def resume_session(self, session_id: str) -> None:
+        """Resume a previous session within the running TUI.
+
+        Clears all UI state, sets the resume ID, creates a new persistence
+        session, and restarts the supervisor worker.  The orchestrator reads
+        ``_resume_session_id`` at startup and injects resumption context.
+        """
+        # Set the resume ID — orchestrator reads this via getattr.
+        self._resume_session_id = session_id
+
+        # Clear conversation UI.
+        self.action_clear()
+        self._conversation_history = []
+
+        # New persistence session (the old transcript is read-only).
+        self._session = Session(self._project_dir, model=self._model)
+        telemetry.init(self._session.session_id, self._project_dir)
+
+        # Reset status bar metrics.
+        bar = self.query_one(ClouStatusBar)
+        bar.input_tokens = 0
+        bar.output_tokens = 0
+        bar.cost_usd = 0.0
+        bar.milestone = ""
+        bar.cycle_type = ""
+        bar.cycle_num = 0
+        bar.phase = ""
+        bar.rate_limited = False
+
+        # Reset app-level state.
+        self._session_start_time = time.monotonic()
+        self._compact_requested.clear()
+        self._compact_complete.clear()
+        self._compaction_count = 0
+        self._compact_instructions = ""
+        self._escalation_queue.clear()
+        self._dag_tasks = []
+        self._dag_deps = {}
+        # Drain stale input from the previous session's queue.
+        while not self._user_input_queue.empty():
+            try:
+                self._user_input_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._queue_count = 0
+
+        # Return to dialogue mode.
+        if self.mode is not Mode.DIALOGUE:
+            self._force_stop_breathing()
+            self.mode = Mode.DIALOGUE
+
+        # Re-enter initializing state so the wake indicator shows during resume.
+        try:
+            conv = self.query_one(ConversationWidget)
+            conv._initializing = True
+            conv.add_class("initializing")
+        except LookupError:
+            pass
+
+        # Restart the supervisor — exclusive=True cancels the current worker.
+        self.run_supervisor_worker()
 
     def action_show_context(self) -> None:
         """Push the golden context tree screen."""
@@ -463,21 +674,20 @@ class ClouApp(App[None]):
             bar.cost_usd += msg.cost_usd
 
     def on_clou_turn_complete(self, msg: ClouTurnComplete) -> None:
-        """Update status bar with turn metrics and record assistant text."""
+        """Update status bar with turn metrics."""
         bar = self.query_one(ClouStatusBar)
         bar.input_tokens += msg.input_tokens
         bar.output_tokens += msg.output_tokens
         if msg.cost_usd is not None:
             bar.cost_usd += msg.cost_usd
-        # Record assistant content — conv widget preserves it before clearing.
-        conv = self.query_one(ConversationWidget)
-        content = conv._last_completed_content
-        if content:
-            self._conversation_history.append(
-                ConversationEntry(role="assistant", content=content)
-            )
-            if self._session is not None:
-                self._session.append("assistant", content)
+
+    def on_clou_turn_content_ready(self, msg: ClouTurnContentReady) -> None:
+        """Persist completed assistant content to history and session."""
+        self._conversation_history.append(
+            ConversationEntry(role="assistant", content=msg.content)
+        )
+        if self._session is not None:
+            self._session.append("assistant", msg.content)
 
     def on_clou_processing_started(self, msg: ClouProcessingStarted) -> None:
         """Message picked up by model — record in history, update queue count."""
@@ -507,22 +717,28 @@ class ClouApp(App[None]):
         self._dag_deps = msg.deps
 
     def on_clou_escalation_arrived(self, msg: ClouEscalationArrived) -> None:
-        """Escalation arrived — store data and enter decision mode."""
-        self._pending_escalation = (
+        """Escalation arrived — queue and enter decision mode."""
+        self._escalation_queue.append((
             msg.path,
             msg.classification,
             msg.issue,
             msg.options,
-        )
+        ))
+        # Already in DECISION — the queued escalation fires when the current one resolves.
+        if self.mode is Mode.DECISION:
+            return
         if not self.transition_mode(Mode.DECISION):
-            self._pending_escalation = None
             _log.warning(
-                "Cannot transition to DECISION from %s — escalation dropped",
+                "Cannot transition to DECISION from %s — escalation queued for later",
                 self.mode,
             )
 
     def on_clou_escalation_resolved(self, msg: ClouEscalationResolved) -> None:
-        """Escalation resolved — return to the mode we were in before DECISION."""
+        """Escalation resolved — show next queued or return to pre-decision mode."""
+        if self._escalation_queue:
+            # More escalations waiting — push the next one immediately.
+            self._push_pending_escalation()
+            return
         target = (
             self._pre_decision_mode
             if self._pre_decision_mode != Mode.DECISION

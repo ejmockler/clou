@@ -4,6 +4,15 @@ Entry point for the Clou system. Manages supervisor and coordinator
 sessions via the Claude Agent SDK. The orchestrator is invisible
 plumbing — the user interacts with the supervisor session.
 
+Telemetry integration:
+    The orchestrator instruments the milestone lifecycle via
+    ``clou.telemetry``.  Milestone start/end events, per-cycle spans
+    (with token deltas from ``clou.tokens.TokenTracker``), agent
+    lifecycle events, and failure events are emitted into the JSONL
+    span log.  At milestone completion, ``write_milestone_summary``
+    aggregates the span log into ``.clou/milestones/<name>/metrics.md``
+    (golden context, Narrative validation tier — DB-12).
+
 Public API:
     main() -> None
 """
@@ -25,19 +34,30 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     SandboxSettings,
     TaskNotificationMessage,
+    ToolPermissionContext,
     create_sdk_mcp_server,
     tool,
 )
 
+from clou.harness import (
+    HarnessTemplate,
+    load_template,
+    read_template_name,
+    template_mcp_servers,
+)
 from clou.hooks import HookConfig, build_hooks
 from clou.prompts import build_cycle_prompt, load_prompt
 from clou.recovery import (
+    attempt_self_heal,
     determine_next_cycle,
     git_commit_phase,
     git_revert_golden_context,
+    log_self_heal_attempt,
     parse_checkpoint,
     read_cycle_count,
     read_cycle_outcome,
@@ -45,10 +65,17 @@ from clou.recovery import (
     write_cycle_limit_escalation,
     write_validation_escalation,
 )
+from clou.gate import UserGate
 from clou.tokens import TokenTracker
-from clou.tools import clou_init, clou_spawn_coordinator, clou_status
+from clou.tools import clou_create_milestone, clou_init, clou_spawn_coordinator, clou_status
 from clou.ui.bridge import _strip_ansi
-from clou.validation import validate_golden_context
+from clou.validation import (
+    ValidationFinding,
+    errors_only,
+    validate_golden_context,
+    warnings_only,
+)
+from clou import telemetry
 
 log = logging.getLogger("clou")
 
@@ -57,20 +84,17 @@ log = logging.getLogger("clou")
 # ---------------------------------------------------------------------------
 
 _MAX_CYCLES = 20
+_NEXT_STEP: dict[str, str] = {
+    "PLAN": "EXECUTE",
+    "EXECUTE": "ASSESS",
+    "ASSESS": "VERIFY",
+    "VERIFY": "EXIT",
+    "EXIT": "COMPLETE",
+}
 _MAX_VALIDATION_RETRIES = 3
 _MAX_CRASH_RETRIES = 3
 _MAX_BUDGET_USD: float | None = None  # No per-cycle cost cap by default
 _MILESTONE_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-_BRUTALIST_MCP: Any = {
-    "command": "npx",
-    "args": ["-y", "@brutalist/mcp@latest"],
-    "type": "stdio",
-}
-_CDP_MCP: Any = {
-    "command": "npx",
-    "args": ["-y", "chrome-devtools-mcp@latest"],
-    "type": "stdio",
-}
 
 # Module-level reference to the active Textual app.  Set by run_coordinator
 # so _run_single_cycle can route messages without a signature change (which
@@ -148,80 +172,28 @@ def _context_exhausted(msg: object) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _build_agents(project_dir: Path, milestone: str) -> dict[str, AgentDefinition]:
-    """Build AgentDefinition dict for coordinator's agent teams."""
+def _build_agents(
+    project_dir: Path,
+    milestone: str,
+    template: HarnessTemplate | None = None,
+) -> dict[str, AgentDefinition]:
+    """Build AgentDefinition dict for coordinator's agent teams.
+
+    When *template* is provided, agent definitions are derived from the
+    template's ``agents`` dict.  Otherwise falls back to the default
+    software-construction template.
+    """
+    if template is None:
+        template = load_template("software-construction")
+
     return {
-        "implementer": AgentDefinition(
-            description=(
-                "Implement code changes for assigned tasks. "
-                "Read compose.py for your function signature, phase.md "
-                "for context. Write results to execution.md."
-            ),
-            prompt=load_prompt("worker", project_dir, milestone=milestone),
-            tools=[
-                "Read",
-                "Write",
-                "Edit",
-                "MultiEdit",
-                "Bash",
-                "Grep",
-                "Glob",
-                "WebSearch",
-                "WebFetch",
-            ],
-            model="opus",
-        ),
-        "assessor": AgentDefinition(
-            description=(
-                "Invoke Brutalist quality gates on changed code and "
-                "structure findings into assessment.md. Does not "
-                "evaluate findings — captures only."
-            ),
-            prompt=load_prompt("assessor", project_dir, milestone=milestone),
-            tools=[
-                "Read",
-                "Write",
-                "Bash",
-                "Grep",
-                "Glob",
-                "mcp__brutalist__roast_codebase",
-                "mcp__brutalist__roast_architecture",
-                "mcp__brutalist__roast_security",
-                "mcp__brutalist__roast_product",
-                "mcp__brutalist__roast_infrastructure",
-                "mcp__brutalist__roast_file_structure",
-                "mcp__brutalist__roast_dependencies",
-                "mcp__brutalist__roast_test_coverage",
-            ],
-            model="opus",
-        ),
-        "verifier": AgentDefinition(
-            description=(
-                "Verify milestone completion by perceiving the software "
-                "as a user would. Materialize the dev environment, walk "
-                "golden paths, explore adversarially, prepare handoff.md."
-            ),
-            prompt=load_prompt("verifier", project_dir, milestone=milestone),
-            tools=[
-                "Read",
-                "Write",
-                "Bash",
-                "Grep",
-                "Glob",
-                "WebSearch",
-                "WebFetch",
-                # CDP browser verification tools
-                "mcp__cdp__navigate",
-                "mcp__cdp__screenshot",
-                "mcp__cdp__accessibility_snapshot",
-                "mcp__cdp__evaluate_javascript",
-                "mcp__cdp__click",
-                "mcp__cdp__type",
-                "mcp__cdp__network_get_response_body",
-                "mcp__cdp__console_messages",
-            ],
-            model="opus",
-        ),
+        name: AgentDefinition(
+            description=spec.description,
+            prompt=load_prompt(spec.prompt_ref, project_dir, milestone=milestone),
+            tools=spec.tools,
+            model=spec.model,
+        )
+        for name, spec in template.agents.items()
     }
 
 
@@ -233,6 +205,7 @@ def _build_agents(project_dir: Path, milestone: str) -> dict[str, AgentDefinitio
 def _build_mcp_server(
     project_dir: Path,
     app: ClouApp | None = None,
+    gate: UserGate | None = None,
 ) -> Any:
     """Build the in-process MCP server with Clou tools."""
 
@@ -287,8 +260,10 @@ def _build_mcp_server(
                     "type": "text",
                     "text": (
                         f"Coordinator for '{milestone}' {result}. "
-                        f"Read {project_dir / '.clou' / 'milestones' / milestone / 'status.md'} "
-                        f"and {project_dir / '.clou' / 'milestones' / milestone / 'handoff.md'} for results."
+                        f"Read {project_dir / '.clou' / 'milestones' / milestone / 'handoff.md'}, "
+                        f"{project_dir / '.clou' / 'milestones' / milestone / 'decisions.md'}, "
+                        f"{project_dir / '.clou' / 'milestones' / milestone / 'status.md'}, "
+                        f"and {project_dir / '.clou' / 'milestones' / milestone / 'metrics.md'} for results."
                     ),
                 }
             ]
@@ -305,15 +280,53 @@ def _build_mcp_server(
 
     @tool(
         "clou_init",
-        "Initialize .clou/ directory structure for a new project.",
+        "Initialize .clou/ directory structure for a new project. "
+        "Call this after converging with the user on what to build.",
         {"project_name": str, "description": str},
     )
     async def init_tool(args: dict[str, Any]) -> dict[str, Any]:
-        text = await clou_init(project_dir, args["project_name"], args["description"])
+        text = await clou_init(
+            project_dir, args["project_name"], args.get("description", "")
+        )
         return {"content": [{"type": "text", "text": text}]}
 
+    @tool(
+        "clou_create_milestone",
+        "Create a new milestone directory with milestone.md and requirements.md. "
+        "Call this after converging with the user, before spawning a coordinator.",
+        {"milestone": str, "milestone_content": str, "requirements_content": str},
+    )
+    async def create_milestone_tool(args: dict[str, Any]) -> dict[str, Any]:
+        milestone = args["milestone"]
+        validate_milestone_name(milestone)
+        text = await clou_create_milestone(
+            project_dir,
+            milestone,
+            args["milestone_content"],
+            args["requirements_content"],
+        )
+        return {"content": [{"type": "text", "text": text}]}
+
+    @tool(
+        "ask_user",
+        "Pause and wait for the user's response. Call this after "
+        "presenting questions or choices in your text output. "
+        "Returns the user's answer as plain text.",
+        {},
+    )
+    async def ask_user_tool(args: dict[str, Any]) -> dict[str, Any]:
+        if gate is None:
+            return {
+                "content": [{"type": "text", "text": "No gate available."}],
+                "is_error": True,
+            }
+        gate.open()
+        answer = await gate.wait()
+        return {"content": [{"type": "text", "text": answer}]}
+
     return create_sdk_mcp_server(
-        "clou", tools=[spawn_coordinator_tool, status_tool, init_tool]
+        "clou",
+        tools=[spawn_coordinator_tool, status_tool, init_tool, create_milestone_tool, ask_user_tool],
     )
 
 
@@ -328,20 +341,49 @@ async def run_supervisor(
 ) -> None:
     """Start and manage the supervisor session."""
     clou_dir = project_dir / ".clou"
-    clou_server = _build_mcp_server(project_dir, app=app)
-    hooks = _to_sdk_hooks(build_hooks("supervisor", project_dir))
+    user_gate = UserGate()
+    clou_server = _build_mcp_server(project_dir, app=app, gate=user_gate)
+
+    # Load harness template for MCP servers and hook permissions.
+    tmpl_name = read_template_name(project_dir)
+    tmpl = load_template(tmpl_name)
+    hooks = _to_sdk_hooks(build_hooks("supervisor", project_dir, template=tmpl))
+
+    # Supervisor gets quality gate MCP servers + clou (not all template
+    # servers — e.g., CDP is for the verifier, not the supervisor).
+    gate_servers = {g.mcp_server for g in tmpl.quality_gates}
+    all_mcp = template_mcp_servers(tmpl)
+    mcp_dict: dict[str, Any] = {
+        name: spec for name, spec in all_mcp.items() if name in gate_servers
+    }
+    mcp_dict["clou"] = clou_server
 
     # The SDK session's working directory is where the user invoked clou,
     # not necessarily where .clou/ lives (which may be the global workspace).
     work_dir = getattr(app, "_work_dir", project_dir) if app else project_dir
 
+    # Block built-in AskUserQuestion — it requires the interactive
+    # permission component which bypassPermissions skips.  The model
+    # should use ask_user (clou MCP tool) instead.
+    async def _can_use_tool(
+        name: str,
+        tool_input: dict[str, Any],
+        ctx: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        if name == "AskUserQuestion":
+            return PermissionResultDeny(
+                message="Use ask_user instead. It pauses for user input.",
+            )
+        return PermissionResultAllow()
+
     options = ClaudeAgentOptions(
         system_prompt=load_prompt("supervisor", project_dir),
-        permission_mode="acceptEdits",
+        permission_mode="bypassPermissions",
         cwd=str(work_dir),
         model="opus",
         hooks=hooks,
-        mcp_servers={"clou": clou_server, "brutalist": _BRUTALIST_MCP},
+        mcp_servers=mcp_dict,
+        can_use_tool=_can_use_tool,
     )
 
     async with ClaudeSDKClient(options=options) as supervisor:
@@ -367,10 +409,21 @@ async def run_supervisor(
                 await supervisor.query(resume_ctx)
             else:
                 # Fallback: resume_id was set but transcript is empty/missing.
+                log.warning("Session %s could not be restored", resume_id)
+                if app is not None:
+                    from contextlib import suppress
+
+                    from clou.ui.widgets.conversation import ConversationWidget
+
+                    with suppress(LookupError):
+                        app.query_one(ConversationWidget).add_error_message(
+                            f"Could not restore session {resume_id}. Starting fresh."
+                        )
                 await supervisor.query(
                     f"Read your protocol file: {protocol_file}\n\n"
                     f"Then read {project_md} for context. "
-                    "Greet the user and ask what they'd like to build."
+                    "The user's session could not be restored. "
+                    "Greet them and orient from the project context."
                 )
         else:
             # Normal startup — adapt based on whether project has golden context.
@@ -383,17 +436,43 @@ async def run_supervisor(
             elif project_md.exists():
                 await supervisor.query(
                     f"Read your protocol file: {protocol_file}\n\n"
-                    f"Then read {project_md} for context. "
-                    "Greet the user and ask what they'd like to build."
+                    f"Then read {project_md} and {roadmap_md} for context.\n\n"
+                    "The user has an existing project. Orient yourself "
+                    "from the golden context and greet them."
                 )
             else:
-                await supervisor.query(
-                    f"Read your protocol file: {protocol_file}\n\n"
-                    "Greet the user and ask what they'd like to build."
+                # No .clou/ — but there may be existing code in the directory.
+                has_existing_code = any(
+                    work_dir.glob(p)
+                    for p in ("*.py", "*.ts", "*.js", "*.go", "*.rs",
+                              "package.json", "pyproject.toml", "Cargo.toml",
+                              "go.mod", "Makefile", "src/", "lib/")
                 )
+                if has_existing_code:
+                    await supervisor.query(
+                        f"Read your protocol file: {protocol_file}\n\n"
+                        "This is the first time Clou is running in this "
+                        "directory, but there is existing code here. "
+                        "Greet the user and let them tell you what they "
+                        "want to do with their project. They may want to "
+                        "add a feature, fix a bug, refactor, or something "
+                        "else. Follow the convergence protocol: listen, "
+                        "then propose, then refine."
+                    )
+                else:
+                    await supervisor.query(
+                        f"Read your protocol file: {protocol_file}\n\n"
+                        "This is a greenfield project — no code and no "
+                        ".clou/ directory exist yet. Greet the user and "
+                        "let them tell you what they're thinking. Follow "
+                        "the convergence protocol: listen, then propose, "
+                        "then refine. Do not start with questions."
+                    )
 
         # Feed user input concurrently — receive_messages() is a
         # long-lived generator; query() injects into the same stream.
+        _input_dead = asyncio.Event()
+
         async def _feed_user_input() -> None:
             assert app is not None
             while True:
@@ -407,35 +486,67 @@ async def run_supervisor(
                 for p in pending:
                     p.cancel()
 
-                if compact_wait in done:
-                    app._compact_requested.clear()
-                    instructions = app._compact_instructions or (
-                        "Summarize the conversation so far, preserving key "
-                        "decisions, code context, and open tasks."
-                    )
-                    # Inject a compaction-focused message into the session.
-                    # The SDK will process this within the existing context.
-                    await supervisor.query(
-                        f"[SYSTEM: Context compaction requested. {instructions}. "
-                        f"Acknowledge briefly and continue.]"
-                    )
-                    app._compaction_count += 1
-                    app._compact_complete.set()
-                    continue
+                try:
+                    if compact_wait in done:
+                        app._compact_requested.clear()
+                        instructions = app._compact_instructions or (
+                            "Summarize the conversation so far, preserving key "
+                            "decisions, code context, and open tasks."
+                        )
+                        await supervisor.query(
+                            f"[SYSTEM: Context compaction requested. {instructions}. "
+                            f"Acknowledge briefly and continue.]"
+                        )
+                        app._compaction_count += 1
+                        app._compact_complete.set()
 
-                if input_wait in done:
-                    text = input_wait.result()
-                    # Signal that this queued message is now being processed.
+                    if input_wait in done:
+                        text = input_wait.result()
+                        from contextlib import suppress
+
+                        from clou.ui.messages import ClouProcessingStarted
+                        from clou.ui.widgets.conversation import ConversationWidget
+
+                        if user_gate.is_open:
+                            # Route to the waiting MCP tool instead of
+                            # injecting a new supervisor message.
+                            user_gate.respond(text)
+                        else:
+                            # Deliver to the model FIRST — only then tell
+                            # the UI the message was picked up.
+                            await supervisor.query(text)
+
+                        with suppress(LookupError):
+                            app.query_one(ConversationWidget).post_message(
+                                ClouProcessingStarted(text=text)
+                            )
+                except Exception:
+                    log.exception("_feed_user_input: query() failed")
+                    # Surface the error so the user knows the session is broken.
                     from contextlib import suppress
 
-                    from clou.ui.messages import ClouProcessingStarted
                     from clou.ui.widgets.conversation import ConversationWidget
 
                     with suppress(LookupError):
-                        app.query_one(ConversationWidget).post_message(
-                            ClouProcessingStarted(text=text)
+                        conv = app.query_one(ConversationWidget)
+                        conv.add_error_message(
+                            "Lost connection to model — input may not be delivered."
                         )
-                    await supervisor.query(text)
+                        conv.reset_turn_state()
+                    # Drain the queue so stale messages don't pile up.
+                    while not app._user_input_queue.empty():
+                        try:
+                            app._user_input_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    app._queue_count = 0
+                    with suppress(LookupError):
+                        app.query_one(ConversationWidget).update_queue_count(0)
+                    # Signal the receive_messages loop to stop — otherwise the
+                    # worker stays alive ("zombie") accepting input into a dead
+                    # queue that nobody will ever read.
+                    _input_dead.set()
+                    return
 
         input_task: asyncio.Task[None] | None = None
         if app is not None:
@@ -443,12 +554,15 @@ async def run_supervisor(
 
         # Resolve post target — post to ConversationWidget so handlers
         # fire there AND bubble up to the app for status bar updates.
-        _post = app.post_message
+        # Only meaningful when app is present (the app-is-None path calls
+        # _display() directly in the receive loop below).
+        _post: Any = None
         if app is not None:
             from contextlib import suppress
 
             from clou.ui.widgets.conversation import ConversationWidget
 
+            _post = app.post_message
             with suppress(LookupError):
                 _post = app.query_one(ConversationWidget).post_message
 
@@ -461,6 +575,11 @@ async def run_supervisor(
                 else:
                     _display(msg)
                 _track(msg, tier="supervisor")
+                # If the input feeder died (e.g. broken pipe), stop
+                # consuming — the session is unrecoverable.
+                if _input_dead.is_set():
+                    log.warning("Input feeder dead — stopping supervisor")
+                    break
         finally:
             if input_task is not None:
                 input_task.cancel()
@@ -482,16 +601,57 @@ async def run_coordinator(
 
     validate_milestone_name(milestone)
 
+    # Load the active harness template once per milestone.
+    tmpl_name = read_template_name(project_dir)
+    tmpl = load_template(tmpl_name)
+    log.info("Using harness template: %s", tmpl.name)
+
     clou_dir = project_dir / ".clou"
     checkpoint_path = clou_dir / "active" / "coordinator.md"
     # Outside .clou/active/ so git_revert_golden_context doesn't touch it.
     milestone_marker = clou_dir / ".coordinator-milestone"
     validation_retries = 0
     crash_retries = 0
-    pending_validation_errors: list[str] | None = None
+    pending_validation_errors: list[ValidationFinding] | None = None
 
     decisions_path = clou_dir / "milestones" / milestone / "decisions.md"
+    seen_path = clou_dir / "active" / "seen-escalations.txt"
     seen_escalations: set[str] = set()
+    if seen_path.exists():
+        seen_escalations = set(seen_path.read_text().splitlines())
+
+    def _post_new_escalations() -> None:
+        """Scan for new escalation files and post them to the UI."""
+        if _active_app is None:
+            return
+        esc_dir = clou_dir / "milestones" / milestone / "escalations"
+        if not esc_dir.is_dir():
+            return
+        for esc_file in sorted(esc_dir.glob("*.md")):
+            if esc_file.name not in seen_escalations:
+                seen_escalations.add(esc_file.name)
+                seen_path.write_text(
+                    "\n".join(sorted(seen_escalations)) + "\n"
+                )
+                try:
+                    from clou.ui.bridge import parse_escalation
+                    from clou.ui.messages import ClouEscalationArrived
+
+                    data = parse_escalation(esc_file)
+                    _active_app.post_message(
+                        ClouEscalationArrived(
+                            path=esc_file,
+                            classification=data["classification"],
+                            issue=data["issue"],
+                            options=data["options"],
+                        )
+                    )
+                except Exception:
+                    log.debug(
+                        "Could not parse escalation %s",
+                        esc_file,
+                        exc_info=True,
+                    )
 
     # Clear stale checkpoint from a previous milestone.
     # Serial execution guarantees one coordinator at a time, so a
@@ -503,6 +663,8 @@ async def run_coordinator(
     milestone_marker.parent.mkdir(parents=True, exist_ok=True)
     milestone_marker.write_text(milestone)
 
+    _ms_outcome = "unknown"
+    telemetry.event("milestone.start", milestone=milestone)
     try:
         while True:
             cycle_type, read_set = determine_next_cycle(
@@ -513,12 +675,17 @@ async def run_coordinator(
 
             if cycle_type == "COMPLETE":
                 log.info("Milestone %r complete", milestone)
+                if seen_path.exists():
+                    seen_path.unlink()
+                _ms_outcome = "completed"
                 return "completed"
 
             cycle_count = read_cycle_count(checkpoint_path)
             if cycle_count >= _MAX_CYCLES:
                 log.warning("Milestone %r hit %d-cycle limit", milestone, _MAX_CYCLES)
                 await write_cycle_limit_escalation(project_dir, milestone, cycle_count)
+                _post_new_escalations()
+                _ms_outcome = "escalated_cycle_limit"
                 return "escalated_cycle_limit"
 
             prompt = build_cycle_prompt(
@@ -527,6 +694,7 @@ async def run_coordinator(
                 cycle_type,
                 read_set,
                 validation_errors=pending_validation_errors,
+                template=tmpl,
             )
             pending_validation_errors = None  # consumed
 
@@ -548,10 +716,39 @@ async def run_coordinator(
                     )
                 )
 
-            status = await _run_single_cycle(project_dir, milestone, cycle_type, prompt)
+                # Post DAG at cycle start too — compose.py exists from PLAN onward.
+                compose_path = clou_dir / "milestones" / milestone / "compose.py"
+                if compose_path.exists():
+                    try:
+                        from clou.graph import extract_dag_data
+                        from clou.ui.messages import ClouDagUpdate
+
+                        source = compose_path.read_text(encoding="utf-8")
+                        tasks, deps = extract_dag_data(source)
+                        _active_app.post_message(ClouDagUpdate(tasks=tasks, deps=deps))
+                    except Exception:
+                        log.debug("Could not parse DAG from compose.py", exc_info=True)
+
+            _tok_before = _tracker.coordinator(milestone)
+            with telemetry.span(
+                "cycle", milestone=milestone, cycle_num=cycle_count + 1,
+                cycle_type=cycle_type,
+            ) as _cy:
+                status = await _run_single_cycle(
+                    project_dir, milestone, cycle_type, prompt,
+                    cycle_num=cycle_count + 1, template=tmpl,
+                )
+                _tok_after = _tracker.coordinator(milestone)
+                _cy["outcome"] = status
+                _cy["input_tokens"] = _tok_after["input"] - _tok_before["input"]
+                _cy["output_tokens"] = _tok_after["output"] - _tok_before["output"]
 
             if status == "failed":
                 crash_retries += 1
+                telemetry.event(
+                    "crash", milestone=milestone,
+                    cycle_num=cycle_count + 1, attempt=crash_retries,
+                )
                 log.warning(
                     "Cycle crashed for %r (attempt %d/%d), retrying",
                     milestone,
@@ -561,15 +758,27 @@ async def run_coordinator(
                 if crash_retries >= _MAX_CRASH_RETRIES:
                     log.error("Milestone %r hit crash retry limit", milestone)
                     await write_agent_crash_escalation(project_dir, milestone)
+                    _post_new_escalations()
+                    _ms_outcome = "escalated_crash_loop"
                     return "escalated_crash_loop"
                 continue
 
             if status == "agent_team_crash":
+                telemetry.event(
+                    "agent_crash", milestone=milestone,
+                    cycle_num=cycle_count + 1,
+                )
                 log.error("Agent team crash for %r, escalating", milestone)
                 await write_agent_crash_escalation(project_dir, milestone)
+                _post_new_escalations()
+                _ms_outcome = "escalated_agent_crash"
                 return "escalated_agent_crash"
 
             if status == "exhausted":
+                telemetry.event(
+                    "context_exhausted", milestone=milestone,
+                    cycle_num=cycle_count + 1, cycle_type=cycle_type,
+                )
                 log.warning(
                     "Context exhausted for %r, continuing from checkpoint",
                     milestone,
@@ -581,9 +790,62 @@ async def run_coordinator(
                 continue
 
             # Validate golden context structure
-            validation_errors = validate_golden_context(project_dir, milestone)
+            findings = validate_golden_context(project_dir, milestone)
+            validation_errors = errors_only(findings)
+            validation_warnings = warnings_only(findings)
+
+            if validation_warnings:
+                log.info(
+                    "Validation warnings for %r (non-blocking): %s",
+                    milestone,
+                    [w.message for w in validation_warnings],
+                )
+                telemetry.event(
+                    "validation_warnings", milestone=milestone,
+                    cycle_num=cycle_count + 1,
+                    warning_count=len(validation_warnings),
+                )
+
+            if validation_errors:
+                # Try self-heal before counting as a failure.
+                healed = attempt_self_heal(
+                    project_dir, milestone, validation_errors,
+                )
+                if healed:
+                    log.info(
+                        "Self-healed %d issue(s) for %r: %s",
+                        len(healed), milestone, healed,
+                    )
+                    telemetry.event(
+                        "self_heal", milestone=milestone,
+                        cycle_num=cycle_count + 1,
+                        fix_count=len(healed),
+                    )
+                    # Re-validate after heal.
+                    findings = validate_golden_context(project_dir, milestone)
+                    validation_errors = errors_only(findings)
+                    validation_warnings = warnings_only(findings)
+                    log_self_heal_attempt(
+                        project_dir, milestone, healed, validation_errors,
+                    )
+
+                if validation_warnings and healed:
+                    # Log warnings again after re-validation.
+                    log.info(
+                        "Validation warnings for %r after self-heal "
+                        "(non-blocking): %s",
+                        milestone,
+                        [w.message for w in validation_warnings],
+                    )
+
             if validation_errors:
                 validation_retries += 1
+                telemetry.event(
+                    "validation_failure", milestone=milestone,
+                    cycle_num=cycle_count + 1, attempt=validation_retries,
+                    error_count=len(validation_errors),
+                    warning_count=len(validation_warnings),
+                )
                 log.warning(
                     "Validation failed for %r (attempt %d/%d): %s",
                     milestone,
@@ -593,14 +855,16 @@ async def run_coordinator(
                 )
                 if validation_retries >= _MAX_VALIDATION_RETRIES:
                     await write_validation_escalation(
-                        project_dir, milestone, validation_errors
+                        project_dir, milestone, findings
                     )
+                    _post_new_escalations()
+                    _ms_outcome = "escalated_validation"
                     return "escalated_validation"
                 try:
                     await git_revert_golden_context(project_dir, milestone)
                 except RuntimeError:
                     log.exception("Git revert failed for %r", milestone)
-                pending_validation_errors = validation_errors
+                pending_validation_errors = findings
                 continue
             else:
                 validation_retries = 0
@@ -625,12 +889,12 @@ async def run_coordinator(
                     ClouCycleComplete(
                         cycle_num=cycle_count + 1,
                         cycle_type=cycle_type,
-                        next_step="",
+                        next_step=_NEXT_STEP.get(cycle_type, ""),
                         phase_status={},
                     )
                 )
 
-            if cycle_type == "PLAN" and _active_app is not None:
+            if _active_app is not None:
                 compose_path = clou_dir / "milestones" / milestone / "compose.py"
                 if compose_path.exists():
                     try:
@@ -643,34 +907,15 @@ async def run_coordinator(
                     except Exception:
                         log.debug("Could not parse DAG from compose.py", exc_info=True)
 
-            if _active_app is not None:
-                esc_dir = clou_dir / "milestones" / milestone / "escalations"
-                if esc_dir.is_dir():
-                    for esc_file in sorted(esc_dir.glob("*.md")):
-                        if esc_file.name not in seen_escalations:
-                            seen_escalations.add(esc_file.name)
-                            try:
-                                from clou.ui.bridge import parse_escalation
-                                from clou.ui.messages import ClouEscalationArrived
-
-                                data = parse_escalation(esc_file)
-                                _active_app.post_message(
-                                    ClouEscalationArrived(
-                                        path=esc_file,
-                                        classification=data["classification"],
-                                        issue=data["issue"],
-                                        options=data["options"],
-                                    )
-                                )
-                            except Exception:
-                                log.debug(
-                                    "Could not parse escalation %s",
-                                    esc_file,
-                                    exc_info=True,
-                                )
+            _post_new_escalations()
 
         return "completed"  # unreachable, but satisfies mypy
     finally:
+        try:
+            telemetry.write_milestone_summary(project_dir, milestone, _ms_outcome)
+            telemetry.event("milestone.end", milestone=milestone, outcome=_ms_outcome)
+        except Exception:
+            log.warning("telemetry summary write failed for %r", milestone, exc_info=True)
         _active_app = None
 
 
@@ -684,20 +929,30 @@ async def _run_single_cycle(
     milestone: str,
     cycle_type: str,
     prompt: str,
+    *,
+    cycle_num: int = 0,
+    template: HarnessTemplate | None = None,
 ) -> str:
     """Run one coordinator cycle as a fresh session."""
-    hooks = _to_sdk_hooks(build_hooks("coordinator", project_dir, milestone=milestone))
+    if template is None:
+        template = load_template("software-construction")
+
+    hooks = _to_sdk_hooks(
+        build_hooks(
+            "coordinator", project_dir, milestone=milestone, template=template,
+        )
+    )
 
     options = ClaudeAgentOptions(
         system_prompt=load_prompt("coordinator", project_dir, milestone=milestone),
         permission_mode="bypassPermissions",
         cwd=str(project_dir),
         model="opus",
-        agents=_build_agents(project_dir, milestone),
+        agents=_build_agents(project_dir, milestone, template),
         hooks=hooks,
         max_budget_usd=_MAX_BUDGET_USD,
         effort="max" if cycle_type in ("ASSESS", "VERIFY") else "high",
-        mcp_servers={"brutalist": _BRUTALIST_MCP, "cdp": _CDP_MCP},
+        mcp_servers=template_mcp_servers(template),
         sandbox=SandboxSettings(
             enabled=True,
             autoAllowBashIfSandboxed=True,
@@ -713,14 +968,56 @@ async def _run_single_cycle(
                 _track(msg, tier="coordinator", milestone=milestone)
 
                 if _active_app is not None:
+                    from contextlib import suppress
+
                     from clou.ui.bridge import route_coordinator_message
+                    from clou.ui.widgets.breath import BreathWidget
+
+                    # Post to the BreathWidget so handlers fire there.
+                    # app.post_message doesn't propagate downward in
+                    # Textual — messages bubble up, not down.
+                    _coord_post = _active_app.post_message
+                    with suppress(LookupError):
+                        _coord_post = _active_app.query_one(
+                            BreathWidget
+                        ).post_message
 
                     route_coordinator_message(
                         msg,
                         milestone,
                         cycle_type,
-                        _active_app.post_message,
+                        _coord_post,
                     )
+
+                # Agent lifecycle telemetry.
+                # Detection logic parallels bridge.py's duck-typing for
+                # TaskStartedMessage / TaskNotificationMessage.  Kept
+                # separate: bridge translates for UI, this records for
+                # the telemetry span log.
+                if hasattr(msg, "task_id"):
+                    if (
+                        hasattr(msg, "description")
+                        and not hasattr(msg, "status")
+                        and not hasattr(msg, "last_tool_name")
+                    ):
+                        telemetry.event(
+                            "agent.start",
+                            milestone=milestone,
+                            cycle_num=cycle_num,
+                            task_id=msg.task_id,
+                            description=msg.description,
+                        )
+                    elif hasattr(msg, "status") and hasattr(msg, "summary"):
+                        _au = getattr(msg, "usage", {}) or {}
+                        telemetry.event(
+                            "agent.end",
+                            milestone=milestone,
+                            cycle_num=cycle_num,
+                            task_id=msg.task_id,
+                            status=msg.status,
+                            total_tokens=_au.get("total_tokens", 0),
+                            tool_uses=_au.get("tool_uses", 0),
+                        )
 
                 if _context_exhausted(msg):
                     log.warning(

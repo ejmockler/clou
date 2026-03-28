@@ -7,7 +7,12 @@ Public API:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from clou.harness import HarnessTemplate
 
 #: Bundled prompt templates shipped with the package — global, not per-project.
 _BUNDLED_PROMPTS = Path(__file__).parent / "_prompts"
@@ -35,7 +40,8 @@ def build_cycle_prompt(
     milestone: str,
     cycle_type: str,
     read_set: list[str],
-    validation_errors: list[str] | None = None,
+    validation_errors: Sequence[object] | None = None,
+    template: HarnessTemplate | None = None,
 ) -> str:
     """Construct targeted prompt for a single cycle.
 
@@ -59,6 +65,12 @@ def build_cycle_prompt(
         f"Execute the {cycle_type} protocol. "
         f"Write all state to golden context before exiting."
     )
+
+    if template:
+        prompt += f"\n\nActive harness: {template.name}."
+        if cycle_type in ("ASSESS", "VERIFY") and template.quality_gates:
+            gate_names = [g.mcp_server for g in template.quality_gates]
+            prompt += f"\nQuality gates: {', '.join(gate_names)}."
 
     if validation_errors:
         error_list = "\n".join(f"  - {e}" for e in validation_errors)

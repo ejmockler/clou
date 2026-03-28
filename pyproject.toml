@@ -24,6 +24,7 @@ build-backend = "hatchling.build"
 testpaths = ["tests"]
 xfail_strict = true
 asyncio_mode = "auto"
+addopts = "-m 'not integration'"
 markers = [
     "integration: tests requiring live Claude CLI auth (deselect with -m 'not integration')",
 ]

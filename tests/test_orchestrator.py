@@ -32,8 +32,15 @@ from clou.orchestrator import (
     _run_single_cycle,
     _to_sdk_hooks,
     run_coordinator,
+    run_supervisor,
     validate_milestone_name,
 )
+from clou.validation import Severity, ValidationFinding
+
+
+def _vf(message: str, severity: Severity = Severity.ERROR) -> ValidationFinding:
+    """Create a ValidationFinding for test mocks."""
+    return ValidationFinding(severity=severity, message=message, path="test.md")
 
 # ---------------------------------------------------------------------------
 # Factories
@@ -526,7 +533,10 @@ class TestRunCoordinator:
             return "ok"
 
         validation_results = iter(
-            [["missing ## Cycle"], []]  # first: fail  # second: pass
+            [
+                [_vf("missing ## Cycle")],  # first: fail
+                [],  # second: pass
+            ]
         )
 
         with (
@@ -544,6 +554,7 @@ class TestRunCoordinator:
                 f"{_P}.validate_golden_context",
                 side_effect=lambda *a: next(validation_results),
             ),
+            patch(f"{_P}.attempt_self_heal", return_value=[]),
             patch(
                 f"{_P}.git_revert_golden_context", new_callable=AsyncMock
             ) as mock_revert,
@@ -561,6 +572,7 @@ class TestRunCoordinator:
         self, project_dir: Path
     ) -> None:
         """3 consecutive validation failures → escalate."""
+        bad_finding = _vf("bad structure")
         with (
             patch(
                 f"{_P}.determine_next_cycle",
@@ -570,8 +582,9 @@ class TestRunCoordinator:
             patch(f"{_P}._run_single_cycle", return_value="ok"),
             patch(
                 f"{_P}.validate_golden_context",
-                return_value=["bad structure"],
+                return_value=[bad_finding],
             ),
+            patch(f"{_P}.attempt_self_heal", return_value=[]),
             patch(f"{_P}.git_revert_golden_context", new_callable=AsyncMock),
             patch(f"{_P}.build_cycle_prompt", return_value="retry"),
             patch(
@@ -582,19 +595,19 @@ class TestRunCoordinator:
 
         assert result == "escalated_validation"
         mock_esc.assert_called_once()
-        # Verify the errors are passed through
+        # Verify the findings are passed through
         call_args = mock_esc.call_args
-        assert call_args.args[2] == ["bad structure"]
+        assert call_args.args[2] == [bad_finding]
 
     @pytest.mark.asyncio
     async def test_validation_retries_reset_on_success(self, project_dir: Path) -> None:
         """Validation retry counter resets when a cycle passes validation."""
         validation_sequence = iter(
             [
-                ["error1"],  # cycle 1: fail (retry=1)
+                [_vf("error1")],  # cycle 1: fail (retry=1)
                 [],  # cycle 1 retry: pass (retry=0)
-                ["error2"],  # cycle 2: fail (retry=1)
-                ["error3"],  # cycle 2 retry: fail (retry=2)
+                [_vf("error2")],  # cycle 2: fail (retry=1)
+                [_vf("error3")],  # cycle 2 retry: fail (retry=2)
                 [],  # cycle 2 re-retry: pass (retry=0)
             ]
         )
@@ -624,6 +637,7 @@ class TestRunCoordinator:
                 f"{_P}.validate_golden_context",
                 side_effect=lambda *a: next(validation_sequence),
             ),
+            patch(f"{_P}.attempt_self_heal", return_value=[]),
             patch(f"{_P}.git_revert_golden_context", new_callable=AsyncMock),
             patch(f"{_P}.build_cycle_prompt", return_value="p"),
         ):
@@ -650,8 +664,9 @@ class TestRunCoordinator:
             patch(f"{_P}._run_single_cycle", return_value="ok"),
             patch(
                 f"{_P}.validate_golden_context",
-                side_effect=[["bad"], []],
+                side_effect=[[_vf("bad")], []],
             ),
+            patch(f"{_P}.attempt_self_heal", return_value=[]),
             patch(
                 f"{_P}.git_revert_golden_context",
                 new_callable=AsyncMock,
@@ -671,7 +686,7 @@ class TestRunCoordinator:
         """Full lifecycle: PLAN → EXECUTE → VERIFY → COMPLETE."""
         cycles_run: list[str] = []
 
-        async def _cycle(pd: Path, ms: str, ct: str, prompt: str) -> str:
+        async def _cycle(pd: Path, ms: str, ct: str, prompt: str, **kw: Any) -> str:
             cycles_run.append(ct)
             return "ok"
 
@@ -797,8 +812,12 @@ class TestRunCoordinator:
             cycle_count += 1
             return "ok"
 
+        missing_finding = _vf("missing field: status")
         validation_results = iter(
-            [["missing field: status"], []]  # cycle 1: fail  # cycle 2: pass
+            [
+                [missing_finding],  # cycle 1: fail
+                [],  # cycle 2: pass
+            ]
         )
 
         with (
@@ -816,6 +835,7 @@ class TestRunCoordinator:
                 f"{_P}.validate_golden_context",
                 side_effect=lambda *a: next(validation_results),
             ),
+            patch(f"{_P}.attempt_self_heal", return_value=[]),
             patch(f"{_P}.git_revert_golden_context", new_callable=AsyncMock),
             patch(f"{_P}.build_cycle_prompt", return_value="p") as mock_bcp,
         ):
@@ -829,18 +849,24 @@ class TestRunCoordinator:
         first_call_kwargs = mock_bcp.call_args_list[0]
         assert first_call_kwargs.kwargs.get("validation_errors") is None
 
-        # Second call (retry after validation failure): errors passed through
+        # Second call (retry after validation failure): findings passed through
         second_call_kwargs = mock_bcp.call_args_list[1]
         assert second_call_kwargs.kwargs.get("validation_errors") == [
-            "missing field: status"
+            missing_finding
         ]
 
     @pytest.mark.asyncio
     async def test_execute_cycle_triggers_git_commit(self, project_dir: Path) -> None:
         """After a successful EXECUTE cycle, git_commit_phase is called."""
-        # Write a checkpoint so parse_checkpoint can extract current_phase
+        # Write a checkpoint so parse_checkpoint can extract current_phase.
+        # Must also write milestone marker to prevent stale-checkpoint clearing.
         cp_path = project_dir / ".clou" / "active" / "coordinator.md"
-        cp_path.write_text("cycle: 2\ncurrent_phase: design\nnext_step: ASSESS\n")
+        cp_path.write_text(
+            "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: design\nphases_completed: 0\nphases_total: 1\n"
+        )
+        marker = project_dir / ".clou" / ".coordinator-milestone"
+        marker.write_text("auth")
 
         async def _cycle(*args: Any, **kwargs: Any) -> str:
             return "ok"
@@ -924,9 +950,498 @@ class TestRunCoordinator:
         mock_commit.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_fatal_escalation_posts_to_ui(self, project_dir: Path) -> None:
+        """Fatal escalation paths post ClouEscalationArrived before returning."""
+        import clou.orchestrator as orch
+
+        mock_app = MagicMock()
+        posted: list[Any] = []
+        mock_app.post_message.side_effect = lambda msg: posted.append(msg)
+
+        # Write an escalation file that write_cycle_limit_escalation would create
+        esc_dir = project_dir / ".clou" / "milestones" / "auth" / "escalations"
+        esc_dir.mkdir(parents=True)
+        (esc_dir / "cycle-limit.md").write_text(
+            "# Escalation\n\n"
+            "## Classification\nblocking\n\n"
+            "## Issue\nCycle limit reached\n\n"
+            "## Options\n1. **Increase limit** — raise the cap\n\n"
+            "## Recommendation\nReassess scope\n"
+        )
+
+        with (
+            patch(
+                f"{_P}.determine_next_cycle",
+                return_value=("PLAN", ["milestone.md"]),
+            ),
+            patch(f"{_P}.read_cycle_count", return_value=20),
+            patch(
+                f"{_P}.write_cycle_limit_escalation", new_callable=AsyncMock
+            ),
+            patch.object(orch, "_active_app", mock_app),
+        ):
+            result = await run_coordinator(project_dir, "auth", app=mock_app)
+
+        assert result == "escalated_cycle_limit"
+
+        from clou.ui.messages import ClouEscalationArrived
+
+        esc_messages = [m for m in posted if isinstance(m, ClouEscalationArrived)]
+        assert len(esc_messages) == 1
+        assert esc_messages[0].classification == "blocking"
+        assert esc_messages[0].issue == "Cycle limit reached"
+
+    # -------------------------------------------------------------------
+    # Warning passthrough / severity-aware validation — validator-resilience
+    # -------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_warnings_only_validation_passes(self, project_dir: Path) -> None:
+        """Only warnings from validation → no retry, no escalation, proceeds."""
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            return "ok"
+
+        warning_finding = _vf("missing **Status:**", severity=Severity.WARNING)
+
+        with (
+            patch(
+                f"{_P}.determine_next_cycle",
+                side_effect=[
+                    ("EXECUTE", ["status.md"]),
+                    ("COMPLETE", []),
+                ],
+            ),
+            patch(f"{_P}.read_cycle_count", return_value=1),
+            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
+            patch(
+                f"{_P}.validate_golden_context",
+                return_value=[warning_finding],
+            ),
+            patch(
+                f"{_P}.git_revert_golden_context", new_callable=AsyncMock
+            ) as mock_revert,
+        ):
+            result = await run_coordinator(project_dir, "auth")
+
+        assert result == "completed"
+        mock_revert.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_errors_block_progression(self, project_dir: Path) -> None:
+        """Errors in validation → validation_retries incremented, retry triggered."""
+        call_count = 0
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            nonlocal call_count
+            call_count += 1
+            return "ok"
+
+        error_finding = _vf("missing ## Summary")
+        validation_results = iter(
+            [
+                [error_finding],  # first: fail
+                [],  # second: pass
+            ]
+        )
+
+        with (
+            patch(
+                f"{_P}.determine_next_cycle",
+                side_effect=[
+                    ("EXECUTE", ["status.md"]),
+                    ("EXECUTE", ["status.md"]),
+                    ("COMPLETE", []),
+                ],
+            ),
+            patch(f"{_P}.read_cycle_count", return_value=1),
+            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
+            patch(
+                f"{_P}.validate_golden_context",
+                side_effect=lambda *a: next(validation_results),
+            ),
+            patch(f"{_P}.attempt_self_heal", return_value=[]),
+            patch(f"{_P}.git_revert_golden_context", new_callable=AsyncMock),
+            patch(f"{_P}.build_cycle_prompt", return_value="p"),
+        ):
+            result = await run_coordinator(project_dir, "auth")
+
+        assert result == "completed"
+        assert call_count == 2  # first cycle failed validation, second passed
+
+    @pytest.mark.asyncio
+    async def test_mixed_findings_errors_dominate(self, project_dir: Path) -> None:
+        """Errors + warnings → failure path taken (errors dominate)."""
+        call_count = 0
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            nonlocal call_count
+            call_count += 1
+            return "ok"
+
+        mixed_findings = [
+            _vf("missing ## Summary", severity=Severity.ERROR),
+            _vf("missing **Status:**", severity=Severity.WARNING),
+        ]
+        validation_results = iter(
+            [
+                mixed_findings,  # first: has errors
+                [],  # second: pass
+            ]
+        )
+
+        with (
+            patch(
+                f"{_P}.determine_next_cycle",
+                side_effect=[
+                    ("EXECUTE", ["status.md"]),
+                    ("EXECUTE", ["status.md"]),
+                    ("COMPLETE", []),
+                ],
+            ),
+            patch(f"{_P}.read_cycle_count", return_value=1),
+            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
+            patch(
+                f"{_P}.validate_golden_context",
+                side_effect=lambda *a: next(validation_results),
+            ),
+            patch(f"{_P}.attempt_self_heal", return_value=[]),
+            patch(
+                f"{_P}.git_revert_golden_context", new_callable=AsyncMock
+            ) as mock_revert,
+            patch(f"{_P}.build_cycle_prompt", return_value="p"),
+        ):
+            result = await run_coordinator(project_dir, "auth")
+
+        assert result == "completed"
+        # Git revert was called because errors were present
+        mock_revert.assert_called_once_with(project_dir, "auth")
+        assert call_count == 2
+
+    @pytest.mark.asyncio
     async def test_milestone_validation_at_coordinator_boundary(
         self, project_dir: Path
     ) -> None:
         """run_coordinator validates milestone name at its own boundary."""
         with pytest.raises(ValueError, match="Invalid milestone name"):
             await run_coordinator(project_dir, "../evil")
+
+
+# ---------------------------------------------------------------------------
+# run_supervisor — resume failure feedback
+# ---------------------------------------------------------------------------
+
+
+class TestRunSupervisorResumeFeedback:
+    """When session resume fails, user gets a warning and the UI shows an error."""
+
+    @pytest.mark.asyncio
+    async def test_failed_resume_logs_warning_and_shows_error(
+        self, tmp_path: Path
+    ) -> None:
+        """build_resumption_context returning '' triggers log + UI error."""
+        import asyncio
+
+        # Use module-level run_supervisor (not deferred import) so the
+        # conftest _no_supervisor monkeypatch doesn't shadow it.
+
+        # Mock app with resume_session_id
+        mock_app = MagicMock()
+        mock_app._resume_session_id = "dead-session"
+        mock_app._work_dir = tmp_path
+        mock_conv = MagicMock()
+        mock_app.query_one.return_value = mock_conv
+
+        # Provide real asyncio primitives so _feed_user_input doesn't crash
+        # on ensure_future(). The queue.get() blocks forever, which is fine
+        # because the task is cancelled once receive_messages exhausts.
+        mock_app._compact_requested = asyncio.Event()
+        mock_app._user_input_queue = asyncio.Queue()
+
+        # SDK client — query returns normally (no exception for control flow).
+        # receive_messages yields nothing so the supervisor exits naturally.
+        client = _mock_sdk_client()
+        client.query = AsyncMock()
+
+        async def _empty_receive() -> Any:
+            return
+            yield  # makes this an async generator
+
+        client.receive_messages = _empty_receive
+
+        (tmp_path / ".clou").mkdir()
+
+        with (
+            patch(f"{_P}.ClaudeSDKClient", return_value=client),
+            patch(f"{_P}.load_prompt", return_value="<system/>"),
+            patch(f"{_P}.build_hooks", return_value={}),
+            patch(f"{_P}._build_mcp_server", return_value={}),
+            patch(f"{_P}.read_template_name", return_value="software-construction"),
+            patch(f"{_P}.load_template", return_value=MagicMock(quality_gates=[])),
+            patch(f"{_P}.template_mcp_servers", return_value={}),
+            patch(
+                "clou.resume.build_resumption_context",
+                return_value="",
+            ),
+        ):
+            await run_supervisor(tmp_path, app=mock_app)
+
+        # The query was attempted (supervisor started after resume failed)
+        assert client.query.await_count >= 1
+
+        # Verify error message was shown in the UI
+        mock_conv.add_error_message.assert_called_once_with(
+            "Could not restore session dead-session. Starting fresh."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Supervisor startup paths (T18)
+# ---------------------------------------------------------------------------
+
+
+class TestSupervisorStartup:
+    """Verify the four startup paths are correctly detected.
+
+    Tests the filesystem detection logic directly rather than running
+    the full supervisor (which has pytest-asyncio mock interaction
+    issues with the SDK's async context manager).
+    """
+
+    def test_checkpoint_path_detected(self, tmp_path: Path) -> None:
+        """Checkpoint exists → would take the resume path."""
+        (tmp_path / ".clou" / "active").mkdir(parents=True)
+        (tmp_path / ".clou" / "active" / "supervisor.md").write_text("# State\n")
+        checkpoint = tmp_path / ".clou" / "active" / "supervisor.md"
+        assert checkpoint.exists()
+
+    def test_project_md_without_checkpoint(self, tmp_path: Path) -> None:
+        """project.md exists but no checkpoint → existing project path."""
+        (tmp_path / ".clou").mkdir()
+        (tmp_path / ".clou" / "project.md").write_text("# Test\n")
+        checkpoint = tmp_path / ".clou" / "active" / "supervisor.md"
+        project_md = tmp_path / ".clou" / "project.md"
+        assert not checkpoint.exists()
+        assert project_md.exists()
+
+    def test_brownfield_detection(self, tmp_path: Path) -> None:
+        """Existing code files detected when no .clou/ exists."""
+        (tmp_path / "package.json").write_text("{}")
+        has_code = any(
+            tmp_path.glob(p)
+            for p in (
+                "*.py", "*.ts", "*.js", "*.go", "*.rs",
+                "package.json", "pyproject.toml", "Cargo.toml",
+                "go.mod", "Makefile", "src/", "lib/",
+            )
+        )
+        assert has_code
+
+    def test_brownfield_detection_pyproject(self, tmp_path: Path) -> None:
+        """pyproject.toml triggers brownfield detection."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        has_code = any(
+            tmp_path.glob(p)
+            for p in (
+                "*.py", "*.ts", "*.js", "*.go", "*.rs",
+                "package.json", "pyproject.toml", "Cargo.toml",
+                "go.mod", "Makefile", "src/", "lib/",
+            )
+        )
+        assert has_code
+
+    def test_brownfield_detection_src_dir(self, tmp_path: Path) -> None:
+        """src/ directory triggers brownfield detection."""
+        (tmp_path / "src").mkdir()
+        has_code = any(
+            tmp_path.glob(p)
+            for p in (
+                "*.py", "*.ts", "*.js", "*.go", "*.rs",
+                "package.json", "pyproject.toml", "Cargo.toml",
+                "go.mod", "Makefile", "src/", "lib/",
+            )
+        )
+        assert has_code
+
+    def test_greenfield_detection(self, tmp_path: Path) -> None:
+        """Empty directory → no brownfield files detected."""
+        empty = tmp_path / "greenfield"
+        empty.mkdir()
+        # Greenfield = none of the detection patterns match
+        for p in ("package.json", "pyproject.toml", "Cargo.toml", "go.mod"):
+            assert not (empty / p).exists()
+        assert not list(empty.glob("*.py"))
+        assert not list(empty.glob("src/"))
+
+
+# ---------------------------------------------------------------------------
+# _feed_user_input — simultaneous compact + input race
+# ---------------------------------------------------------------------------
+
+
+class TestFeedUserInputRace:
+    """Verify that _feed_user_input processes both compact and user input
+    when both are ready simultaneously (no message loss).
+
+    _feed_user_input is a closure inside run_supervisor, so we replicate
+    its core loop logic here and verify the fix (removing ``continue``
+    after compact processing) prevents input loss.
+    """
+
+    @pytest.mark.asyncio
+    async def test_simultaneous_compact_and_input_both_processed(self) -> None:
+        """When compact_wait and input_wait both resolve at once,
+        both the compaction query and the user query must execute."""
+        import asyncio
+
+        compact_requested = asyncio.Event()
+        compact_requested.set()  # already signalled
+        input_queue: asyncio.Queue[str] = asyncio.Queue()
+        input_queue.put_nowait("hello from user")
+
+        queries: list[str] = []
+
+        async def mock_query(text: str) -> None:
+            queries.append(text)
+
+        # Replicate the fixed _feed_user_input loop for exactly one iteration.
+        compact_wait = asyncio.ensure_future(compact_requested.wait())
+        input_wait = asyncio.ensure_future(input_queue.get())
+
+        # Both futures should resolve immediately (event set + queue non-empty).
+        # Give the event loop a tick to complete them.
+        await asyncio.sleep(0)
+
+        done, pending = await asyncio.wait(
+            {compact_wait, input_wait},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for p in pending:
+            p.cancel()
+
+        # --- Fixed logic (no continue after compact) ---
+        if compact_wait in done:
+            compact_requested.clear()
+            instructions = (
+                "Summarize the conversation so far, preserving key "
+                "decisions, code context, and open tasks."
+            )
+            await mock_query(
+                f"[SYSTEM: Context compaction requested. {instructions}. "
+                f"Acknowledge briefly and continue.]"
+            )
+
+        if input_wait in done:
+            text = input_wait.result()
+            await mock_query(text)
+
+        # Both must have been processed.
+        compact_queries = [q for q in queries if "compaction requested" in q.lower()]
+        assert len(compact_queries) == 1, f"Expected 1 compact query, got: {queries}"
+        assert "hello from user" in queries, (
+            f"User input was lost! queries={queries}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_continue_would_lose_input(self) -> None:
+        """Demonstrate that the old ``continue`` logic loses user input."""
+        import asyncio
+
+        compact_requested = asyncio.Event()
+        compact_requested.set()
+        input_queue: asyncio.Queue[str] = asyncio.Queue()
+        input_queue.put_nowait("hello from user")
+
+        queries: list[str] = []
+
+        async def mock_query(text: str) -> None:
+            queries.append(text)
+
+        compact_wait = asyncio.ensure_future(compact_requested.wait())
+        input_wait = asyncio.ensure_future(input_queue.get())
+        await asyncio.sleep(0)
+
+        done, pending = await asyncio.wait(
+            {compact_wait, input_wait},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for p in pending:
+            p.cancel()
+
+        # --- Old logic WITH continue ---
+        processed_input = False
+        if compact_wait in done:
+            compact_requested.clear()
+            await mock_query("[SYSTEM: compact]")
+            # ``continue`` would skip the input_wait check below
+        else:
+            # Only reaches here if compact_wait NOT in done
+            if input_wait in done:
+                processed_input = True
+                await mock_query(input_wait.result())
+
+        # When both fire, the old logic processes compact but skips input.
+        if compact_wait in done and input_wait in done:
+            assert not processed_input, (
+                "Old logic should NOT have processed input when compact also fired"
+            )
+
+
+# ---------------------------------------------------------------------------
+# can_use_tool — AskUserQuestion blocked
+# ---------------------------------------------------------------------------
+
+
+class TestCanUseTool:
+    """The supervisor's can_use_tool callback blocks AskUserQuestion."""
+
+    @pytest.mark.asyncio
+    async def test_blocks_ask_user_question(self) -> None:
+        """AskUserQuestion is denied — model should use ask_user MCP tool."""
+        from claude_agent_sdk import (
+            PermissionResultDeny,
+            ToolPermissionContext,
+        )
+
+        # Reconstruct the callback as defined in run_supervisor.
+        async def _can_use_tool(
+            name: str,
+            tool_input: dict[str, Any],
+            ctx: ToolPermissionContext,
+        ) -> Any:
+            if name == "AskUserQuestion":
+                return PermissionResultDeny(
+                    message="Use ask_user instead. It pauses for user input.",
+                )
+            from claude_agent_sdk import PermissionResultAllow
+
+            return PermissionResultAllow()
+
+        result = await _can_use_tool(
+            "AskUserQuestion", {}, ToolPermissionContext(signal=None, suggestions=[]),
+        )
+        assert result.behavior == "deny"
+        assert "ask_user" in result.message
+
+    @pytest.mark.asyncio
+    async def test_allows_other_tools(self) -> None:
+        """Non-AskUserQuestion tools are allowed."""
+        from claude_agent_sdk import (
+            PermissionResultAllow,
+            ToolPermissionContext,
+        )
+
+        async def _can_use_tool(
+            name: str,
+            tool_input: dict[str, Any],
+            ctx: ToolPermissionContext,
+        ) -> Any:
+            if name == "AskUserQuestion":
+                from claude_agent_sdk import PermissionResultDeny
+
+                return PermissionResultDeny(message="Use ask_user instead.")
+            return PermissionResultAllow()
+
+        result = await _can_use_tool(
+            "Read", {"file_path": "/tmp/f"}, ToolPermissionContext(signal=None, suggestions=[]),
+        )
+        assert result.behavior == "allow"

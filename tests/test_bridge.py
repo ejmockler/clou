@@ -109,6 +109,15 @@ class TestExtractCoordinatorStatus:
         blocks = [_ToolUseBlock("Write", {"file_path": "/proj/.clou/status.md"})]
         assert extract_coordinator_status(blocks, "EXECUTE") is None
 
+    def test_compose_py_edit_with_stats(self) -> None:
+        blocks = [_ToolUseBlock("Edit", {
+            "file_path": "/proj/.clou/compose.py",
+            "old_string": "old\n",
+            "new_string": "new\nextra\n",
+        })]
+        result = extract_coordinator_status(blocks, "EXECUTE")
+        assert result == "compose.py updated  +2 −1"
+
     def test_execution_md_write_returns_none(self) -> None:
         blocks = [_ToolUseBlock("Write", {"file_path": "/proj/.clou/execution.md"})]
         assert extract_coordinator_status(blocks, "EXECUTE") is None
@@ -216,6 +225,31 @@ class TestParseEscalation:
         assert result["options"][0]["label"] == "Provide key"
         assert result["options"][1]["label"] == "Skip"
         assert "Option 1" in result["recommendation"]
+
+    def test_parses_system_generated_escalation(self, tmp_path: Path) -> None:
+        """System-generated escalations use plain numbered options (no bold)."""
+        md = tmp_path / "escalation.md"
+        md.write_text(
+            "# Escalation: Cycle Limit Reached\n\n"
+            "**Classification:** blocking\n"
+            "**Filed:** 2026-03-23T12:00:00+00:00\n\n"
+            "## Context\nThe coordinator has completed 20 cycles.\n\n"
+            "## Issue\nCycle count (20) has reached the 20-cycle limit.\n\n"
+            "## Evidence\ncycle_count=20\n\n"
+            "## Options\n"
+            "1. Increase the cycle limit and continue execution\n"
+            "2. Reassess the milestone scope and break it into smaller milestones\n"
+            "3. Manually intervene to unblock progress\n\n"
+            "## Recommendation\nReassess the milestone scope.\n\n"
+            "## Disposition\nstatus: open\n",
+            encoding="utf-8",
+        )
+        result = parse_escalation(md)
+        assert result["classification"] == "blocking"
+        assert "20-cycle limit" in result["issue"]
+        assert len(result["options"]) == 3
+        assert result["options"][0]["label"] == "Increase the cycle limit and continue execution"
+        assert result["options"][2]["label"] == "Manually intervene to unblock progress"
 
     def test_missing_sections_return_empty(self, tmp_path: Path) -> None:
         md = tmp_path / "empty.md"
@@ -812,3 +846,38 @@ class TestAnsiInCoordinatorFilePath:
         ansi_path = "\x1b[36m/proj/.clou/decisions.md\x1b[0m"
         blocks = [_ToolUseBlock("Edit", {"file_path": ansi_path})]
         assert extract_coordinator_status(blocks, "PLAN") == "decision logged"
+
+
+# ---------------------------------------------------------------------------
+# tool_use_id threading
+# ---------------------------------------------------------------------------
+
+
+class TestToolUseIdThreading:
+    """ClouToolUse carries tool_use_id from the SDK ToolUseBlock."""
+
+    def test_tool_use_id_passed_through(self) -> None:
+        block = _ToolUseBlock("Read", {"file_path": "/tmp/x"})
+        block.id = "toolu_abc123"  # type: ignore[attr-defined]
+        msg = _Msg(content=[block])
+        posted: list[Any] = []
+        route_supervisor_message(msg, posted.append)
+        assert len(posted) == 1
+        assert isinstance(posted[0], ClouToolUse)
+        assert posted[0].tool_use_id == "toolu_abc123"
+
+    def test_tool_use_id_defaults_empty_when_missing(self) -> None:
+        """Blocks without id attribute get empty string."""
+        block = _ToolUseBlock("Read", {"file_path": "/tmp/x"})
+        msg = _Msg(content=[block])
+        posted: list[Any] = []
+        route_supervisor_message(msg, posted.append)
+        assert posted[0].tool_use_id == ""
+
+    def test_tool_use_id_ansi_stripped(self) -> None:
+        block = _ToolUseBlock("Read", {"file_path": "/tmp/x"})
+        block.id = "\x1b[1mtoolu_abc\x1b[0m"  # type: ignore[attr-defined]
+        msg = _Msg(content=[block])
+        posted: list[Any] = []
+        route_supervisor_message(msg, posted.append)
+        assert posted[0].tool_use_id == "toolu_abc"

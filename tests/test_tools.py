@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from clou.tools import clou_init, clou_spawn_coordinator, clou_status
+from clou.tools import clou_create_milestone, clou_init, clou_spawn_coordinator, clou_status
 
 # ---------------------------------------------------------------------------
 # clou_spawn_coordinator
@@ -121,6 +121,7 @@ def test_init_creates_structure(tmp_path: Path) -> None:
     clou_dir = tmp_path / ".clou"
     assert (clou_dir / "milestones").is_dir()
     assert (clou_dir / "active").is_dir()
+    assert (clou_dir / "prompts").is_dir()
     assert (clou_dir / "project.md").is_file()
     assert (clou_dir / "roadmap.md").is_file()
     assert (clou_dir / "requests.md").is_file()
@@ -157,6 +158,7 @@ def test_init_idempotent_repairs_partial(tmp_path: Path) -> None:
     clou_dir = tmp_path / ".clou"
     assert (clou_dir / "milestones").is_dir()
     assert (clou_dir / "active").is_dir()
+    assert (clou_dir / "prompts").is_dir()
     assert (clou_dir / "project.md").is_file()
     assert (clou_dir / "roadmap.md").is_file()
     assert (clou_dir / "requests.md").is_file()
@@ -171,6 +173,48 @@ def test_init_does_not_overwrite(tmp_path: Path) -> None:
     assert (clou_dir / "project.md").read_text() == "original"
 
 
+def test_init_copies_prompt_files(tmp_path: Path) -> None:
+    """Init copies all 14 bundled prompt files to .clou/prompts/."""
+    from clou.prompts import _BUNDLED_PROMPTS
+
+    asyncio.run(clou_init(tmp_path, "MyProject", "A cool project"))
+
+    prompts_dir = tmp_path / ".clou" / "prompts"
+    copied = sorted(f.name for f in prompts_dir.iterdir() if f.is_file())
+
+    expected = sorted(
+        f.name
+        for f in _BUNDLED_PROMPTS.iterdir()
+        if f.is_file() and f.name != "__init__.py"
+    )
+    assert len(expected) == 14
+    assert copied == expected
+
+
+def test_init_prompt_content_matches_bundled(tmp_path: Path) -> None:
+    """Copied prompt files match the bundled originals."""
+    from clou.prompts import _BUNDLED_PROMPTS
+
+    asyncio.run(clou_init(tmp_path, "MyProject", "A cool project"))
+
+    for src in _BUNDLED_PROMPTS.iterdir():
+        if src.is_file() and src.name != "__init__.py":
+            copied = tmp_path / ".clou" / "prompts" / src.name
+            assert copied.read_text() == src.read_text()
+
+
+def test_init_does_not_overwrite_customized_prompts(tmp_path: Path) -> None:
+    """Re-running init preserves per-project prompt customizations."""
+    asyncio.run(clou_init(tmp_path, "MyProject", "A cool project"))
+
+    custom = tmp_path / ".clou" / "prompts" / "worker.md"
+    custom.write_text("customized")
+
+    # Second init should not overwrite
+    asyncio.run(clou_init(tmp_path, "MyProject", "A cool project"))
+    assert custom.read_text() == "customized"
+
+
 def test_init_load_prompt_works_without_init(tmp_path: Path) -> None:
     """load_prompt reads from bundled prompts, no project init needed."""
     from clou.prompts import load_prompt
@@ -179,3 +223,60 @@ def test_init_load_prompt_works_without_init(tmp_path: Path) -> None:
     prompt = load_prompt("supervisor", tmp_path)
     assert isinstance(prompt, str)
     assert len(prompt) > 0
+
+
+# ---------------------------------------------------------------------------
+# clou_create_milestone
+# ---------------------------------------------------------------------------
+
+
+def test_create_milestone_happy_path(tmp_path: Path) -> None:
+    (tmp_path / ".clou" / "milestones").mkdir(parents=True)
+    result = asyncio.run(
+        clou_create_milestone(tmp_path, "m01-auth", "# Auth", "# Requirements\n")
+    )
+    ms_dir = tmp_path / ".clou" / "milestones" / "m01-auth"
+    assert ms_dir.is_dir()
+    assert (ms_dir / "milestone.md").read_text() == "# Auth"
+    assert (ms_dir / "requirements.md").read_text() == "# Requirements\n"
+    assert "m01-auth" in result
+
+
+def test_create_milestone_duplicate_raises(tmp_path: Path) -> None:
+    ms_dir = tmp_path / ".clou" / "milestones" / "m01-auth"
+    ms_dir.mkdir(parents=True)
+    with pytest.raises(ValueError, match="already exists"):
+        asyncio.run(
+            clou_create_milestone(tmp_path, "m01-auth", "# Auth", "# Req")
+        )
+
+
+def test_create_milestone_parents_created(tmp_path: Path) -> None:
+    """mkdir(parents=True) handles missing .clou/milestones/."""
+    result = asyncio.run(
+        clou_create_milestone(tmp_path, "m01-auth", "# Auth", "# Req")
+    )
+    assert (tmp_path / ".clou" / "milestones" / "m01-auth" / "milestone.md").is_file()
+    assert "m01-auth" in result
+
+
+def test_create_milestone_content_preserved(tmp_path: Path) -> None:
+    """Verify exact content written matches input, including whitespace."""
+    content_ms = "# My Milestone\n\nDetailed description.\n"
+    content_req = "# Requirements\n\n- Req 1\n- Req 2\n"
+    asyncio.run(
+        clou_create_milestone(tmp_path, "m01-auth", content_ms, content_req)
+    )
+    ms_dir = tmp_path / ".clou" / "milestones" / "m01-auth"
+    assert (ms_dir / "milestone.md").read_text() == content_ms
+    assert (ms_dir / "requirements.md").read_text() == content_req
+
+
+def test_create_milestone_does_not_create_subdirs(tmp_path: Path) -> None:
+    """Tool creates only milestone.md and requirements.md, not phases/ or escalations/."""
+    asyncio.run(
+        clou_create_milestone(tmp_path, "m01-auth", "# Auth", "# Req")
+    )
+    ms_dir = tmp_path / ".clou" / "milestones" / "m01-auth"
+    children = sorted(f.name for f in ms_dir.iterdir())
+    assert children == ["milestone.md", "requirements.md"]

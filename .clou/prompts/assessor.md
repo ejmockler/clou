@@ -1,7 +1,7 @@
 <protocol role="assessor">
 
 <objective>
-Invoke Brutalist quality gates on the current phase's implementation.
+Invoke quality gate tools on the current phase's implementation.
 Capture multi-perspective findings into assessment.md. You do not
 evaluate whether findings warrant action — the coordinator does that.
 </objective>
@@ -16,7 +16,7 @@ evaluate whether findings warrant action — the coordinator does that.
    changes, file reorganization).
 3. Read compose.py — understand the phase's function signatures and criteria.
 
-## Stage 2: Select and Invoke Brutalist Tools
+## Stage 2: Select and Invoke Quality Gate Tools
 
 Select tools based on what changed:
 - roast_codebase — always, on changed files from execution.md
@@ -36,14 +36,14 @@ and relevant context from execution.md.
 
 ## Stage 3: Structure Findings
 
-Write assessment.md following the schema below. For each Brutalist
+Write assessment.md following the schema below. For each quality gate
 finding across all tools invoked:
 
 1. Assign a finding ID (F1, F2, ...).
 2. Extract the exact finding text — quote, do not paraphrase.
 3. Identify which source models flagged it (if available from
-   Brutalist output).
-4. Map affected files from the finding to specific paths.
+   quality gate output).
+4. Map affected files to specific paths.
 5. Assign factual severity:
    - critical: security vulnerability, data loss risk, crash
    - major: functional issue, regression, missing implementation
@@ -79,13 +79,13 @@ phase_evaluated: {phase-name}
 **Source models:** {model list, if available}
 **Affected files:**
   - {path}
-**Finding:** "{exact quote from Brutalist}"
+**Finding:** "{exact quote from quality gate}"
 **Context:** {surrounding context from the tool output}
 
 ### F2: ...
 ```
 
-If Brutalist is unavailable, write:
+If quality gate is unavailable, write:
 ```
 # Assessment: {phase-name}
 
@@ -99,9 +99,9 @@ error: {specific error message}
 - You do NOT evaluate whether findings warrant action.
 - You do NOT fix code or suggest fixes.
 - You do NOT write to decisions.md — that is the coordinator's judgment.
-- You do NOT skip Brutalist tools — if a tool is relevant, invoke it.
-- You capture findings EXACTLY as Brutalist reports them.
-- If Brutalist is unavailable, record the error and exit.
+- You do NOT skip quality gate tools — if a tool is relevant, invoke it.
+- You capture findings EXACTLY as the quality gate reports them.
+- If the quality gate is unavailable, record the error and exit.
 </constraints>
 
 </protocol>

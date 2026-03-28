@@ -4,13 +4,14 @@ The orchestrator is the thin Python layer that manages Clou's session lifecycles
 
 ## Responsibilities
 
-1. **Start the supervisor session** with the correct prompt, tools, hooks, and MCP servers
-2. **Spawn coordinator sessions** when the supervisor requests (via custom MCP tool)
-3. **Monitor sessions** for context exhaustion, errors, and completion
-4. **Enforce write boundaries** via PreToolUse hooks running in-process
-5. **Track token usage** per session and cumulative
-6. **Handle crashes** by restarting from golden context checkpoints
-7. **Provide custom MCP tools** to sessions (clou-specific tools running in-process)
+1. **Load the active harness template** from `project.md`'s `template:` field (DB-11)
+2. **Start the supervisor session** with the correct prompt, tools, hooks, and MCP servers
+3. **Spawn coordinator sessions** configured from the active template (agent definitions, quality gates, MCP servers, write permissions)
+4. **Monitor sessions** for context exhaustion, errors, and completion
+5. **Enforce write boundaries** via PreToolUse hooks using template-sourced permissions
+6. **Track token usage** per session and cumulative
+7. **Handle crashes** by restarting from golden context checkpoints
+8. **Provide custom MCP tools** to sessions (clou-specific tools running in-process)
 
 ## Entry Point
 
@@ -48,32 +49,44 @@ async def run_supervisor(project_dir: Path):
     clou_tools = build_clou_mcp_tools(project_dir)
     clou_server = create_sdk_mcp_server("clou", tools=clou_tools)
 
+    # Load harness template for MCP servers and hook permissions (DB-11).
+    tmpl_name = read_template_name(project_dir)
+    tmpl = load_template(tmpl_name)
+    hooks = build_hooks("supervisor", project_dir, template=tmpl)
+
+    # Supervisor gets quality gate MCP servers + clou (not all template
+    # servers — e.g., CDP is for the verifier, not the supervisor).
+    gate_servers = {g.mcp_server for g in tmpl.quality_gates}
+    all_mcp = template_mcp_servers(tmpl)
+    mcp_dict = {
+        name: spec for name, spec in all_mcp.items() if name in gate_servers
+    }
+    mcp_dict["clou"] = clou_server
+
     options = ClaudeAgentOptions(
         system_prompt=load_prompt("supervisor", project_dir),
-        tools={"type": "preset", "preset": "claude_code"},
-        permission_mode="acceptEdits",
+        permission_mode="bypassPermissions",
         cwd=str(project_dir),
         model="opus",
-        hooks=build_hooks("supervisor", project_dir),
-        mcp_servers={
-            "clou": clou_server,
-            "brutalist": brutalist_mcp_config(),
-        },
+        hooks=hooks,
+        mcp_servers=mcp_dict,
     )
 
-    async with ClaudeSDKClient(options) as supervisor:
-        # Initial prompt: read protocol, then checkpoint or start fresh
+    async with ClaudeSDKClient(options=options) as supervisor:
+        # Protocol files are bundled with the package.
+        protocol_file = str(_BUNDLED_PROMPTS / "supervisor.md")
         checkpoint = project_dir / ".clou" / "active" / "supervisor.md"
+
         if checkpoint.exists():
             await supervisor.query(
-                "Read your protocol file: .clou/prompts/supervisor.md\n\n"
-                "Then resume from checkpoint. Read .clou/active/supervisor.md "
-                "and .clou/roadmap.md to reconstruct your state."
+                f"Read your protocol file: {protocol_file}\n\n"
+                f"Then resume from checkpoint. Read {checkpoint} "
+                f"and {project_dir / '.clou' / 'roadmap.md'} to reconstruct your state."
             )
         else:
             await supervisor.query(
-                "Read your protocol file: .clou/prompts/supervisor.md\n\n"
-                "Then read .clou/project.md for context. "
+                f"Read your protocol file: {protocol_file}\n\n"
+                f"Then read {project_dir / '.clou' / 'project.md'} for context. "
                 "Greet the user and ask what they'd like to build."
             )
 
@@ -91,10 +104,17 @@ The coordinator runs as a **session-per-cycle** loop. Each cycle (PLAN, EXECUTE,
 async def run_coordinator(project_dir: Path, milestone: str) -> str:
     """Run a coordinator for a single milestone via session-per-cycle loop."""
 
+    # Load the active harness template once per milestone (DB-11).
+    tmpl_name = read_template_name(project_dir)
+    tmpl = load_template(tmpl_name)
+
     clou_dir = project_dir / ".clou"
     checkpoint_path = clou_dir / "active" / "coordinator.md"
-    validation_retries = 0  # Track consecutive validation failures
+    validation_retries = 0
+    crash_retries = 0
+    pending_validation_errors = None
     MAX_VALIDATION_RETRIES = 3
+    MAX_CRASH_RETRIES = 3
     MAX_CYCLES = 20
     cycle_count = 0
 
@@ -111,22 +131,34 @@ async def run_coordinator(project_dir: Path, milestone: str) -> str:
             await write_cycle_limit_escalation(project_dir, milestone, cycle_count)
             return "escalated_cycle_limit"
 
-        # Build targeted prompt for this cycle
+        # Build targeted prompt for this cycle (with template context)
         prompt = build_cycle_prompt(
-            project_dir, milestone, cycle_type, read_set
+            project_dir, milestone, cycle_type, read_set,
+            validation_errors=pending_validation_errors,
+            template=tmpl,
+        )
+        pending_validation_errors = None  # consumed
+
+        status = await _run_single_cycle(
+            project_dir, milestone, cycle_type, prompt, template=tmpl,
         )
 
-        status = await run_single_cycle(project_dir, milestone, prompt)
-
         if status == "failed":
-            # Crash mid-cycle — golden context has last cycle boundary state
-            # Retry the same cycle (checkpoint hasn't advanced)
-            continue
+            crash_retries += 1
+            if crash_retries >= MAX_CRASH_RETRIES:
+                await write_agent_crash_escalation(project_dir, milestone)
+                return "escalated_crash_loop"
+            continue  # Retry same cycle from checkpoint
 
         if status == "agent_team_crash":
-            # Agent team crashed — preserve execution.md, escalate to supervisor
             await write_agent_crash_escalation(project_dir, milestone)
             return "escalated_agent_crash"
+
+        if status == "exhausted":
+            # Agent wrote mid-cycle checkpoint. Skip validation (partial
+            # golden context) and let determine_next_cycle route from it.
+            crash_retries = 0
+            continue
 
         # Validate golden context structure after cycle
         validation_errors = validate_golden_context(project_dir, milestone)
@@ -137,78 +169,78 @@ async def run_coordinator(project_dir: Path, milestone: str) -> str:
                     project_dir, milestone, validation_errors
                 )
                 return "escalated_validation"
-            # Revert golden context to pre-cycle state and retry
             await git_revert_golden_context(project_dir, milestone)
-            prompt = build_cycle_prompt(
-                project_dir, milestone, cycle_type, read_set,
-                validation_errors=validation_errors,
-            )
+            pending_validation_errors = validation_errors
             continue
         else:
-            validation_retries = 0  # Reset on success
+            validation_retries = 0
+            crash_retries = 0
 
         # Coordinator-only commit at phase completion
-        if status == "phase_completed":
-            await git_commit_phase(project_dir, milestone, checkpoint_path)
+        if cycle_type == "EXECUTE" and checkpoint_path.exists():
+            cp = parse_checkpoint(checkpoint_path.read_text())
+            if cp.current_phase:
+                await git_commit_phase(project_dir, milestone, cp.current_phase)
 
     return "completed"
 
 
-async def run_single_cycle(
-    project_dir: Path, milestone: str, prompt: str
+async def _run_single_cycle(
+    project_dir: Path, milestone: str, cycle_type: str,
+    prompt: str, *, template: HarnessTemplate | None = None,
 ) -> str:
     """Run one coordinator cycle as a fresh session."""
 
+    if template is None:
+        template = load_template("software-construction")
+
+    hooks = build_hooks(
+        "coordinator", project_dir, milestone=milestone, template=template,
+    )
+
     options = ClaudeAgentOptions(
         system_prompt=load_prompt("coordinator", project_dir, milestone=milestone),
-        tools={"type": "preset", "preset": "claude_code"},
         permission_mode="bypassPermissions",
         cwd=str(project_dir),
         model="opus",
-        agents=build_agent_definitions(project_dir, milestone),
-        hooks=build_hooks("coordinator", project_dir),
-        mcp_servers={
-            "brutalist": brutalist_mcp_config(),
-            "cdp": cdp_mcp_config(),
-        },
-        max_turns=200,  # Safety limit per cycle
+        agents=_build_agents(project_dir, milestone, template),
+        hooks=hooks,
+        effort="max" if cycle_type in ("ASSESS", "VERIFY") else "high",
+        mcp_servers=template_mcp_servers(template),
+        sandbox=SandboxSettings(
+            enabled=True,
+            autoAllowBashIfSandboxed=True,
+            allowUnsandboxedCommands=False,
+        ),
     )
 
     try:
-        async with ClaudeSDKClient(options) as coordinator:
+        async with ClaudeSDKClient(options=options) as coordinator:
             await coordinator.query(prompt)
 
             async for msg in coordinator.receive_response():
-                track_coordinator_progress(msg, milestone)
+                _track(msg, tier="coordinator", milestone=milestone)
 
                 # Mid-cycle context exhaustion — force checkpoint and restart
-                if isinstance(msg, ResultMessage) and context_exhausted(msg):
+                if _context_exhausted(msg):
                     await coordinator.query(
                         "Context approaching limit. Write a mid-cycle checkpoint "
                         "to active/coordinator.md with partial progress, then exit."
                     )
                     return "exhausted"  # Loop will restart same cycle
 
-                # Detect agent team crashes via SDK notifications
-                if is_agent_team_crash(msg):
+                # Detect agent team crashes via SDK TaskNotificationMessage
+                if isinstance(msg, TaskNotificationMessage) and msg.status == "failed":
                     await coordinator.query(
                         "Agent team member crashed. Preserve all execution.md "
                         "entries. Do NOT retry. Write checkpoint and exit."
                     )
                     return "agent_team_crash"
 
-                # Detect Brutalist unavailability during ASSESS
-                if is_brutalist_unavailable(msg):
-                    await coordinator.query(
-                        "Brutalist MCP is unavailable. Write a blocking "
-                        "escalation with the error details, then exit."
-                    )
-                    return "brutalist_unavailable"
+        return read_cycle_outcome(project_dir)
 
-        return read_cycle_outcome(project_dir, milestone)
-
-    except Exception as e:
-        log_error(f"Coordinator cycle crashed for {milestone}: {e}")
+    except Exception:
+        log.exception("Coordinator cycle crashed for %r", milestone)
         return "failed"
 
 
@@ -261,6 +293,7 @@ def build_cycle_prompt(
     project_dir: Path, milestone: str,
     cycle_type: str, read_set: list[str],
     validation_errors: list[str] | None = None,
+    template: HarnessTemplate | None = None,
 ) -> str:
     """Construct targeted prompt for a single cycle.
 
@@ -268,18 +301,16 @@ def build_cycle_prompt(
     This initial query provides: cycle type, protocol file pointer, and
     golden context file pointers. The coordinator reads the protocol file
     as its first action, then the golden context files.
-
-    If validation_errors is provided, the prompt includes feedback about
-    the previous cycle's malformed golden context writes.
     """
 
     milestone_prefix = f".clou/milestones/{milestone}"
     file_list = "\n".join(
-        f"- {milestone_prefix}/{f}" if not f.startswith("project.md")
-        else f"- .clou/{f}"
+        f"- .clou/{f}" if f.startswith(("project.md", "active/"))
+        else f"- {milestone_prefix}/{f}"
         for f in read_set
     )
-    protocol_file = f".clou/prompts/coordinator-{cycle_type.lower()}.md"
+    # Protocol files are bundled with the package, not per-project.
+    protocol_file = str(_BUNDLED_PROMPTS / f"coordinator-{cycle_type.lower()}.md")
 
     prompt = (
         f"This cycle: {cycle_type}.\n\n"
@@ -288,6 +319,13 @@ def build_cycle_prompt(
         f"Execute the {cycle_type} protocol. "
         f"Write all state to golden context before exiting."
     )
+
+    # Template context for ASSESS/VERIFY cycles (DB-11).
+    if template:
+        prompt += f"\n\nActive harness: {template.name}."
+        if cycle_type in ("ASSESS", "VERIFY") and template.quality_gates:
+            gate_names = [g.mcp_server for g in template.quality_gates]
+            prompt += f"\nQuality gates: {', '.join(gate_names)}."
 
     if validation_errors:
         error_list = "\n".join(f"  - {e}" for e in validation_errors)
@@ -340,120 +378,55 @@ def build_clou_mcp_tools(project_dir: Path) -> list:
     return [spawn_coordinator, clou_status, clou_init]
 
 
-def build_verifier_tools(project_dir: Path, milestone: str) -> list[str]:
-    """Build verifier tool list based on verification modalities (DB-09).
-
-    The coordinator's compose.py encodes which modalities are needed.
-    Browser modality adds CDP MCP tools. All modalities get Bash.
-    Tools the verifier won't use are distractors (Research §1).
-    """
-    base_tools = ["Read", "Write", "Bash", "Grep", "Glob", "LS",
-                  "WebSearch", "WebFetch"]
-
-    modalities = read_verification_modalities(project_dir, milestone)
-    if "browser" in modalities:
-        base_tools.extend([
-            "mcp__cdp__navigate",
-            "mcp__cdp__screenshot",
-            "mcp__cdp__accessibility_snapshot",
-            "mcp__cdp__evaluate_javascript",
-            "mcp__cdp__click",
-            "mcp__cdp__type",
-            "mcp__cdp__network_get_response_body",
-            "mcp__cdp__console_messages",
-        ])
-
-    return base_tools
 ```
+
+**Note:** Verifier tools (including CDP browser tools) are defined in the harness template's `AgentSpec.tools` list. There is no separate `build_verifier_tools()` function — the template is the single source of truth for all agent tool configuration (DB-11).
 
 ## Hook Enforcement
 
 The orchestrator enforces write boundaries via PreToolUse hooks:
 
 ```python
-def build_hooks(tier: str, project_dir: Path) -> dict:
-    """Build tier-specific hooks for write boundary enforcement."""
+def build_hooks(
+    tier: str, project_dir: Path,
+    *, milestone: str | None = None,
+    template: HarnessTemplate | None = None,
+) -> dict[str, list[HookConfig]]:
+    """Build tier-specific hooks for write boundary enforcement.
 
-    clou_dir = project_dir / ".clou"
+    When template is provided, write permissions and agent tier map are
+    derived from the template instead of module-level constants.
+    When milestone is provided, write patterns are scoped to that
+    milestone (milestones/* → milestones/{milestone}).
+    """
 
-    # Define which paths each tier can write to
-    write_permissions = {
-        "supervisor": [
-            "project.md", "roadmap.md", "requests.md",
-            "milestones/*/milestone.md",  # creation only
-            "milestones/*/requirements.md",
-            "milestones/*/escalations/*.md",  # disposition only
-            "active/supervisor.md",
-        ],
-        "coordinator": [
-            "milestones/*/compose.py",
-            "milestones/*/status.md",
-            "milestones/*/decisions.md",
-            "milestones/*/escalations/*.md",  # creation
-            "milestones/*/phases/*/phase.md",
-            "active/coordinator.md",
-        ],
-        "worker": [
-            "milestones/*/phases/*/execution.md",
-            # Plus any codebase files (not in .clou/)
-        ],
-        "verifier": [
-            "milestones/*/phases/verification/execution.md",
-            "milestones/*/handoff.md",
-        ],
-    }
+    # Derive permissions and tier map from template or module-level constants.
+    if template is not None:
+        permissions = template.write_permissions
+        agent_map = template_agent_tier_map(template) if tier == "coordinator" else None
+    else:
+        permissions = None  # use WRITE_PERMISSIONS default
+        agent_map = AGENT_TIER_MAP if tier == "coordinator" else None
 
-    async def enforce_write_boundary(input_data):
-        tool_name = input_data.get("tool_name", "")
-        if tool_name not in ("Write", "Edit", "MultiEdit"):
-            return {}
-
-        file_path = input_data.get("tool_input", {}).get("file_path", "")
-
-        # Allow all writes outside .clou/
-        if str(clou_dir) not in file_path:
-            return {}
-
-        # Check against tier's write permissions
-        relative = str(Path(file_path).relative_to(clou_dir))
-        if not path_matches_patterns(relative, write_permissions[tier]):
-            return {
-                "hookSpecificOutput": {
-                    "permissionDecision": "deny",
-                    "reason": f"{tier} tier cannot write to .clou/{relative}"
-                }
-            }
-        return {}
-
-    # Composition validation (PostToolUse)
-    async def validate_composition(input_data):
-        """Validate compose.py call graph after coordinator writes it."""
-        file_path = input_data.get("tool_input", {}).get("file_path", "")
-        if not file_path.endswith("compose.py"):
-            return {}
-
-        code = Path(file_path).read_text()
-        errors = graph.validate(code)
-        if errors:
-            return {"hookSpecificOutput": {
-                "message": "Composition errors:\n"
-                    + "\n".join(f"  - {e}" for e in errors)
-                    + "\nFix the call graph."
-            }}
-        return {}
+    # PreToolUse: write boundary enforcement
+    # The pre-hook resolves agent_type from subagent context and enforces
+    # per-tier permissions. Unknown agent types are DENIED (fail-closed).
+    pre_hook = _make_pre_hook(
+        tier, project_dir,
+        milestone=milestone, agent_tier_map=agent_map, permissions=permissions,
+    )
 
     hooks = {
         "PreToolUse": [
-            HookMatcher(matcher="Write|Edit|MultiEdit",
-                       hooks=[enforce_write_boundary])
+            HookConfig(matcher="Write|Edit|MultiEdit", hooks=[pre_hook])
         ],
     }
 
-    # Only add composition validation for coordinators
+    # PostToolUse: composition validation (coordinators only)
     if tier == "coordinator":
+        post_hook = _make_post_hook(project_dir)
         hooks["PostToolUse"] = [
-            HookMatcher(matcher="Write|Edit|MultiEdit",
-                       hooks=[validate_composition])
+            HookConfig(matcher="Write|Edit|MultiEdit", hooks=[post_hook])
         ]
 
     return hooks
@@ -591,14 +564,20 @@ async def write_validation_escalation(
 
 Clou uses a two-layer prompt architecture (DB-04, decided). The system prompt is a small identity + invariants template (~800–2,000 tokens). The full protocol lives in separate files the agent reads as its first action. This is grounded in research: instruction density degrades past a threshold, decomposition outperforms monolithic prompts, and system prompts have no architectural privilege over read content. See [Research Foundations](../research-foundations.md).
 
+Prompts are **bundled with the package** in `clou/_prompts/`, not loaded from the project's `.clou/prompts/`. The `.clou/prompts/` directory holds project-local copies for reference, but the orchestrator always reads from the bundled directory to prevent drift between Clou versions and project-local copies.
+
 ```python
+#: Bundled prompt templates shipped with the package — global, not per-project.
+_BUNDLED_PROMPTS = Path(__file__).parent / "_prompts"
+
+
 def load_prompt(tier: str, project_dir: Path, **kwargs) -> str:
     """Load and parameterize a tier's system prompt (identity + invariants only).
 
-    System prompts are small XML templates. The full protocol is in separate
-    files the agent reads during execution — pointed to by build_cycle_prompt().
+    Prompts are global — loaded from the bundled _prompts/ directory,
+    not from the project's .clou/prompts/.
     """
-    prompt_path = project_dir / ".clou" / "prompts" / f"{tier}-system.xml"
+    prompt_path = _BUNDLED_PROMPTS / f"{tier}-system.xml"
     prompt = prompt_path.read_text()
 
     # Inject instance-specific context ({{milestone}}, {{phase}}, etc.)
@@ -611,36 +590,65 @@ def load_prompt(tier: str, project_dir: Path, **kwargs) -> str:
 ## Agent Team Definitions
 
 ```python
-def build_agent_definitions(project_dir: Path, milestone: str) -> dict:
+def _build_agents(
+    project_dir: Path, milestone: str,
+    template: HarnessTemplate | None = None,
+) -> dict[str, AgentDefinition]:
     """Build AgentDefinition dict for coordinator's agent teams.
 
+    When template is provided, agent definitions are derived from the
+    template's agents dict. Otherwise falls back to the default
+    software-construction template.
+
     Each agent gets a small system prompt (identity + invariants) via
-    the prompt field. The full protocol is in .clou/prompts/worker.md
-    or .clou/prompts/verifier.md, which the agent reads during execution.
+    the prompt field, loaded from the bundled _prompts/ directory.
+    The full protocol is in _prompts/<prompt_ref>.md, which the agent
+    reads during execution.
     """
+    if template is None:
+        template = load_template("software-construction")
+
     return {
-        "implementer": AgentDefinition(
-            description=(
-                "Implement code changes for assigned tasks. "
-                "Read compose.py for your function signature, phase.md for context. "
-                "Write results to execution.md."
-            ),
-            prompt=load_prompt("worker", project_dir, milestone=milestone),
-            tools=["Read", "Write", "Edit", "MultiEdit", "Bash",
-                   "Grep", "Glob", "LS", "WebSearch", "WebFetch"],
-            model="opus",  # DB-06: Opus everywhere
-        ),
-        "verifier": AgentDefinition(
-            description=(
-                "Verify milestone completion by perceiving the software as a user would. "
-                "Materialize the dev environment, walk golden paths with perceptual "
-                "record capture, explore adversarially, and prepare handoff.md."
-            ),
-            prompt=load_prompt("verifier", project_dir, milestone=milestone),
-            tools=build_verifier_tools(project_dir, milestone),  # DB-09: modality-based
-            model="opus",  # DB-06: Opus everywhere
-        ),
+        name: AgentDefinition(
+            description=spec.description,
+            prompt=load_prompt(spec.prompt_ref, project_dir, milestone=milestone),
+            tools=spec.tools,
+            model=spec.model,
+        )
+        for name, spec in template.agents.items()
     }
+```
+
+Template loading and MCP server conversion live in `clou/harness.py` (not in the orchestrator):
+
+```python
+# clou/harness.py
+
+def read_template_name(project_dir: Path) -> str:
+    """Read the template name from project.md.
+
+    Looks for a 'template: <name>' line. Returns
+    'software-construction' if not found or malformed.
+    """
+    ...
+
+def load_template(name: str) -> HarnessTemplate:
+    """Load a harness template by name.
+
+    Validates name against _TEMPLATE_NAME_RE (import injection defense),
+    imports clou.harnesses.<name>, validates the template, and falls
+    back to the software-construction default on any failure (D9).
+    Three-tier fallback: module → software_construction import → _INLINE_FALLBACK.
+    """
+    ...
+
+def template_mcp_servers(template: HarnessTemplate) -> dict[str, Any]:
+    """Convert template MCP server specs to SDK-compatible dicts."""
+    ...
+
+def template_agent_tier_map(template: HarnessTemplate) -> dict[str, str]:
+    """Derive agent-name-to-tier mapping from template agents."""
+    ...
 ```
 
 ## File Structure
@@ -648,7 +656,14 @@ def build_agent_definitions(project_dir: Path, milestone: str) -> dict:
 ```
 clou/                              # Orchestrator Python code
 ├── orchestrator.py                 # Entry point, session lifecycle management
-├── prompts.py                      # System prompt loading (small XML templates)
+├── harness.py                      # Template dataclasses, loader, validator (DB-11)
+├── harnesses/                      # Harness templates (ship with package)
+│   ├── __init__.py
+│   └── software_construction.py    # First template (extracted from hardcoded config)
+├── _prompts/                       # Bundled prompt templates (orchestrator reads these)
+│   ├── *-system.xml                # System prompts (identity + invariants)
+│   └── *.md                        # Protocol files (agents read during execution)
+├── prompts.py                      # System prompt loading from _prompts/
 ├── hooks.py                        # Write boundary enforcement + composition validation
 ├── graph.py                        # Call graph parsing and validation (~100 lines)
 ├── tools.py                        # Custom MCP tool definitions
@@ -657,7 +672,7 @@ clou/                              # Orchestrator Python code
 ├── validation.py                   # Golden context structural validation
 └── utils.py                        # Shared utilities
 
-.clou/prompts/                     # Prompt files (part of golden context)
+.clou/prompts/                     # Project-local prompt copies (reference only)
 ├── supervisor-system.xml           # Supervisor system prompt (~1,500-2,000 tokens)
 ├── supervisor.md                   # Supervisor protocol (agent reads)
 ├── coordinator-system.xml          # Coordinator system prompt (~800-1,200 tokens)

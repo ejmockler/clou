@@ -20,6 +20,27 @@ def _run(coro: object) -> dict[str, object]:
     return result
 
 
+def _is_denied(result: dict[str, object]) -> bool:
+    """Check whether a PreToolUse hook response blocks the tool."""
+    hso = result.get("hookSpecificOutput")
+    if not isinstance(hso, dict):
+        return False
+    return hso.get("permissionDecision") == "deny"
+
+
+def _deny_reason(result: dict[str, object]) -> str:
+    """Extract the deny reason from a hook response."""
+    hso = result.get("hookSpecificOutput")
+    if not isinstance(hso, dict):
+        return ""
+    return str(hso.get("permissionDecisionReason", ""))
+
+
+def _is_allowed(result: dict[str, object]) -> bool:
+    """Check that a hook response allows the tool (no deny/block)."""
+    return not _is_denied(result)
+
+
 # ---------------------------------------------------------------------------
 # build_hooks structure
 # ---------------------------------------------------------------------------
@@ -72,7 +93,7 @@ def test_write_outside_clou_allowed() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_worker_allowed_execution_md() -> None:
@@ -90,7 +111,7 @@ def test_worker_allowed_execution_md() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_worker_blocked_from_project_md() -> None:
@@ -105,8 +126,8 @@ def test_worker_blocked_from_project_md() -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
-    assert "worker" in str(result.get("reason"))
+    assert _is_denied(result)
+    assert "worker" in _deny_reason(result)
 
 
 def test_supervisor_allowed_project_md() -> None:
@@ -121,7 +142,7 @@ def test_supervisor_allowed_project_md() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_supervisor_allowed_roadmap() -> None:
@@ -136,7 +157,7 @@ def test_supervisor_allowed_roadmap() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_supervisor_allowed_milestone_md() -> None:
@@ -153,7 +174,7 @@ def test_supervisor_allowed_milestone_md() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_supervisor_blocked_from_compose() -> None:
@@ -170,7 +191,7 @@ def test_supervisor_blocked_from_compose() -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
+    assert _is_denied(result)
 
 
 def test_coordinator_allowed_compose() -> None:
@@ -187,7 +208,7 @@ def test_coordinator_allowed_compose() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_coordinator_allowed_status() -> None:
@@ -204,7 +225,7 @@ def test_coordinator_allowed_status() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_coordinator_allowed_phase_md() -> None:
@@ -221,7 +242,7 @@ def test_coordinator_allowed_phase_md() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_coordinator_blocked_from_project() -> None:
@@ -236,7 +257,7 @@ def test_coordinator_blocked_from_project() -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
+    assert _is_denied(result)
 
 
 def test_verifier_allowed_verification_execution() -> None:
@@ -254,7 +275,7 @@ def test_verifier_allowed_verification_execution() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_verifier_allowed_handoff() -> None:
@@ -271,7 +292,7 @@ def test_verifier_allowed_handoff() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_verifier_blocked_from_non_verification_execution() -> None:
@@ -289,7 +310,7 @@ def test_verifier_blocked_from_non_verification_execution() -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
+    assert _is_denied(result)
 
 
 def test_edit_tool_also_enforced() -> None:
@@ -304,7 +325,7 @@ def test_edit_tool_also_enforced() -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
+    assert _is_denied(result)
 
 
 def test_multiedit_tool_also_enforced() -> None:
@@ -319,7 +340,7 @@ def test_multiedit_tool_also_enforced() -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
+    assert _is_denied(result)
 
 
 def test_non_write_tool_ignored() -> None:
@@ -334,7 +355,7 @@ def test_non_write_tool_ignored() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_missing_file_path_allowed() -> None:
@@ -346,7 +367,7 @@ def test_missing_file_path_allowed() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_escalation_allowed_supervisor() -> None:
@@ -363,7 +384,7 @@ def test_escalation_allowed_supervisor() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_escalation_allowed_coordinator() -> None:
@@ -380,115 +401,71 @@ def test_escalation_allowed_coordinator() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 # ---------------------------------------------------------------------------
-# Services write permissions (coordinator only, project-level)
+# Services write permissions removed (orphaned patterns)
 # ---------------------------------------------------------------------------
 
 
-def test_coordinator_allowed_service_setup() -> None:
+def test_coordinator_blocked_from_service_setup() -> None:
+    """Coordinator can no longer write to services/ (orphaned permission removed)."""
     hook = _get_pre_hook("coordinator")
     result = _run(
         hook(
             {
                 "tool_name": "Write",
-                "tool_input": {
-                    "file_path": "/tmp/project/.clou/services/api/setup.md"
-                },
+                "tool_input": {"file_path": "/tmp/project/.clou/services/bar/setup.md"},
             },
             "tool-1",
             {},
         )
     )
-    assert result == {}
+    assert _is_denied(result)
 
 
-def test_coordinator_allowed_service_env_example() -> None:
-    hook = _get_pre_hook("coordinator")
+# ---------------------------------------------------------------------------
+# Verifier artifact write permissions
+# ---------------------------------------------------------------------------
+
+
+def test_verifier_allowed_verification_artifact() -> None:
+    """Verifier can write to verification artifacts directory."""
+    hook = _get_pre_hook("verifier")
     result = _run(
         hook(
             {
                 "tool_name": "Write",
                 "tool_input": {
-                    "file_path": "/tmp/project/.clou/services/api/.env.example"
+                    "file_path": "/tmp/project/.clou/milestones"
+                    "/foo/phases/verification/artifacts/screenshot.png"
                 },
             },
             "tool-1",
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
-def test_coordinator_allowed_service_status() -> None:
-    hook = _get_pre_hook("coordinator")
+def test_verifier_blocked_from_non_verification_artifacts() -> None:
+    """Verifier cannot write to artifact paths outside the verification phase."""
+    hook = _get_pre_hook("verifier")
     result = _run(
         hook(
             {
                 "tool_name": "Write",
                 "tool_input": {
-                    "file_path": "/tmp/project/.clou/services/db/status.md"
+                    "file_path": "/tmp/project/.clou/milestones"
+                    "/foo/phases/build/artifacts/x.png"
                 },
             },
             "tool-1",
             {},
         )
     )
-    assert result == {}
-
-
-def test_worker_blocked_from_service_paths() -> None:
-    hook = _get_pre_hook("worker")
-    result = _run(
-        hook(
-            {
-                "tool_name": "Write",
-                "tool_input": {
-                    "file_path": "/tmp/project/.clou/services/api/setup.md"
-                },
-            },
-            "tool-1",
-            {},
-        )
-    )
-    assert result.get("decision") == "block"
-
-
-def test_supervisor_blocked_from_service_paths() -> None:
-    hook = _get_pre_hook("supervisor")
-    result = _run(
-        hook(
-            {
-                "tool_name": "Write",
-                "tool_input": {
-                    "file_path": "/tmp/project/.clou/services/api/setup.md"
-                },
-            },
-            "tool-1",
-            {},
-        )
-    )
-    assert result.get("decision") == "block"
-
-
-def test_scoped_coordinator_allowed_service_paths() -> None:
-    """Service paths are not milestone-scoped, so scoping doesn't affect them."""
-    hook = _get_scoped_pre_hook("coordinator", "auth")
-    result = _run(
-        hook(
-            {
-                "tool_name": "Write",
-                "tool_input": {
-                    "file_path": "/tmp/project/.clou/services/api/setup.md"
-                },
-            },
-            "tool-1",
-            {},
-        )
-    )
-    assert result == {}
+    assert _is_denied(result)
 
 
 def test_unknown_tier_blocks_clou_writes() -> None:
@@ -503,7 +480,7 @@ def test_unknown_tier_blocks_clou_writes() -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
+    assert _is_denied(result)
 
 
 def test_active_supervisor_md() -> None:
@@ -518,7 +495,7 @@ def test_active_supervisor_md() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_active_coordinator_md() -> None:
@@ -533,7 +510,7 @@ def test_active_coordinator_md() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +533,7 @@ def test_assessor_allowed_assessment_md(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_assessor_blocked_from_execution_md(tmp_path: Path) -> None:
@@ -574,8 +551,8 @@ def test_assessor_blocked_from_execution_md(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
-    assert "assessor" in str(result.get("reason"))
+    assert _is_denied(result)
+    assert "assessor" in _deny_reason(result)
 
 
 def test_assessor_blocked_from_decisions_md(tmp_path: Path) -> None:
@@ -593,7 +570,7 @@ def test_assessor_blocked_from_decisions_md(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
+    assert _is_denied(result)
 
 
 def test_assessor_blocked_from_compose_py(tmp_path: Path) -> None:
@@ -611,7 +588,7 @@ def test_assessor_blocked_from_compose_py(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
+    assert _is_denied(result)
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +628,7 @@ async def execute():
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_compose_invalid(tmp_path: Path) -> None:
@@ -681,11 +658,12 @@ async def execute():
     )
     output = result.get("hookSpecificOutput")
     assert isinstance(output, dict)
-    message = output.get("message")
-    assert isinstance(message, str)
-    assert "Composition errors:" in message
-    assert "Undefined: task_b" in message
-    assert "Fix the call graph." in message
+    assert output.get("hookEventName") == "PostToolUse"
+    ctx = output.get("additionalContext")
+    assert isinstance(ctx, str)
+    assert "Composition errors:" in ctx
+    assert "Undefined: task_b" in ctx
+    assert "Fix the call graph." in ctx
 
 
 def test_compose_non_clou_ignored(tmp_path: Path) -> None:
@@ -704,7 +682,7 @@ def test_compose_non_clou_ignored(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_compose_non_compose_file_ignored(tmp_path: Path) -> None:
@@ -725,7 +703,7 @@ def test_compose_non_compose_file_ignored(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_compose_read_tool_ignored(tmp_path: Path) -> None:
@@ -742,7 +720,7 @@ def test_compose_read_tool_ignored(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_compose_missing_file(tmp_path: Path) -> None:
@@ -763,7 +741,7 @@ def test_compose_missing_file(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 # ---------------------------------------------------------------------------
@@ -825,7 +803,7 @@ def test_scoped_coordinator_allowed_own_milestone() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_scoped_coordinator_blocked_other_milestone() -> None:
@@ -843,7 +821,7 @@ def test_scoped_coordinator_blocked_other_milestone() -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
+    assert _is_denied(result)
 
 
 def test_scoped_coordinator_active_still_allowed() -> None:
@@ -859,7 +837,7 @@ def test_scoped_coordinator_active_still_allowed() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_scoped_worker_allowed_own_milestone() -> None:
@@ -879,7 +857,7 @@ def test_scoped_worker_allowed_own_milestone() -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_scoped_worker_blocked_other_milestone() -> None:
@@ -899,7 +877,7 @@ def test_scoped_worker_blocked_other_milestone() -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
+    assert _is_denied(result)
 
 
 # ---------------------------------------------------------------------------
@@ -926,7 +904,7 @@ def test_dotdot_escape_blocked(tmp_path: Path) -> None:
     # .clou/ are always permitted — enforcement only restricts *within* .clou/).
     # This confirms Path.resolve() correctly collapses ".." so the path is
     # NOT treated as a .clou/ path with bypassed checks.
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_absolute_path_outside_clou_allowed(tmp_path: Path) -> None:
@@ -942,7 +920,7 @@ def test_absolute_path_outside_clou_allowed(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_dotdot_within_clou_blocked(tmp_path: Path) -> None:
@@ -964,8 +942,8 @@ def test_dotdot_within_clou_blocked(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
-    assert "worker" in str(result.get("reason"))
+    assert _is_denied(result)
+    assert "worker" in _deny_reason(result)
 
 
 # ---------------------------------------------------------------------------
@@ -987,7 +965,7 @@ def test_coordinator_hook_allows_coordinator_write(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_coordinator_hook_blocks_worker_writing_compose(tmp_path: Path) -> None:
@@ -1005,8 +983,8 @@ def test_coordinator_hook_blocks_worker_writing_compose(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
-    assert "worker" in str(result.get("reason"))
+    assert _is_denied(result)
+    assert "worker" in _deny_reason(result)
 
 
 def test_coordinator_hook_allows_worker_writing_execution(tmp_path: Path) -> None:
@@ -1026,7 +1004,7 @@ def test_coordinator_hook_allows_worker_writing_execution(tmp_path: Path) -> Non
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_coordinator_hook_blocks_verifier_writing_compose(tmp_path: Path) -> None:
@@ -1044,8 +1022,8 @@ def test_coordinator_hook_blocks_verifier_writing_compose(tmp_path: Path) -> Non
             {},
         )
     )
-    assert result.get("decision") == "block"
-    assert "verifier" in str(result.get("reason"))
+    assert _is_denied(result)
+    assert "verifier" in _deny_reason(result)
 
 
 def test_coordinator_hook_allows_verifier_writing_handoff(tmp_path: Path) -> None:
@@ -1063,7 +1041,7 @@ def test_coordinator_hook_allows_verifier_writing_handoff(tmp_path: Path) -> Non
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_coordinator_hook_unknown_agent_type_blocked(
@@ -1083,8 +1061,8 @@ def test_coordinator_hook_unknown_agent_type_blocked(
             {},
         )
     )
-    assert result.get("decision") == "block"
-    assert "Unknown agent type" in str(result.get("reason"))
+    assert _is_denied(result)
+    assert "Unknown agent type" in _deny_reason(result)
 
 
 def test_coordinator_hook_empty_string_agent_type_uses_coordinator(
@@ -1105,7 +1083,7 @@ def test_coordinator_hook_empty_string_agent_type_uses_coordinator(
         )
     )
     # Empty string is falsy — treated as lead agent, coordinator permissions apply.
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_coordinator_hook_none_agent_type_uses_coordinator(
@@ -1125,7 +1103,7 @@ def test_coordinator_hook_none_agent_type_uses_coordinator(
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_coordinator_hook_non_string_agent_type_uses_coordinator(
@@ -1145,7 +1123,7 @@ def test_coordinator_hook_non_string_agent_type_uses_coordinator(
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_worker_blocked_from_verifier_paths(tmp_path: Path) -> None:
@@ -1163,8 +1141,8 @@ def test_worker_blocked_from_verifier_paths(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
-    assert "worker" in str(result.get("reason"))
+    assert _is_denied(result)
+    assert "worker" in _deny_reason(result)
 
 
 def test_verifier_blocked_from_worker_paths(tmp_path: Path) -> None:
@@ -1190,8 +1168,8 @@ def test_verifier_blocked_from_worker_paths(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result.get("decision") == "block"
-    assert "verifier" in str(result.get("reason"))
+    assert _is_denied(result)
+    assert "verifier" in _deny_reason(result)
 
 
 def test_verifier_allowed_verification_phase_execution(tmp_path: Path) -> None:
@@ -1217,7 +1195,7 @@ def test_verifier_allowed_verification_phase_execution(tmp_path: Path) -> None:
             {},
         )
     )
-    assert result == {}
+    assert _is_allowed(result)
 
 
 def test_coordinator_hook_scoped_milestone_blocks_cross_milestone_worker(
@@ -1240,7 +1218,7 @@ def test_coordinator_hook_scoped_milestone_blocks_cross_milestone_worker(
             {},
         )
     )
-    assert result.get("decision") == "block"
+    assert _is_denied(result)
 
 
 def test_supervisor_hook_ignores_agent_type() -> None:
@@ -1258,7 +1236,7 @@ def test_supervisor_hook_ignores_agent_type() -> None:
         )
     )
     # Supervisor allows project.md — agent_type is irrelevant.
-    assert result == {}
+    assert _is_allowed(result)
 
 
 # ---------------------------------------------------------------------------

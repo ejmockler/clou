@@ -1,3 +1,5 @@
 # clou
+template: software-construction
 
-Agentic coding system for software construction
+Three-tier agentic orchestrator for structured multi-milestone work.
+Domain-agnostic architecture; software construction is the first harness template.

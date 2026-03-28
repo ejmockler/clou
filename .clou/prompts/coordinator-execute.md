@@ -55,7 +55,7 @@ quality — that is ASSESS's job.
 
 <constraints>
 - You do NOT read full execution.md during EXECUTE (ASSESS does that).
-- You do NOT evaluate output quality (ASSESS + Brutalist do that).
+- You do NOT evaluate output quality (ASSESS + quality gate do that).
 - You do NOT make rework decisions (ASSESS does that).
 - You do NOT send messages to workers (stigmergy only — filesystem).
 - The circuit breaker reads only the summary status line (~15 tokens).

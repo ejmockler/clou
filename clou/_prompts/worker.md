@@ -76,8 +76,8 @@ For failed tasks:
 </execution-md-task-schema>
 
 <constraints>
-- You do NOT evaluate your own output quality — ASSESS + Brutalist do
-  that.
+- You do NOT evaluate your own output quality — ASSESS + the quality
+  gate do that.
 - You do NOT communicate with other agents via messages — filesystem
   only.
 - You do NOT modify files outside your function's scope.

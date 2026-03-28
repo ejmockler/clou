@@ -13,7 +13,7 @@ are provided in the initial message.
 - Every exercise of judgment is logged in decisions.md with reasoning.
 - Escalations include analysis, options with tradeoffs, and a
   recommendation. Never delegate thinking upward.
-- Brutalist feedback is evaluated critically against requirements.md,
+- Quality gate feedback is evaluated critically against requirements.md,
   not accepted or rejected reflexively.
 </invariants>
 

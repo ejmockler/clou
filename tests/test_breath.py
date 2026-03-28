@@ -7,21 +7,22 @@ import time
 import pytest
 from textual.geometry import Size
 
-from clou.ui.mode import BreathStateMachine
-from clou.ui.theme import PALETTE, cycle_color
 from clou.ui.messages import (
     ClouAgentComplete,
+    ClouAgentProgress,
     ClouAgentSpawned,
     ClouCoordinatorSpawned,
     ClouCycleComplete,
 )
+from clou.ui.mode import BreathStateMachine
+from clou.ui.theme import PALETTE, cycle_color
 from clou.ui.widgets.breath import (
+    _CYCLE_RGB_CACHE,
     LABEL_WIDTH,
     MAX_EVENTS,
     SHIMMER_AMPLITUDE,
     BreathEventItem,
     BreathWidget,
-    _CYCLE_RGB_CACHE,
     _cycle_type_rgb,
     compute_shimmer,
     luminance_to_rgb,
@@ -313,12 +314,16 @@ class TestShimmerReset:
         assert w._active_agent_count == 2
 
         # Complete first — shimmer should remain active.
-        w.on_clou_agent_complete(ClouAgentComplete(task_id="a1", status="completed", summary="done"))
+        w.on_clou_agent_complete(
+            ClouAgentComplete(task_id="a1", status="completed", summary="done")
+        )
         assert w.shimmer_active is True
         assert w._active_agent_count == 1
 
         # Complete second — shimmer should turn off.
-        w.on_clou_agent_complete(ClouAgentComplete(task_id="a2", status="completed", summary="done"))
+        w.on_clou_agent_complete(
+            ClouAgentComplete(task_id="a2", status="completed", summary="done")
+        )
         assert w.shimmer_active is False
         assert w._active_agent_count == 0
 
@@ -326,7 +331,9 @@ class TestShimmerReset:
         w = BreathWidget()
 
         # Complete without a prior spawn.
-        w.on_clou_agent_complete(ClouAgentComplete(task_id="x", status="completed", summary="ok"))
+        w.on_clou_agent_complete(
+            ClouAgentComplete(task_id="x", status="completed", summary="ok")
+        )
         assert w._active_agent_count == 0
         assert w.shimmer_active is False
 
@@ -341,6 +348,40 @@ class TestShimmerReset:
         w.on_clou_coordinator_spawned(ClouCoordinatorSpawned(milestone="test"))
         assert w._active_agent_count == 0
         assert w.shimmer_active is False
+
+    def test_agent_progress_is_ambient_only(self) -> None:
+        """Agent progress is ambient (shimmer), not a visible event line."""
+        w = BreathWidget()
+
+        w.on_clou_agent_progress(
+            ClouAgentProgress(
+                task_id="a1",
+                last_tool="Read",
+                total_tokens=5000,
+                tool_uses=3,
+            )
+        )
+        assert len(w._events) == 0  # no visible line added
+
+    def test_agent_progress_does_not_change_agent_count(self) -> None:
+        w = BreathWidget()
+
+        # Spawn an agent first.
+        w.on_clou_agent_spawned(ClouAgentSpawned(task_id="a1", description="task"))
+        assert w._active_agent_count == 1
+        assert w.shimmer_active is True
+
+        # Progress should not change count or shimmer.
+        w.on_clou_agent_progress(
+            ClouAgentProgress(
+                task_id="a1",
+                last_tool="Grep",
+                total_tokens=1000,
+                tool_uses=1,
+            )
+        )
+        assert w._active_agent_count == 1
+        assert w.shimmer_active is True
 
     def test_cycle_complete_adds_event(self) -> None:
         w = BreathWidget()

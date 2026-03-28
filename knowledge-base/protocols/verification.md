@@ -2,7 +2,7 @@
 
 ## Principle
 
-The agent experiences the software before the user does. Verification is not test suites passing. It's the agent perceiving software through the user's lens — walking user flows against a live environment, trying to break things, noticing what a user would notice — and handing off a prepared room, not a construction site.
+The agent experiences the output before the user does. Verification is not automated checks passing. It's the agent perceiving the output through the user's lens — walking user flows against a live environment, trying to break things, noticing what a user would notice — and handing off a prepared room, not a construction site. For software construction, this means running the dev environment and walking user flows. Other domains use their own verification modalities (DB-11).
 
 ## Verification as Phase
 
@@ -16,7 +16,7 @@ It runs after all implementation phases complete. It is always the final phase i
 
 ## Verification Modalities
 
-The verification protocol adapts to different software through composable **verification modalities** — interaction methods the verification agent uses, selected by the coordinator during PLAN based on what the milestone builds. Modalities replace a fixed project type taxonomy. See [DB-09](../decision-boundaries/09-verification-generalization.md) for the full decision.
+The verification protocol adapts through composable **verification modalities** — interaction methods the verification agent uses, selected by the coordinator during PLAN based on what the milestone builds. The active harness template provides default modalities; the coordinator can override per milestone. Modalities replace a fixed project type taxonomy. See [DB-09](../decision-boundaries/09-verification-generalization.md) and [DB-11](../decision-boundaries/11-harness-architecture.md).
 
 | Modality | Tools | What the verifier perceives |
 |---|---|---|
@@ -91,7 +91,7 @@ During golden path walking, the verification agent captures raw perception artif
 - **Command output** including stdout, stderr, and exit code (Shell/Code modality)
 - **The complete action sequence** — what was done, in what order, what was observed
 
-Raw artifacts are stored in `phases/verification/artifacts/`. `execution.md` references them by path and includes the verifier's narrative interpretation. This keeps execution.md readable while making raw evidence available to the coordinator and Brutalist.
+Raw artifacts are stored in `phases/verification/artifacts/`. `execution.md` references them by path and includes the verifier's narrative interpretation. This keeps execution.md readable while making raw evidence available to the coordinator and quality gate.
 
 ### Stage 3: Exploratory Testing
 
@@ -105,7 +105,7 @@ After walking prescribed golden paths, the verification agent shifts intent — 
 - Edge cases discovered during golden path walking
 
 **What exploratory testing does NOT cover:**
-- Comprehensive security audit (that's Brutalist `roast_security`)
+- Comprehensive security audit (that's the quality gate's responsibility — e.g., Brutalist `roast_security` for software)
 - Performance testing (out of scope for verification)
 - Full regression testing (that's implementation-phase unit/integration tests)
 
@@ -120,21 +120,21 @@ After the verification agent completes its perception stages, the coordinator ev
 ### The Pattern
 
 1. **Read the perceptual record** — verification/execution.md + artifacts/
-2. **Invoke Brutalist `roast_product`** — pass the verifier's experience narrative, key raw artifacts (accessibility snapshots, screenshots, response bodies), and acceptance criteria from requirements.md
-3. **Evaluate** — verifier findings + Brutalist experience assessment against acceptance criteria
+2. **Invoke quality gate verify tools** — pass the verifier's experience narrative, key raw artifacts (accessibility snapshots, screenshots, response bodies), and acceptance criteria from requirements.md. For software-construction: Brutalist `roast_product`.
+3. **Evaluate** — verifier findings + quality gate experience assessment against acceptance criteria
 4. **Decide next step:**
    - Code issue → rework EXECUTE targeting the problem, then re-VERIFY
-   - Perception gap flagged by Brutalist → dispatch additional verification pass
+   - Perception gap flagged by quality gate → dispatch additional verification pass
    - Experience quality issue → rework EXECUTE, then re-VERIFY
    - All satisfied → dispatch handoff preparation → EXIT
 
-**Brutalist experience assessment is structural** — it always runs during VERIFY. The coordinator can scope exploratory testing, but cannot skip Brutalist. This parallels ASSESS: the coordinator decides implementation scope, but cannot skip Brutalist code assessment. Without external assessment, the verifier's "looks good" is self-reflection by the same model family that wrote the code (see [Research Foundations](../research-foundations.md) §9).
+**Quality gate experience assessment is structural** — it always runs during VERIFY when the template defines a required quality gate. The coordinator can scope exploratory testing, but cannot skip the gate. This parallels ASSESS: the coordinator decides implementation scope, but cannot skip quality assessment. Without external assessment, the verifier's "looks good" is self-reflection by the same model family that wrote the code (see [Research Foundations](../research-foundations.md) §9).
 
-**Mediated perception:** Brutalist receives the verifier's raw artifacts — the same evidence the verifier captured, not a summarized narrative. Brutalist's multiple models independently interpret the raw captures. This is consistent with how Brutalist assesses code (reads it on disk, doesn't independently write it). See [DB-09](../decision-boundaries/09-verification-generalization.md) for the full rationale.
+**Mediated perception:** The quality gate receives the verifier's raw artifacts — the same evidence the verifier captured, not a summarized narrative. The gate's multiple models independently interpret the raw captures. This is consistent with how the gate assesses code (reads it on disk, doesn't independently write it). See [DB-09](../decision-boundaries/09-verification-generalization.md) for the full rationale.
 
 ## Handoff Preparation
 
-Once the coordinator's VERIFY evaluation passes — golden paths verified, Brutalist experience assessment resolved — the coordinator dispatches handoff preparation.
+Once the coordinator's VERIFY evaluation passes — golden paths verified, quality gate experience assessment resolved — the coordinator dispatches handoff preparation.
 
 **`handoff.md` schema:**
 
@@ -210,7 +210,7 @@ In addition to the full verification phase at milestone end, Clou runs integrati
 
 ### What Smoke Tests Do NOT Cover
 
-- Full Brutalist assessment (that's the ASSESS cycle)
+- Full quality gate assessment (that's the ASSESS cycle)
 - Comprehensive edge cases and error states (that's the VERIFY phase at milestone end)
 - Code quality review (coordinator handles that in ASSESS)
 
@@ -229,17 +229,17 @@ The full verification phase remains the comprehensive end-of-milestone verificat
 
 ## Coordinator's Exit Condition Change
 
-The coordinator doesn't exit when implementation is done. It doesn't exit when Brutalist code assessment is satisfied. It exits when the verification phase has produced a `handoff.md` with a running environment, verified golden paths, and Brutalist experience assessment resolved.
+The coordinator doesn't exit when implementation is done. It doesn't exit when quality gate code assessment is satisfied. It exits when the verification phase has produced a `handoff.md` with a running environment, verified golden paths, and quality gate experience assessment resolved.
 
 ```
-plan → implement → brutalist code review → resolve feedback →
+plan → implement → quality gate code review → resolve feedback →
     verify (materialize → walk paths → explore →
-            coordinator: brutalist experience assessment → evaluate →
+            coordinator: quality gate experience assessment → evaluate →
             prepare handoff) →
     exit or loop
 ```
 
-If verification fails — environment won't start, a golden path is broken, Brutalist flags experience issues, the agent encounters incoherent behavior — the coordinator loops back to implementation with the findings as input.
+If verification fails — environment won't start, a golden path is broken, the quality gate flags experience issues, the agent encounters incoherent behavior — the coordinator loops back to implementation with the findings as input.
 
 ## Verification Phase Files
 

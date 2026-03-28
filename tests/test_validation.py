@@ -3,13 +3,23 @@
 Each test creates a golden context file structure in a temp directory and
 exercises the public validate_golden_context() API. No implementation
 details are tested directly.
+
+Phase 4 (validator-resilience): tests updated to work with
+list[ValidationFinding] return type. New tests for severity classification,
+errors_only/warnings_only helpers.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from clou.validation import validate_golden_context
+from clou.validation import (
+    Severity,
+    ValidationFinding,
+    errors_only,
+    validate_golden_context,
+    warnings_only,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -20,6 +30,11 @@ def _write(path: Path, content: str) -> None:
     """Write content to path, creating parent directories."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
+
+
+def _messages(findings: list[ValidationFinding]) -> list[str]:
+    """Extract message strings from findings for backward-compatible assertions."""
+    return [f.message for f in findings]
 
 
 # ---------------------------------------------------------------------------
@@ -39,50 +54,126 @@ def test_empty_clou_dir_no_errors(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# active/coordinator.md
+# active/coordinator.md — checkpoint-tier validation (DB-12)
 # ---------------------------------------------------------------------------
+
+VALID_CHECKPOINT = """\
+# Coordinator State
+
+cycle: 3
+step: ASSESS
+next_step: VERIFY
+current_phase: implementation
+phases_completed: 2
+phases_total: 3
+"""
 
 
 def test_valid_coordinator(tmp_path: Path) -> None:
-    _write(
-        tmp_path / ".clou" / "active" / "coordinator.md",
-        "# Coordinator\n\n## Cycle\nCycle 3\n\n## Phase Status\nASSESS: done\n",
-    )
+    _write(tmp_path / ".clou" / "active" / "coordinator.md", VALID_CHECKPOINT)
     assert validate_golden_context(tmp_path, "m1") == []
 
 
-def test_coordinator_missing_cycle(tmp_path: Path) -> None:
-    _write(
-        tmp_path / ".clou" / "active" / "coordinator.md",
-        "# Coordinator\n\n## Phase Status\nASSESS: done\n",
-    )
-    errors = validate_golden_context(tmp_path, "m1")
-    assert len(errors) == 1
-    assert "'## Cycle'" in errors[0]
+def test_coordinator_missing_required_key(tmp_path: Path) -> None:
+    """Missing a required key produces an error per missing key."""
+    # Missing step and next_step
+    content = "cycle: 1\ncurrent_phase: p1\nphases_completed: 0\nphases_total: 1\n"
+    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("missing required key 'step'" in m for m in msgs)
+    assert any("missing required key 'next_step'" in m for m in msgs)
 
 
-def test_coordinator_missing_phase_status(tmp_path: Path) -> None:
-    _write(
-        tmp_path / ".clou" / "active" / "coordinator.md",
-        "# Coordinator\n\n## Cycle\nCycle 1\n",
-    )
-    errors = validate_golden_context(tmp_path, "m1")
-    assert len(errors) == 1
-    assert "'## Phase Status'" in errors[0]
+def test_coordinator_invalid_step(tmp_path: Path) -> None:
+    """Invalid step value is rejected."""
+    content = VALID_CHECKPOINT.replace("step: ASSESS", "step: BANANA")
+    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("invalid step 'BANANA'" in m for m in msgs)
 
 
-def test_coordinator_missing_both(tmp_path: Path) -> None:
+def test_coordinator_invalid_next_step(tmp_path: Path) -> None:
+    """Invalid next_step value is rejected."""
+    content = VALID_CHECKPOINT.replace("next_step: VERIFY", "next_step: NOPE")
+    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("invalid next_step 'NOPE'" in m for m in msgs)
+
+
+def test_coordinator_non_integer_cycle(tmp_path: Path) -> None:
+    """Non-integer cycle value is rejected."""
+    content = VALID_CHECKPOINT.replace("cycle: 3", "cycle: boom")
+    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("must be an integer" in m for m in msgs)
+
+
+def test_coordinator_negative_phases(tmp_path: Path) -> None:
+    """Negative integer values are rejected."""
+    content = VALID_CHECKPOINT.replace("phases_completed: 2", "phases_completed: -1")
+    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("non-negative" in m for m in msgs)
+
+
+def test_coordinator_completed_exceeds_total(tmp_path: Path) -> None:
+    """phases_completed > phases_total is rejected."""
+    content = VALID_CHECKPOINT.replace("phases_completed: 2", "phases_completed: 5")
+    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("exceeds phases_total" in m for m in msgs)
+
+
+def test_coordinator_all_keys_missing(tmp_path: Path) -> None:
+    """Content with no key-value pairs produces errors for all required keys."""
     _write(
         tmp_path / ".clou" / "active" / "coordinator.md",
         "# Coordinator\nJust some text.\n",
     )
-    errors = validate_golden_context(tmp_path, "m1")
-    assert len(errors) == 2
+    findings = validate_golden_context(tmp_path, "m1")
+    assert len(findings) == 6  # one per required key
+
+
+def test_coordinator_valid_next_step_rework(tmp_path: Path) -> None:
+    """'EXECUTE (rework)' is a valid next_step."""
+    content = VALID_CHECKPOINT.replace(
+        "next_step: VERIFY", "next_step: EXECUTE (rework)"
+    )
+    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    assert validate_golden_context(tmp_path, "m1") == []
+
+
+def test_coordinator_valid_next_step_complete(tmp_path: Path) -> None:
+    """'COMPLETE' is a valid next_step."""
+    content = VALID_CHECKPOINT.replace("next_step: VERIFY", "next_step: COMPLETE")
+    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    assert validate_golden_context(tmp_path, "m1") == []
 
 
 # ---------------------------------------------------------------------------
 # execution.md
 # ---------------------------------------------------------------------------
+
+VALID_STATUS = """\
+# Status
+
+## Current State
+phase: implementation
+cycle: 3
+last_updated: 2026-03-25
+
+## Phase Progress
+| Phase | Status |
+|-------|--------|
+| setup | completed |
+| implementation | in_progress |
+"""
 
 VALID_EXECUTION = """\
 ## Summary
@@ -111,8 +202,9 @@ def test_execution_missing_summary(tmp_path: Path) -> None:
 **Status:** pending
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "execution.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("missing '## Summary'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("missing '## Summary'" in m for m in msgs)
 
 
 def test_execution_summary_missing_status_field(tmp_path: Path) -> None:
@@ -125,8 +217,9 @@ No status field here.
 **Status:** pending
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "execution.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("'status:' field" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("'status:' field" in m for m in msgs)
 
 
 def test_execution_missing_tasks(tmp_path: Path) -> None:
@@ -135,8 +228,9 @@ def test_execution_missing_tasks(tmp_path: Path) -> None:
 status: completed
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "execution.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("missing '## Tasks'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("missing '## Tasks'" in m for m in msgs)
 
 
 def test_execution_tasks_no_entries(tmp_path: Path) -> None:
@@ -148,8 +242,9 @@ status: completed
 Nothing here yet.
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "execution.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("no '### T<N>:' entries" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("no '### T<N>:' entries" in m for m in msgs)
 
 
 def test_execution_task_missing_status(tmp_path: Path) -> None:
@@ -162,8 +257,9 @@ status: completed
 No status here.
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "execution.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("task 1 missing '**Status:**'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("task 1 missing '**Status:**'" in m for m in msgs)
 
 
 def test_execution_task_invalid_status(tmp_path: Path) -> None:
@@ -176,8 +272,9 @@ status: completed
 **Status:** done
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "execution.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("invalid status 'done'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("invalid status 'done'" in m for m in msgs)
 
 
 def test_execution_all_valid_task_statuses(tmp_path: Path) -> None:
@@ -233,8 +330,9 @@ def test_decisions_no_cycle_section(tmp_path: Path) -> None:
 Some text but no cycle sections.
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "decisions.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("missing '## Cycle'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("missing '## Cycle'" in m for m in msgs)
 
 
 def test_decisions_cycle_no_entries(tmp_path: Path) -> None:
@@ -245,8 +343,9 @@ def test_decisions_cycle_no_entries(tmp_path: Path) -> None:
 No decision entries here.
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "decisions.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("Cycle section 1 has no" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("Cycle section 1 has no" in m for m in msgs)
 
 
 def test_decisions_assess_section_zero_findings_valid(tmp_path: Path) -> None:
@@ -292,8 +391,9 @@ No entries.
 OK.
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "decisions.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("Cycle section 1 has no" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("Cycle section 1 has no" in m for m in msgs)
 
 
 def test_decisions_mixed_valid_invalid_cycles(tmp_path: Path) -> None:
@@ -307,9 +407,9 @@ Good.
 No entries here.
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "decisions.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert len(errors) == 1
-    assert "Cycle section 2" in errors[0]
+    findings = validate_golden_context(tmp_path, "m1")
+    assert len(findings) == 1
+    assert "Cycle section 2" in findings[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -318,17 +418,7 @@ No entries here.
 
 
 def test_valid_status(tmp_path: Path) -> None:
-    content = """\
-# Status
-
-Current State: EXECUTE
-
-Phase Progress
-| Phase | Status |
-| ----- | ------ |
-| ASSESS | done |
-"""
-    _write(tmp_path / ".clou" / "milestones" / "m1" / "status.md", content)
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "status.md", VALID_STATUS)
     assert validate_golden_context(tmp_path, "m1") == []
 
 
@@ -336,23 +426,87 @@ def test_status_missing_current_state(tmp_path: Path) -> None:
     content = """\
 # Status
 
-Phase Progress
+## Phase Progress
 | Phase | Status |
+|-------|--------|
+| setup | completed |
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "status.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("Current State" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("Current State" in m for m in msgs)
 
 
 def test_status_missing_phase_progress(tmp_path: Path) -> None:
     content = """\
 # Status
 
-Current State: ASSESS
+## Current State
+phase: implementation
+cycle: 1
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "status.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("Phase Progress" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("Phase Progress" in m for m in msgs)
+
+
+def test_status_missing_phase_key(tmp_path: Path) -> None:
+    """Current State section missing 'phase:' key."""
+    content = """\
+# Status
+
+## Current State
+cycle: 1
+
+## Phase Progress
+| Phase | Status |
+|-------|--------|
+| setup | completed |
+"""
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "status.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("missing 'phase:'" in m for m in msgs)
+
+
+def test_status_invalid_phase_status(tmp_path: Path) -> None:
+    """Invalid status value in Phase Progress table."""
+    content = """\
+# Status
+
+## Current State
+phase: p1
+cycle: 1
+
+## Phase Progress
+| Phase | Status |
+|-------|--------|
+| setup | bananas |
+"""
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "status.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("invalid phase status" in m for m in msgs)
+
+
+def test_status_empty_phase_progress_table(tmp_path: Path) -> None:
+    """Phase Progress section with header but no data rows."""
+    content = """\
+# Status
+
+## Current State
+phase: p1
+cycle: 1
+
+## Phase Progress
+| Phase | Status |
+|-------|--------|
+"""
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "status.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("no table rows" in m for m in msgs)
 
 
 # ---------------------------------------------------------------------------
@@ -381,8 +535,9 @@ def test_roadmap_missing_milestones_section(tmp_path: Path) -> None:
 Some text.
 """
     _write(tmp_path / ".clou" / "roadmap.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("missing '## Milestones'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("missing '## Milestones'" in m for m in msgs)
 
 
 def test_roadmap_no_entries(tmp_path: Path) -> None:
@@ -393,8 +548,9 @@ def test_roadmap_no_entries(tmp_path: Path) -> None:
 No entries yet.
 """
     _write(tmp_path / ".clou" / "roadmap.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("no '### N. name' entries" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("no '### N. name' entries" in m for m in msgs)
 
 
 def test_roadmap_entry_missing_status(tmp_path: Path) -> None:
@@ -406,8 +562,9 @@ def test_roadmap_entry_missing_status(tmp_path: Path) -> None:
 No status.
 """
     _write(tmp_path / ".clou" / "roadmap.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("milestone entry 1 missing '**Status:**'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("milestone entry 1 missing '**Status:**'" in m for m in msgs)
 
 
 def test_roadmap_entry_invalid_status(tmp_path: Path) -> None:
@@ -419,8 +576,9 @@ def test_roadmap_entry_invalid_status(tmp_path: Path) -> None:
 **Status:** done
 """
     _write(tmp_path / ".clou" / "roadmap.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("invalid status 'done'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("invalid status 'done'" in m for m in msgs)
 
 
 def test_roadmap_all_valid_statuses(tmp_path: Path) -> None:
@@ -501,8 +659,9 @@ def test_assessment_missing_summary(tmp_path: Path) -> None:
 **Finding:** "A finding"
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "assessment.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("missing '## Summary'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("missing '## Summary'" in m for m in msgs)
 
 
 def test_assessment_summary_missing_status(tmp_path: Path) -> None:
@@ -515,8 +674,9 @@ tools_invoked: 2
 ## Findings
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "assessment.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("'status:' field" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("'status:' field" in m for m in msgs)
 
 
 def test_assessment_blocked_status_valid(tmp_path: Path) -> None:
@@ -541,8 +701,9 @@ status: completed
 tools_invoked: 1
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "assessment.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("missing '## Findings'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("missing '## Findings'" in m for m in msgs)
 
 
 def test_assessment_finding_missing_severity(tmp_path: Path) -> None:
@@ -558,8 +719,9 @@ status: completed
 **Finding:** "Some quote"
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "assessment.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("finding 1 missing '**Severity:**'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("finding 1 missing '**Severity:**'" in m for m in msgs)
 
 
 def test_assessment_finding_missing_quote(tmp_path: Path) -> None:
@@ -575,8 +737,9 @@ status: completed
 **Severity:** major
 """
     _write(tmp_path / ".clou" / "milestones" / "m1" / "assessment.md", content)
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("finding 1 missing '**Finding:**'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("finding 1 missing '**Finding:**'" in m for m in msgs)
 
 
 def test_assessment_empty_findings_valid(tmp_path: Path) -> None:
@@ -605,7 +768,7 @@ def test_multiple_files_all_valid(tmp_path: Path) -> None:
     """All golden context files present and valid."""
     _write(
         tmp_path / ".clou" / "active" / "coordinator.md",
-        "## Cycle\nCycle 1\n\n## Phase Status\nOK\n",
+        VALID_CHECKPOINT,
     )
     _write(
         tmp_path / ".clou" / "milestones" / "m1" / "execution.md",
@@ -617,7 +780,7 @@ def test_multiple_files_all_valid(tmp_path: Path) -> None:
     )
     _write(
         tmp_path / ".clou" / "milestones" / "m1" / "status.md",
-        "Current State: EXECUTE\n\nPhase Progress\n| P | S |\n",
+        VALID_STATUS,
     )
     _write(
         tmp_path / ".clou" / "roadmap.md",
@@ -636,9 +799,9 @@ def test_multiple_files_multiple_errors(tmp_path: Path) -> None:
         tmp_path / ".clou" / "milestones" / "m1" / "execution.md",
         "Nothing useful.\n",
     )
-    errors = validate_golden_context(tmp_path, "m1")
+    findings = validate_golden_context(tmp_path, "m1")
     # Coordinator errors + execution errors
-    assert len(errors) >= 4
+    assert len(findings) >= 4
 
 
 def test_different_milestone_name(tmp_path: Path) -> None:
@@ -691,9 +854,10 @@ def test_phase_level_execution_malformed(tmp_path: Path) -> None:
         / "execution.md",
         "Nothing useful.\n",
     )
-    errors = validate_golden_context(tmp_path, "m1")
-    assert any("missing '## Summary'" in e for e in errors)
-    assert any("missing '## Tasks'" in e for e in errors)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("missing '## Summary'" in m for m in msgs)
+    assert any("missing '## Tasks'" in m for m in msgs)
 
 
 def test_phase_level_multiple_phases_validated(tmp_path: Path) -> None:
@@ -712,10 +876,10 @@ def test_phase_level_multiple_phases_validated(tmp_path: Path) -> None:
         / "execution.md",
         "Nothing useful.\n",
     )
-    errors = validate_golden_context(tmp_path, "m1")
+    findings = validate_golden_context(tmp_path, "m1")
     # assess is valid, implement is malformed
-    assert len(errors) >= 2
-    assert any("implement" in e for e in errors)
+    assert len(findings) >= 2
+    assert any("implement" in f.path for f in findings)
 
 
 def test_phase_level_and_flat_both_checked(tmp_path: Path) -> None:
@@ -734,6 +898,234 @@ def test_phase_level_and_flat_both_checked(tmp_path: Path) -> None:
         / "execution.md",
         "Nothing useful.\n",
     )
-    errors = validate_golden_context(tmp_path, "m1")
+    findings = validate_golden_context(tmp_path, "m1")
     # Flat is valid, phase-level is malformed
-    assert len(errors) >= 2
+    assert len(findings) >= 2
+
+
+# ---------------------------------------------------------------------------
+# Severity classification — new tests for validator-resilience
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_errors_are_errors(tmp_path: Path) -> None:
+    """Missing keys and bad enums in coordinator checkpoint produce ERROR severity."""
+    content = "cycle: 1\ncurrent_phase: p1\nphases_completed: 0\nphases_total: 1\n"
+    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    assert all(f.severity == Severity.ERROR for f in findings)
+    assert len(findings) >= 2  # at least step and next_step missing
+
+
+def test_status_errors_are_errors(tmp_path: Path) -> None:
+    """Missing Current State and Phase Progress in status.md produce ERROR severity."""
+    content = "# Status\nSome text.\n"
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "status.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    errs = errors_only(findings)
+    assert len(errs) >= 1
+    msgs = _messages(errs)
+    assert any("Current State" in m for m in msgs)
+
+
+def test_execution_structural_errors_are_errors(tmp_path: Path) -> None:
+    """Missing ## Summary and ## Tasks in execution.md produce ERROR severity."""
+    _write(
+        tmp_path / ".clou" / "milestones" / "m1" / "execution.md",
+        "Nothing useful.\n",
+    )
+    findings = validate_golden_context(tmp_path, "m1")
+    errs = errors_only(findings)
+    assert len(errs) >= 2
+    msgs = _messages(errs)
+    assert any("## Summary" in m for m in msgs)
+    assert any("## Tasks" in m for m in msgs)
+
+
+def test_formatting_issues_are_warnings(tmp_path: Path) -> None:
+    """Missing **Status:** in roadmap entries and invalid task status are WARNINGs."""
+    # Roadmap entry missing **Status:**
+    roadmap = """\
+# Roadmap
+
+## Milestones
+### 1. Auth
+No status.
+"""
+    _write(tmp_path / ".clou" / "roadmap.md", roadmap)
+    findings = validate_golden_context(tmp_path, "m1")
+    warns = warnings_only(findings)
+    assert len(warns) >= 1
+    assert all(f.severity == Severity.WARNING for f in warns)
+    assert any("**Status:**" in f.message for f in warns)
+
+
+def test_decision_missing_entries_is_warning(tmp_path: Path) -> None:
+    """Non-ASSESS cycle section without decision entries is WARNING severity."""
+    content = """\
+## Cycle 2 — EXECUTE
+No entries.
+
+## Cycle 1
+### Accepted: Something
+OK.
+"""
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "decisions.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    warns = warnings_only(findings)
+    assert len(warns) >= 1
+    assert any("Cycle section" in f.message for f in warns)
+
+
+def test_assessment_missing_field_markup_is_warning(tmp_path: Path) -> None:
+    """Missing **Severity:** or **Finding:** in assessment findings is WARNING."""
+    content = """\
+# Assessment: implementation
+
+## Summary
+status: completed
+
+## Findings
+
+### F1: A finding
+No severity or finding fields.
+"""
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "assessment.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    warns = warnings_only(findings)
+    assert len(warns) >= 1
+    msgs = _messages(warns)
+    assert any("**Severity:**" in m or "**Finding:**" in m for m in msgs)
+
+
+def test_task_invalid_status_is_warning(tmp_path: Path) -> None:
+    """Invalid task status values produce WARNING severity."""
+    content = """\
+## Summary
+status: completed
+
+## Tasks
+### T1: Do something
+**Status:** done
+"""
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "execution.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    warns = warnings_only(findings)
+    assert len(warns) >= 1
+    assert any("invalid status 'done'" in f.message for f in warns)
+
+
+def test_invalid_phase_status_is_warning(tmp_path: Path) -> None:
+    """Invalid phase status in status.md table produces WARNING severity."""
+    content = """\
+# Status
+
+## Current State
+phase: p1
+cycle: 1
+
+## Phase Progress
+| Phase | Status |
+|-------|--------|
+| setup | bananas |
+"""
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "status.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    warns = warnings_only(findings)
+    assert len(warns) >= 1
+    assert any("invalid phase status" in f.message for f in warns)
+
+
+def test_roadmap_invalid_milestone_status_is_warning(tmp_path: Path) -> None:
+    """Invalid milestone status in roadmap produces WARNING severity."""
+    content = """\
+# Roadmap
+
+## Milestones
+### 1. Auth
+**Status:** done
+"""
+    _write(tmp_path / ".clou" / "roadmap.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    warns = warnings_only(findings)
+    assert len(warns) >= 1
+    assert any("invalid status 'done'" in f.message for f in warns)
+
+
+def test_errors_only_helper(tmp_path: Path) -> None:
+    """errors_only() filters to only ERROR-severity findings."""
+    mixed = [
+        ValidationFinding(Severity.ERROR, "error msg", "file.md"),
+        ValidationFinding(Severity.WARNING, "warning msg", "file.md"),
+        ValidationFinding(Severity.ERROR, "another error", "other.md"),
+    ]
+    result = errors_only(mixed)
+    assert len(result) == 2
+    assert all(f.severity == Severity.ERROR for f in result)
+    assert {f.message for f in result} == {"error msg", "another error"}
+
+
+def test_warnings_only_helper(tmp_path: Path) -> None:
+    """warnings_only() filters to only WARNING-severity findings."""
+    mixed = [
+        ValidationFinding(Severity.ERROR, "error msg", "file.md"),
+        ValidationFinding(Severity.WARNING, "warning msg", "file.md"),
+        ValidationFinding(Severity.WARNING, "another warning", "other.md"),
+    ]
+    result = warnings_only(mixed)
+    assert len(result) == 2
+    assert all(f.severity == Severity.WARNING for f in result)
+    assert {f.message for f in result} == {"warning msg", "another warning"}
+
+
+def test_errors_only_empty_list() -> None:
+    """errors_only() on empty list returns empty."""
+    assert errors_only([]) == []
+
+
+def test_warnings_only_no_warnings() -> None:
+    """warnings_only() returns empty when all findings are errors."""
+    findings = [
+        ValidationFinding(Severity.ERROR, "err", "f.md"),
+    ]
+    assert warnings_only(findings) == []
+
+
+def test_finding_str_renders_as_path_message() -> None:
+    """ValidationFinding.__str__ renders as 'path message' for backward compat."""
+    f = ValidationFinding(Severity.ERROR, "missing key", "active/coordinator.md")
+    assert str(f) == "active/coordinator.md missing key"
+
+
+def test_finding_has_path_attribute() -> None:
+    """ValidationFinding carries the relative path to the problematic file."""
+    f = ValidationFinding(Severity.ERROR, "missing key", "active/coordinator.md")
+    assert f.path == "active/coordinator.md"
+    assert f.severity == Severity.ERROR
+    assert f.message == "missing key"
+
+
+def test_mixed_errors_and_warnings_across_files(tmp_path: Path) -> None:
+    """Validation returns both errors and warnings from different files."""
+    # Invalid task status (WARNING) in execution.md
+    _write(
+        tmp_path / ".clou" / "milestones" / "m1" / "execution.md",
+        """\
+## Summary
+status: completed
+
+## Tasks
+### T1: Do something
+**Status:** done
+""",
+    )
+    # Missing ## Milestones in roadmap (ERROR)
+    _write(
+        tmp_path / ".clou" / "roadmap.md",
+        "# Roadmap\nSome text.\n",
+    )
+    findings = validate_golden_context(tmp_path, "m1")
+    errs = errors_only(findings)
+    warns = warnings_only(findings)
+    assert len(errs) >= 1  # roadmap missing milestones
+    assert len(warns) >= 1  # task invalid status

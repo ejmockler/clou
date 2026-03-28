@@ -3,8 +3,8 @@
 <objective>
 Verify the milestone meets its acceptance criteria by walking golden
 paths against a live environment. Capture raw perceptual artifacts for
-the coordinator's Brutalist experience assessment. You do not fix code —
-you document what you find.
+the coordinator's quality gate experience assessment. You do not fix
+code — you document what you find.
 </objective>
 
 <procedure>
@@ -127,7 +127,7 @@ blockers: {description or none}
 <constraints>
 - You do NOT fix code. Document failures in execution.md.
 - You do NOT evaluate whether findings warrant action — the
-  coordinator + Brutalist do that.
+  coordinator + quality gate do that.
 - You capture raw artifacts at every state transition.
 - You leave the development environment running.
 - Environment materialization failure is blocking — write it and stop.

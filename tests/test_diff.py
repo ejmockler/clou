@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from clou.ui.diff import render_diff
+from clou.ui.diff import (
+    compute_edit_stats,
+    compute_multi_edit_stats,
+    render_diff,
+    render_inline_diff,
+)
 
 
 _SAMPLE_DIFF = """\
@@ -47,6 +52,81 @@ class TestRenderDiff:
         result = render_diff(_SAMPLE_DIFF)
         text = str(result)
         assert "@@" in text
+
+
+class TestComputeEditStats:
+    def test_pure_addition(self) -> None:
+        adds, rems = compute_edit_stats("a\n", "a\nb\n")
+        assert adds == 1
+        assert rems == 0
+
+    def test_pure_removal(self) -> None:
+        adds, rems = compute_edit_stats("a\nb\n", "a\n")
+        assert adds == 0
+        assert rems == 1
+
+    def test_replacement(self) -> None:
+        adds, rems = compute_edit_stats("old\n", "new\n")
+        assert adds == 1
+        assert rems == 1
+
+    def test_no_change(self) -> None:
+        adds, rems = compute_edit_stats("same\n", "same\n")
+        assert adds == 0
+        assert rems == 0
+
+    def test_empty_to_content(self) -> None:
+        adds, rems = compute_edit_stats("", "line1\nline2\n")
+        assert adds == 2
+        assert rems == 0
+
+    def test_content_to_empty(self) -> None:
+        adds, rems = compute_edit_stats("line1\nline2\n", "")
+        assert adds == 0
+        assert rems == 2
+
+    def test_multi_line_replace(self) -> None:
+        adds, rems = compute_edit_stats("a\nb\nc\n", "a\nx\ny\nz\nc\n")
+        assert adds == 3
+        assert rems == 1
+
+
+class TestComputeMultiEditStats:
+    def test_sums_across_edits(self) -> None:
+        edits = [
+            {"old_string": "a\n", "new_string": "b\nc\n"},
+            {"old_string": "x\ny\n", "new_string": "z\n"},
+        ]
+        adds, rems = compute_multi_edit_stats(edits)
+        assert adds == 3  # 2 + 1
+        assert rems == 3  # 1 + 2
+
+    def test_empty_list(self) -> None:
+        adds, rems = compute_multi_edit_stats([])
+        assert adds == 0
+        assert rems == 0
+
+
+class TestRenderInlineDiff:
+    def test_shows_additions_and_removals(self) -> None:
+        result = render_inline_diff("old_line\n", "new_line\n")
+        text = result.plain
+        assert "- old_line" in text
+        assert "+ new_line" in text
+
+    def test_empty_strings(self) -> None:
+        result = render_inline_diff("", "")
+        assert result.plain == ""
+
+    def test_pure_addition(self) -> None:
+        result = render_inline_diff("", "added\n")
+        assert "+ added" in result.plain
+        assert "- " not in result.plain
+
+    def test_pure_removal(self) -> None:
+        result = render_inline_diff("removed\n", "")
+        assert "- removed" in result.plain
+        assert "+ " not in result.plain
 
 
 class TestDiffCommand:

@@ -11,6 +11,7 @@ from textual.widgets import Static
 
 from rich.markup import escape as _escape_markup
 
+from clou.ui.messages import ClouDagUpdate
 from clou.ui.theme import PALETTE
 from clou.ui.widgets.dag import DagWidget
 
@@ -67,3 +68,10 @@ class DagScreen(Screen[None]):
             deps=self._deps,
             id="dag-widget",
         )
+
+    def on_clou_dag_update(self, msg: ClouDagUpdate) -> None:
+        """Live-update the DAG when new data arrives."""
+        try:
+            self.query_one("#dag-widget", DagWidget).update_dag(msg.tasks, msg.deps)
+        except Exception:
+            pass

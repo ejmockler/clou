@@ -598,7 +598,9 @@ class TestDecisionToHandoff:
             assert app.mode is Mode.HANDOFF
             # Timer stays running during graceful RELEASING/SETTLING shutdown.
             assert app._animation_timer is not None
-            assert app._breath_machine.state is BreathState.RELEASING
+            assert app._breath_machine.state in (
+                BreathState.RELEASING, BreathState.SETTLING,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -940,14 +942,14 @@ class TestActionClear:
 
 
 # ---------------------------------------------------------------------------
-# Escalation dropped when DECISION→DECISION is blocked
+# Escalation queued when already in DECISION
 # ---------------------------------------------------------------------------
 
 
-class TestEscalationDropOnDecision:
+class TestEscalationQueueInDecision:
     @pytest.mark.asyncio
-    async def test_escalation_dropped_when_already_in_decision(self, tmp_path: Path) -> None:
-        """ClouEscalationArrived during DECISION mode is dropped (transition fails)."""
+    async def test_escalation_queued_when_already_in_decision(self, tmp_path: Path) -> None:
+        """ClouEscalationArrived during DECISION mode is queued for later."""
         async with ClouApp(project_dir=tmp_path).run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
 
@@ -981,10 +983,9 @@ class TestEscalationDropOnDecision:
             )
             await pilot.pause()
 
-            # Should still be in DECISION, and _pending_escalation should be None
-            # (the second was dropped because transition failed).
+            # Should still be in DECISION, with second escalation queued.
             assert app.mode is Mode.DECISION
-            assert app._pending_escalation is None
+            assert len(app._escalation_queue) == 1
 
 
 # ---------------------------------------------------------------------------

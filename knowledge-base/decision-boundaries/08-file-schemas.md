@@ -21,6 +21,7 @@ Several file schemas were resolved by earlier decision boundaries:
 | `active/supervisor.md` | DB-03 | Position, open escalations, pending items |
 | `status.md` | DB-07 | Current State + Phase Progress table + Notes |
 | `handoff.md` | Verification protocol | 7-section schema (environment, what was built, walk-through, services, verified, limitations, what to look for) |
+| `metrics.md` | DB-08 (below) | Telemetry summary — key-value header + cycle/agent/incident tables. Orchestrator-generated. |
 | Escalation files | Escalation protocol | Classification, context, issue, evidence, options, recommendation, disposition |
 | Schema enforcement | DB-05 | Structural validation at cycle boundaries (form, not content) |
 
@@ -198,6 +199,56 @@ The schema resolves three research tensions:
 4. **U-shaped positional alignment.** With newest-first: current cycle at top (attention sink — strong), oldest cycle at bottom (end of file — moderate per U-curve), middle cycles in the middle (weakest attention). For a 20-cycle-cap milestone, the file stays under ~3K tokens. At that scale the dead zone is narrow. But the principle holds: the latest judgments should be in the strongest position.
 
 **Structural validation:** File must contain at least one `## Cycle N` section. Each section must have at least one `### Accepted:` or `### Overridden:` or `### Tradeoff:` entry with the required fields for its type.
+
+### `metrics.md`
+
+```markdown
+# Metrics: <milestone-name>
+
+outcome: completed
+cycles: 4
+duration: 3m 15s
+tokens_in: 73000
+tokens_out: 12000
+agents_spawned: 2
+agents_completed: 2
+agents_failed: 0
+crash_retries: 0
+validation_failures: 0
+context_exhaustions: 0
+
+## Cycles
+
+| # | Type | Duration | Tokens In | Tokens Out | Outcome |
+|---|------|----------|-----------|------------|---------|
+| 1 | PLAN | 12s | 12,000 | 3,000 | EXECUTE |
+| 2 | EXECUTE | 1m 45s | 35,000 | 6,000 | ASSESS |
+| 3 | ASSESS | 38s | 20,000 | 2,000 | VERIFY |
+| 4 | VERIFY | 22s | 6,000 | 1,000 | COMPLETE |
+
+## Agents
+
+| Description | Cycle | Status | Tokens | Tools |
+|-------------|-------|--------|--------|-------|
+| implement login | 2 | completed | 15,000 | 12 |
+| write tests | 2 | completed | 8,000 | 5 |
+
+## Incidents
+
+- Cycle 1: crash (attempt 1)
+```
+
+**Design rationale:**
+
+1. **Key-value header matching checkpoint format.** The header uses the same `key: value` format as `active/coordinator.md` and `status.md`, providing consistency for agents reading golden context files.
+
+2. **Supervisor-consumable.** The supervisor reads `metrics.md` from completed milestones when planning future milestones — calibrating cycle count, token budget, and agent strategy expectations based on empirical data from past work.
+
+3. **Machine-generated, not agent-written.** Unlike other golden context files, `metrics.md` is written by the orchestrator (`clou.telemetry.write_milestone_summary`), not by any agent. This ensures accuracy — the data comes from the JSONL span log, not from agent self-report. Implements the Event Log + Periodic Snapshot pattern from research foundations §4b.
+
+4. **Sections are conditional.** The `## Agents` section is omitted if no agents were spawned. The `## Incidents` section is omitted if no incidents occurred. This respects §1 (every token is actively harmful).
+
+**Structural validation:** Narrative tier (DB-12). Required: `# Metrics:` heading, `outcome:` and `cycles:` key-value fields. Optional sections: `## Cycles`, `## Agents`, `## Incidents`.
 
 ### Schema Reference Location
 

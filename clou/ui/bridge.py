@@ -20,6 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from clou.ui.diff import compute_edit_stats
 from clou.ui.messages import (
     ClouAgentComplete,
     ClouAgentProgress,
@@ -75,6 +76,46 @@ _OPTION_RE = re.compile(
     r"^\s*(\d+)\.\s*\*\*(.+?)\*\*[:\s]*(.*)$",
     re.MULTILINE,
 )
+# Plain numbered list (system-generated escalations without bold markup).
+_OPTION_PLAIN_RE = re.compile(
+    r"^\s*(\d+)\.\s+(.+)$",
+    re.MULTILINE,
+)
+
+
+# ---------------------------------------------------------------------------
+# URL shortening
+# ---------------------------------------------------------------------------
+
+
+def _shorten_url(url: str, max_len: int = 50) -> str:
+    """Compress a URL to domain + trailing path segments.
+
+    ``https://docs.python.org/3/library/asyncio.html``
+    → ``docs.python.org/.../asyncio``
+    """
+    for prefix in ("https://", "http://"):
+        if url.startswith(prefix):
+            url = url[len(prefix):]
+            break
+    if url.startswith("www."):
+        url = url[4:]
+    url = url.rstrip("/")
+    for suffix in (".html", ".htm", ".php"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+    if len(url) <= max_len:
+        return url
+    slash = url.find("/")
+    if slash == -1:
+        return url[:max_len]
+    domain = url[:slash]
+    segments = [s for s in url[slash + 1 :].split("/") if s]
+    if len(segments) <= 2:
+        result = domain + "/" + "/".join(segments)
+    else:
+        result = domain + "/.../" + "/".join(segments[-2:])
+    return result[:max_len] if len(result) > max_len else result
 
 
 # ---------------------------------------------------------------------------
@@ -102,15 +143,23 @@ def extract_coordinator_status(
 
             if name in ("Write", "Edit"):
                 file_path: str = _strip_ansi(tool_input.get("file_path", ""))
+                # Compute stat suffix for edits
+                stat_suffix = ""
+                if name == "Edit":
+                    old = str(tool_input.get("old_string", ""))
+                    new = str(tool_input.get("new_string", ""))
+                    adds, rems = compute_edit_stats(old, new)
+                    if adds or rems:
+                        stat_suffix = f"  +{adds} −{rems}"  # noqa: RUF001
                 if "compose.py" in file_path:
-                    return "compose.py updated"
+                    return f"compose.py updated{stat_suffix}"
                 if "execution.md" in file_path:
                     return None
                 if "phase.md" in file_path:
                     phase = Path(file_path).parent.name
-                    return f"phase:{phase} spec written"
+                    return f"phase:{phase} spec written{stat_suffix}"
                 if "decisions.md" in file_path:
-                    return "decision logged"
+                    return f"decision logged{stat_suffix}"
                 if "status.md" in file_path:
                     return None
                 return None
@@ -118,6 +167,14 @@ def extract_coordinator_status(
             if name == "Agent":
                 desc: str = tool_input.get("description", "")
                 return f"dispatching {desc[:50]}"
+
+            if name == "WebFetch":
+                url: str = _strip_ansi(tool_input.get("url", ""))
+                return f"fetch {_shorten_url(url)}" if url else "fetch"
+
+            if name == "WebSearch":
+                query: str = _strip_ansi(tool_input.get("query", ""))
+                return f'search "{query[:40]}"' if query else "search"
 
             if name.startswith("mcp__brutalist__"):
                 tool_short = name.replace("mcp__brutalist__", "")
@@ -179,6 +236,7 @@ def parse_escalation(path: Path) -> dict[str, Any]:
     sections: dict[str, str] = {}
     current_key: str | None = None
     current_lines: list[str] = []
+    preamble_lines: list[str] = []
 
     for line in raw.splitlines():
         if line.startswith("## "):
@@ -186,20 +244,43 @@ def parse_escalation(path: Path) -> dict[str, Any]:
                 sections[current_key] = "\n".join(current_lines).strip()
             current_key = line[3:].strip().lower()
             current_lines = []
+        elif current_key is None:
+            preamble_lines.append(line)
         else:
             current_lines.append(line)
 
     if current_key is not None:
         sections[current_key] = "\n".join(current_lines).strip()
 
+    # System-generated escalations use **Key:** value in the preamble
+    # instead of ## Key sections.  Extract them as fallbacks.
+    _BOLD_KV = re.compile(r"^\*\*(.+?)\*\*[:\s]*(.*)$")
+    for line in preamble_lines:
+        m = _BOLD_KV.match(line.strip())
+        if m:
+            key = m.group(1).strip().rstrip(":").lower()
+            if key not in sections:
+                sections[key] = m.group(2).strip()
+
     options: list[dict[str, str]] = []
-    for match in _OPTION_RE.finditer(sections.get("options", "")):
-        options.append(
-            {
-                "label": match.group(2).strip(),
-                "description": match.group(3).strip(),
-            }
-        )
+    options_text = sections.get("options", "")
+    bold_matches = list(_OPTION_RE.finditer(options_text))
+    if bold_matches:
+        for match in bold_matches:
+            options.append(
+                {
+                    "label": match.group(2).strip(),
+                    "description": match.group(3).strip(),
+                }
+            )
+    else:
+        for match in _OPTION_PLAIN_RE.finditer(options_text):
+            options.append(
+                {
+                    "label": match.group(2).strip(),
+                    "description": "",
+                }
+            )
 
     return {
         "classification": sections.get("classification", ""),
@@ -223,6 +304,12 @@ def route_supervisor_message(
     *post* is a callable that accepts a ``Message`` and posts it
     (e.g. ``app.post_message``).
     """
+    # Subagent messages (Agent tool internals) have parent_tool_use_id set.
+    # Filter them out — their result arrives as a ToolResultBlock on the
+    # supervisor's own AssistantMessage and fills the _AgentDisclosure.
+    if getattr(msg, "parent_tool_use_id", None):
+        return
+
     # AssistantMessage — has .content list
     if hasattr(msg, "content") and isinstance(msg.content, list):
         # Surface error field (auth failures, billing errors, etc.)
@@ -238,7 +325,16 @@ def route_supervisor_message(
                 post(ClouThinking(text=_strip_ansi(block.thinking)))
             elif hasattr(block, "name") and hasattr(block, "input"):
                 tool_input = block.input if isinstance(block.input, dict) else {}
-                post(ClouToolUse(name=_strip_ansi(block.name), tool_input=tool_input))
+                # Strip ANSI from user-visible string values in tool_input.
+                tool_input = {
+                    k: _strip_ansi(v) if isinstance(v, str) else v
+                    for k, v in tool_input.items()
+                }
+                post(ClouToolUse(
+                    name=_strip_ansi(block.name),
+                    tool_input=tool_input,
+                    tool_use_id=_strip_ansi(getattr(block, "id", "")),
+                ))
             elif hasattr(block, "tool_use_id") and hasattr(block, "content"):
                 content = block.content
                 if isinstance(content, list):
@@ -280,6 +376,8 @@ def route_supervisor_message(
             )
         )
         return
+
+    _log.debug("unrouted supervisor message: %s", type(msg).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -362,3 +460,5 @@ def route_coordinator_message(
             )
         )
         return
+
+    _log.debug("unrouted coordinator message: %s", type(msg).__name__)

@@ -32,33 +32,16 @@ DB-02 and DB-04 establish this:
 
 Each compose.py function gets its own agent. `gather()` tasks spawn in parallel. Sequential tasks spawn serially, gated by SDK `TaskNotificationMessage`.
 
-### Agent Definitions
+### Agent Definitions (Template-Driven)
 
-```python
-# In orchestrator.py
-def build_agent_definitions(project_dir: Path, milestone: str) -> dict:
-    return {
-        "implementer": AgentDefinition(
-            description=(
-                "Implement code changes for assigned tasks. "
-                "Read compose.py for your function signature, phase.md for context. "
-                "Write results to execution.md."
-            ),
-            prompt=load_prompt("worker", project_dir, milestone=milestone),
-            tools=["Read", "Write", "Edit", "MultiEdit", "Bash",
-                   "Grep", "Glob", "LS", "WebSearch", "WebFetch"],
-            model="opus",
-        ),
-        "verifier": AgentDefinition(
-            description=(
-                "Verify milestone completion by perceiving the software as a user would."
-            ),
-            prompt=load_prompt("verifier", project_dir, milestone=milestone),
-            tools=build_verifier_tools(project_dir, milestone),
-            model="opus",
-        ),
-    }
-```
+Agent definitions come from the active harness template (DB-11). The template's `agents` dict maps agent names to `AgentSpec` objects specifying description, prompt_ref, tier, tools, and model. The orchestrator's `build_agent_definitions()` reads the template and constructs `AgentDefinition` objects. See [Orchestrator](./orchestrator.md) for the loading code.
+
+For the software-construction template, the agents are:
+- **implementer** (tier: worker) — code editing tools, web search
+- **assessor** (tier: assessor) — Brutalist quality gate tools
+- **verifier** (tier: verifier) — CDP browser tools, web search
+
+This replaces the previous hardcoded dict. New templates define different agent sets with different tools appropriate to their domain.
 
 ### Agent Briefing
 

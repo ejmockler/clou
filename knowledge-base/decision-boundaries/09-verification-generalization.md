@@ -5,11 +5,11 @@
 **Severity:** Medium — limits Clou to web applications without resolution
 **Question:** How does the verification protocol adapt beyond web applications?
 
-**Decision:** Verification modalities (composable, coordinator-selected) replace the project type taxonomy. The verifier captures raw perceptual artifacts that Brutalist reads during the coordinator's VERIFY evaluation (mediated perception). Verification decomposes into three perception stages (materialize, walk golden paths, explore) plus coordinator-level Brutalist experience assessment within the VERIFY cycle. Manual walk-through is the declared residual, not the starting point.
+**Decision:** Verification modalities (composable, coordinator-selected) replace the project type taxonomy. The verifier captures raw perceptual artifacts that the quality gate reads during the coordinator's VERIFY evaluation (mediated perception). Verification decomposes into three perception stages (materialize, walk golden paths, explore) plus coordinator-level quality gate experience assessment within the VERIFY cycle. The specific quality gate comes from the active harness template (DB-11); for software-construction, this is Brutalist. Manual walk-through is the declared residual, not the starting point.
 
 ## Design Constraints from Research
 
-- **§9 (LLM-Modulo):** LLMs can't self-verify. The verification agent and implementation agents are the same model family. Without external assessment, the verifier's "looks good" is structurally self-reflection. Brutalist experience assessment within VERIFY is the external verification layer.
+- **§9 (LLM-Modulo):** LLMs can't self-verify. The verification agent and implementation agents are the same model family. Without external assessment, the verifier's "looks good" is structurally self-reflection. Quality gate experience assessment within VERIFY is the external verification layer — the specific gate comes from the active template (DB-11).
 - **§9 (Compositionality at 2+ hops):** User flows are multi-hop. Compositional reasoning degrades past hop 2. Flows must stay unified within a single verification task — decomposition at stage boundaries, not mid-flow.
 - **§10 (Multi-Agent Failure Modes):** Premature termination — declaring success based on happy-path passing — is a documented failure mode (3 of 14). Exploratory testing and Brutalist experience assessment are structural countermeasures.
 - **§10 (Blackboard Architecture):** Clou's golden context is a blackboard. Agents coordinate through structured artifacts, not shared live-environment interaction. Brutalist reads the verifier's perceptual record — same pattern as Brutalist reading code on disk.
@@ -50,9 +50,9 @@ By modality:
 
 This extends Principle 3 ("The agent experiences the software before the user does"): the agent experiences as much as possible before asking the user to experience the rest. Automation is the default. Manual is the declared exception.
 
-### D2: Mediated Perception for Brutalist
+### D2: Mediated Perception for Quality Gate
 
-The verifier captures raw perceptual artifacts during path walking and exploratory testing. The coordinator passes these artifacts to Brutalist `roast_product` during its VERIFY evaluation. Brutalist does not independently interact with the live environment.
+The verifier captures raw perceptual artifacts during path walking and exploratory testing. The coordinator passes these artifacts to the quality gate during its VERIFY evaluation. The gate does not independently interact with the live environment. For the software-construction template, this means Brutalist's `roast_product` reads the verifier's perceptual record.
 
 #### Why Mediated Perception
 
@@ -83,21 +83,21 @@ The verifier writes to `verification/execution.md` per the DB-08 schema. Verific
 
 If Brutalist identifies a gap in the perceptual record — "I cannot assess error handling quality because no error state snapshots were captured" — that's a finding. The coordinator dispatches additional verification targeting the gap. Same pattern as ASSESS rework: Brutalist flags an issue → coordinator acts. The verifier's exploratory testing stage (D3) is the primary mechanism for covering edges beyond prescribed paths.
 
-#### Brutalist Experience Assessment Within VERIFY
+#### Quality Gate Experience Assessment Within VERIFY
 
-The coordinator invokes Brutalist within the VERIFY cycle, mirroring how it invokes Brutalist within ASSESS:
+The coordinator invokes the quality gate within the VERIFY cycle, mirroring how it invokes the gate within ASSESS. The specific gate and tools come from the active harness template (DB-11):
 
 | | ASSESS Cycle | VERIFY Cycle |
 |---|---|---|
 | What's assessed | Code quality | Experience quality |
 | Evidence | Code on disk | Perceptual record (execution.md + artifacts/) |
-| Brutalist tool | `roast_codebase`, `roast_architecture`, etc. | `roast_product` |
+| Gate tools (software-construction) | `roast_codebase`, `roast_architecture`, etc. | `roast_product` |
 | Criteria | Code standards, project.md conventions | Acceptance criteria from requirements.md |
-| Coordinator's role | Evaluate Brutalist feedback → accept/override/escalate | Same pattern |
+| Coordinator's role | Evaluate gate feedback → accept/override/escalate | Same pattern |
 
-The coordinator's judgment loop is the same shape across cycle types. Inputs differ. Evaluator tool differs. Criteria differ. The pattern is identical.
+The coordinator's judgment loop is the same shape across cycle types. Inputs differ. Gate tools differ. Criteria differ. The pattern is identical.
 
-**Brutalist experience assessment is structural** — it always runs during VERIFY. The coordinator can scope exploratory testing, but cannot skip Brutalist. This parallels ASSESS: the coordinator decides implementation scope, but cannot skip Brutalist code assessment (DB-05). §9 (LLM-Modulo): without external verification, the system is self-assessing.
+**Quality gate experience assessment is structural** — it always runs during VERIFY for templates with required gates. The coordinator can scope exploratory testing, but cannot skip the gate. This parallels ASSESS: the coordinator decides implementation scope, but cannot skip quality assessment (DB-05). §9 (LLM-Modulo): without external verification, the system is self-assessing.
 
 ### D3: Verification Stage Structure
 
@@ -193,14 +193,14 @@ The orchestrator's `build_agent_definitions` parameterizes the verifier's tool l
 - [x] **HTTP testing approach:** Bash + curl — already available, response bodies are complete representations
 - [x] **Mobile strategy:** Automate to maximum extent, manual walk-through as declared residual with documented WHY
 - [x] **Mixed-type coordination:** Modalities compose naturally in compose.py, no special mechanism
-- [x] **Brutalist perception:** Mediated through verifier's raw artifacts — lossless for HTTP/Shell/Code, same-as-independent for Browser
-- [x] **Verification stages:** Three perception stages (materialize, walk, explore) + coordinator-level Brutalist — decompose by intent, not by flow
+- [x] **Quality gate perception:** Mediated through verifier's raw artifacts — lossless for HTTP/Shell/Code, same-as-independent for Browser. The specific gate comes from the active template (DB-11).
+- [x] **Verification stages:** Three perception stages (materialize, walk, explore) + coordinator-level quality gate assessment — decompose by intent, not by flow
 
 ## Cascading Effects
 
-- **Verification protocol:** Updated with modalities, perception stages, exploratory testing, Brutalist experience assessment, perceptual record requirements, manual-as-residual.
-- **Coordinator protocol:** VERIFY cycle includes Brutalist `roast_product` invocation, mirroring ASSESS pattern.
-- **Brutalist integration:** `roast_product` invoked during VERIFY on perceptual record — structural, not optional.
+- **Verification protocol:** Updated with modalities, perception stages, exploratory testing, quality gate experience assessment, perceptual record requirements, manual-as-residual.
+- **Coordinator protocol:** VERIFY cycle includes quality gate invocation (for software-construction: Brutalist `roast_product`), mirroring ASSESS pattern.
+- **Quality gate integration:** Experience assessment invoked during VERIFY on perceptual record — structural for templates with required gates, not optional.
 - **Orchestrator:** Verifier tools dynamically configured by modality. `build_agent_definitions` parameterized.
 - **Golden context:** Verification phase includes `artifacts/` directory for raw perception captures.
 - **DB-10 (Team Communication):** The verifier's perceptual record format (execution.md + artifacts/) is a communication artifact between verifier and coordinator within VERIFY.

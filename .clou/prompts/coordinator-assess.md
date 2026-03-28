@@ -1,7 +1,7 @@
 <cycle type="ASSESS">
 
 <objective>
-Dispatch the assessor to invoke Brutalist quality gates, then evaluate
+Dispatch the assessor to invoke quality gate tools, then evaluate
 the structured findings against requirements.md and compose.py criteria.
 Determine: rework needed, phase complete, or escalation required.
 </objective>
@@ -27,17 +27,16 @@ Determine: rework needed, phase complete, or escalation required.
    ```
 
 4. Read assessment.md — the assessor's structured findings.
-   - If status: blocked — Brutalist is unavailable. Write escalation.
+   - If status: blocked — quality gate unavailable. Write escalation.
      Exit.
 
 5. Evaluate each finding against requirements.md — not all findings
    warrant action.
 
 6. For each finding, decide and log in decisions.md:
-   - Accept: create rework task. Log what Brutalist said (from
-     assessment.md finding quote), action taken, reasoning.
-   - Override: no changes. Log what Brutalist said, reasoning for
-     override.
+   - Accept: create rework task. Log the finding (from assessment.md
+     quote), action taken, reasoning.
+   - Override: no changes. Log the finding, reasoning for override.
    - Escalate: issue beyond coordinator authority.
    Cross-model agreement strengthens the case. Single-model findings
    deserve more scrutiny.
@@ -56,20 +55,20 @@ Determine: rework needed, phase complete, or escalation required.
 
 decisions.md entries (newest cycle first):
 ```
-## Cycle {N} — Brutalist Assessment
+## Cycle {N} — Quality Gate Assessment
 
 ### Accepted: {finding title}
-**Brutalist said:** "{exact finding from assessment.md}"
+**Finding:** "{exact finding from assessment.md}"
 **Action:** {what will be done}
 **Reasoning:** {why this finding warrants action}
 
 ### Overridden: "{finding title}"
-**Brutalist said:** "{exact finding from assessment.md}"
+**Finding:** "{exact finding from assessment.md}"
 **Action:** Override — no changes
 **Reasoning:** {why this finding does not warrant action}
 ```
 
-Non-Brutalist judgments:
+Non-gate judgments:
 ```
 ## Cycle {N} — Coordinator Judgment
 
@@ -85,11 +84,11 @@ Non-Brutalist judgments:
 - Task criteria met (from compose.py docstrings)?
 - Tests passing?
 - No regressions in existing functionality?
-- Brutalist findings valid against requirements.md scope?
+- Quality gate findings valid against requirements.md scope?
 - Security issues require action regardless of scope.
 - Performance/architecture suggestions outside milestone scope: override
   with reasoning, note for future milestones.
-- Do the multiple Brutalist source models agree on the finding?
+- Do the multiple source models agree on the finding?
 </evaluation-criteria>
 
 </cycle>

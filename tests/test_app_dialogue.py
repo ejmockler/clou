@@ -61,27 +61,39 @@ class TestInputSubmission:
 
     @pytest.mark.asyncio
     async def test_input_queues_message(self) -> None:
-        """Input submission queues the message — it only appears in the
-        conversation when ClouProcessingStarted fires."""
+        """First message is active (not queued). Second message shows as queued.
+        ClouProcessingStarted transitions queued messages to active."""
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
             inp = pilot.app.query_one("#user-input Input")
-            inp.value = "test message"
-            await inp.action_submit()
-            await pilot.pause()
             conv = pilot.app.query_one(ConversationWidget)
-            # Message should NOT appear yet — it's queued, not displayed.
-            assert len(conv.query(".msg")) == 0
-            assert app._queue_count == 1
 
-            # Simulate the orchestrator picking up the message.
-            conv.post_message(ClouProcessingStarted(text="test message"))
+            # First message: _queue_count is 0, so queued=False (active).
+            inp.value = "first message"
+            await inp.action_submit()
             await pilot.pause()
             msgs = conv.query(".msg")
             assert len(msgs) >= 1
-            all_text = "".join(str(w.render()) for w in msgs)
-            assert "test message" in all_text
-            assert app._queue_count == 0
+            first_rendered = str(msgs.last().render())
+            assert "first message" in first_rendered
+            assert "queued" not in first_rendered
+            assert app._queue_count == 1
+
+            # Second message: _queue_count is 1, so queued=True.
+            inp.value = "second message"
+            await inp.action_submit()
+            await pilot.pause()
+            msgs = conv.query(".msg")
+            assert len(msgs) >= 2
+            second_rendered = str(msgs.last().render())
+            assert "second message" in second_rendered
+            assert "queued" in second_rendered
+            assert app._queue_count == 2
+
+            # Simulate the orchestrator picking up the first message.
+            conv.post_message(ClouProcessingStarted(text="first message"))
+            await pilot.pause()
+            assert app._queue_count == 1
 
     @pytest.mark.asyncio
     async def test_empty_input_ignored(self) -> None:

@@ -17,9 +17,11 @@ from clou.recovery import (
     ConvergenceState,
     _safe_int,
     assess_convergence,
+    attempt_self_heal,
     determine_next_cycle,
     git_commit_phase,
     git_revert_golden_context,
+    log_self_heal_attempt,
     parse_checkpoint,
     read_cycle_count,
     read_cycle_outcome,
@@ -27,6 +29,7 @@ from clou.recovery import (
     write_cycle_limit_escalation,
     write_validation_escalation,
 )
+from clou.validation import Severity, ValidationFinding
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -673,6 +676,7 @@ def test_parse_checkpoint_valid_next_steps_preserved() -> None:
         "PLAN",
         "EXECUTE",
         "EXECUTE (rework)",
+        "EXECUTE (additional verification)",
         "ASSESS",
         "VERIFY",
         "EXIT",
@@ -974,3 +978,320 @@ def test_git_commit_phase_message_format(
     asyncio.run(git_commit_phase(tmp_path, "auth-v2", "implementation"))
 
     assert commit_msg == "feat(auth-v2): complete phase 'implementation'"
+
+
+# ---------------------------------------------------------------------------
+# parse_checkpoint — "none" maps to COMPLETE
+# ---------------------------------------------------------------------------
+
+
+def test_parse_checkpoint_none_maps_to_complete() -> None:
+    """next_step: none (from coordinator-exit.md) maps to COMPLETE."""
+    cp = parse_checkpoint("cycle: 7\nstep: EXIT\nnext_step: none\n")
+    assert cp.next_step == "COMPLETE"
+
+
+def test_parse_checkpoint_none_case_insensitive() -> None:
+    """next_step normalization is case-insensitive."""
+    for variant in ("none", "None", "NONE"):
+        cp = parse_checkpoint(f"next_step: {variant}\n")
+        assert cp.next_step == "COMPLETE", f"Failed for {variant!r}"
+
+
+# ---------------------------------------------------------------------------
+# determine_next_cycle — EXECUTE (additional verification)
+# ---------------------------------------------------------------------------
+
+
+def test_determine_next_cycle_additional_verification(tmp_path: Path) -> None:
+    """EXECUTE (additional verification) routes to EXECUTE cycle."""
+    cp_path = tmp_path / "coordinator.md"
+    _write(
+        cp_path,
+        "cycle: 6\nstep: VERIFY\nnext_step: EXECUTE (additional verification)\n"
+        "current_phase: verification\n",
+    )
+    cycle_type, read_set = determine_next_cycle(cp_path, "m1")
+    assert cycle_type == "EXECUTE"
+    assert "phases/verification/phase.md" in read_set
+
+
+def test_additional_verification_not_affected_by_convergence(tmp_path: Path) -> None:
+    """EXECUTE (additional verification) is NOT overridden by convergence."""
+    cp_path = tmp_path / "coordinator.md"
+    _write(
+        cp_path,
+        "cycle: 6\nstep: VERIFY\nnext_step: EXECUTE (additional verification)\n"
+        "current_phase: verification\n",
+    )
+    decisions_path = tmp_path / "decisions.md"
+    _write(decisions_path, _DECISIONS_CONVERGED)
+
+    cycle_type, _ = determine_next_cycle(
+        cp_path, "m1", decisions_path=decisions_path,
+    )
+    assert cycle_type == "EXECUTE"  # NOT overridden to VERIFY
+
+
+# ---------------------------------------------------------------------------
+# Self-heal tests — validator-resilience
+# ---------------------------------------------------------------------------
+
+
+def test_self_heal_normalises_status_value(tmp_path: Path) -> None:
+    """Self-heal normalises 'in progress' to 'in_progress' in status.md table."""
+    status_content = """\
+# Status
+
+## Current State
+phase: implementation
+cycle: 1
+
+## Phase Progress
+| Phase | Status |
+|-------|--------|
+| setup | completed |
+| implementation | in progress |
+"""
+    _write(
+        tmp_path / ".clou" / "milestones" / "m1" / "status.md",
+        status_content,
+    )
+    errors = [
+        ValidationFinding(
+            severity=Severity.WARNING,
+            message="invalid phase status 'in progress'",
+            path="milestones/m1/status.md",
+        ),
+    ]
+    fixes = attempt_self_heal(tmp_path, "m1", errors)
+    assert len(fixes) >= 1
+    assert any("normalised" in f for f in fixes)
+
+    # Verify the file was actually fixed.
+    content = (tmp_path / ".clou" / "milestones" / "m1" / "status.md").read_text()
+    assert "in_progress" in content
+    assert "in progress" not in content.split("Phase Progress")[1]
+
+
+def test_self_heal_adds_missing_field(tmp_path: Path) -> None:
+    """Self-heal adds missing phase: field to Current State."""
+    status_content = """\
+# Status
+
+## Current State
+cycle: 1
+
+## Phase Progress
+| Phase | Status |
+|-------|--------|
+| setup | completed |
+"""
+    _write(
+        tmp_path / ".clou" / "milestones" / "m1" / "status.md",
+        status_content,
+    )
+    errors = [
+        ValidationFinding(
+            severity=Severity.ERROR,
+            message="'Current State' missing 'phase:' field",
+            path="milestones/m1/status.md",
+        ),
+    ]
+    fixes = attempt_self_heal(tmp_path, "m1", errors)
+    assert len(fixes) >= 1
+    assert any("phase:" in f for f in fixes)
+
+    # Verify the field was added.
+    content = (tmp_path / ".clou" / "milestones" / "m1" / "status.md").read_text()
+    assert "phase:" in content
+
+
+def test_self_heal_skips_non_owned_files(tmp_path: Path) -> None:
+    """Self-heal does not touch files outside coordinator write permissions."""
+    # execution.md under phases/ is worker-owned, not coordinator-owned.
+    exec_content = """\
+## Summary
+status: completed
+
+## Tasks
+### T1: Do something
+**Status:** done
+"""
+    _write(
+        tmp_path / ".clou" / "milestones" / "m1" / "phases" / "impl" / "execution.md",
+        exec_content,
+    )
+    errors = [
+        ValidationFinding(
+            severity=Severity.WARNING,
+            message="task 1 has invalid status 'done'",
+            path="milestones/m1/phases/impl/execution.md",
+        ),
+    ]
+    fixes = attempt_self_heal(tmp_path, "m1", errors)
+    assert fixes == []  # nothing attempted
+
+    # Verify file was not modified.
+    content = (
+        tmp_path / ".clou" / "milestones" / "m1" / "phases" / "impl" / "execution.md"
+    ).read_text()
+    assert "done" in content
+
+
+def test_self_heal_idempotent(tmp_path: Path) -> None:
+    """Running self-heal twice produces identical file content."""
+    status_content = """\
+# Status
+
+## Current State
+phase: implementation
+cycle: 1
+
+## Phase Progress
+| Phase | Status |
+|-------|--------|
+| setup | completed |
+| implementation | in progress |
+"""
+    _write(
+        tmp_path / ".clou" / "milestones" / "m1" / "status.md",
+        status_content,
+    )
+    errors = [
+        ValidationFinding(
+            severity=Severity.WARNING,
+            message="invalid phase status 'in progress'",
+            path="milestones/m1/status.md",
+        ),
+    ]
+
+    # First application.
+    fixes1 = attempt_self_heal(tmp_path, "m1", errors)
+    content_after_first = (
+        tmp_path / ".clou" / "milestones" / "m1" / "status.md"
+    ).read_text()
+
+    # Second application — should be a no-op (no new fixes).
+    fixes2 = attempt_self_heal(tmp_path, "m1", errors)
+    content_after_second = (
+        tmp_path / ".clou" / "milestones" / "m1" / "status.md"
+    ).read_text()
+
+    assert content_after_first == content_after_second
+    assert len(fixes1) >= 1
+    assert fixes2 == []  # second run finds nothing to fix
+
+
+def test_self_heal_failure_falls_through(tmp_path: Path) -> None:
+    """Unfixable error in coordinator-writable file returns empty list."""
+    # Missing ## Current State entirely — self-heal can add fields but
+    # cannot create the section from scratch.
+    status_content = """\
+# Status
+
+## Phase Progress
+| Phase | Status |
+|-------|--------|
+| setup | completed |
+"""
+    _write(
+        tmp_path / ".clou" / "milestones" / "m1" / "status.md",
+        status_content,
+    )
+    errors = [
+        ValidationFinding(
+            severity=Severity.ERROR,
+            message="missing 'Current State' section",
+            path="milestones/m1/status.md",
+        ),
+    ]
+    fixes = attempt_self_heal(tmp_path, "m1", errors)
+    # No fixes possible — the section header is absent.
+    assert fixes == []
+
+
+def test_self_heal_logs_attempt(tmp_path: Path) -> None:
+    """log_self_heal_attempt writes to decisions.md."""
+    decisions_path = tmp_path / ".clou" / "milestones" / "m1" / "decisions.md"
+    decisions_path.parent.mkdir(parents=True, exist_ok=True)
+    decisions_path.write_text("# Decisions\n\n## Cycle 1\n### Accepted: X\nOK.\n")
+
+    fixes = ["normalised status 'in progress' -> 'in_progress'"]
+    remaining = [
+        ValidationFinding(Severity.ERROR, "missing section", "status.md"),
+    ]
+    log_self_heal_attempt(tmp_path, "m1", fixes, remaining)
+
+    content = decisions_path.read_text()
+    assert "Self-Heal" in content
+    assert "normalised status" in content
+    assert "missing section" in content
+
+
+# ---------------------------------------------------------------------------
+# Escalation tests with structured findings — validator-resilience
+# ---------------------------------------------------------------------------
+
+
+def test_escalation_includes_severity_breakdown(tmp_path: Path) -> None:
+    """Validation escalation evidence section shows errors vs warnings."""
+    findings = [
+        ValidationFinding(
+            Severity.ERROR, "missing ## Summary", "execution.md",
+        ),
+        ValidationFinding(
+            Severity.WARNING,
+            "task 1 missing **Status:**",
+            "execution.md",
+        ),
+    ]
+    asyncio.run(
+        write_validation_escalation(tmp_path, "m1", findings),
+    )
+    esc_dir = (
+        tmp_path / ".clou" / "milestones" / "m1" / "escalations"
+    )
+    files = list(esc_dir.iterdir())
+    assert len(files) == 1
+
+    content = files[0].read_text()
+    assert "Errors (blocking)" in content
+    assert "missing ## Summary" in content
+    assert "Warnings (non-blocking)" in content
+    assert "task 1 missing **Status:**" in content
+
+
+def test_escalation_classification_blocking_on_errors(tmp_path: Path) -> None:
+    """Escalation classification is 'blocking' when errors are present."""
+    findings = [
+        ValidationFinding(Severity.ERROR, "missing key", "coordinator.md"),
+        ValidationFinding(Severity.WARNING, "bad format", "roadmap.md"),
+    ]
+    asyncio.run(write_validation_escalation(tmp_path, "m1", findings))
+    esc_dir = tmp_path / ".clou" / "milestones" / "m1" / "escalations"
+    content = next(esc_dir.iterdir()).read_text()
+    assert "**Classification:** blocking" in content
+
+
+def test_escalation_classification_informational_warnings_only(
+    tmp_path: Path,
+) -> None:
+    """Escalation classification is 'informational' when only warnings present."""
+    findings = [
+        ValidationFinding(Severity.WARNING, "bad format", "roadmap.md"),
+    ]
+    asyncio.run(write_validation_escalation(tmp_path, "m1", findings))
+    esc_dir = tmp_path / ".clou" / "milestones" / "m1" / "escalations"
+    content = next(esc_dir.iterdir()).read_text()
+    assert "**Classification:** informational" in content
+
+
+def test_escalation_with_legacy_strings(tmp_path: Path) -> None:
+    """Validation escalation still works with plain string errors (backward compat)."""
+    errors = ["missing '## Cycle'", "task 1 missing '**Status:**'"]
+    asyncio.run(write_validation_escalation(tmp_path, "m1", errors))
+    esc_dir = tmp_path / ".clou" / "milestones" / "m1" / "escalations"
+    content = next(esc_dir.iterdir()).read_text()
+    assert "**Classification:** blocking" in content
+    assert "missing '## Cycle'" in content

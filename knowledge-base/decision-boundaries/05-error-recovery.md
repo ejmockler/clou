@@ -7,15 +7,15 @@
 
 ## Decisions
 
-1. **20-cycle milestone limit.** The coordinator has a hard cap of 20 cycles per milestone. The coordinator critically evaluates Brutalist feedback for validity — the cap prevents infinite thrashing, not thoughtful iteration. When the cap is hit, the coordinator escalates to the supervisor with a diagnosis of why convergence failed.
+1. **20-cycle milestone limit.** The coordinator has a hard cap of 20 cycles per milestone. The coordinator critically evaluates quality gate feedback for validity — the cap prevents infinite thrashing, not thoughtful iteration. When the cap is hit, the coordinator escalates to the supervisor with a diagnosis of why convergence failed.
 
 2. **Agent team crash: kill, preserve, escalate.** When a teammate crashes, the orchestrator kills remaining team members, preserves any `execution.md` entries they wrote, and escalates to the supervisor. The supervisor informs the user. The crash exits the coordinator loop entirely — it does not retry silently.
 
 3. **Coordinator-only commits.** Agent teams write code but do not commit. The coordinator reviews `execution.md` and code changes, then makes git commits at phase completion. Commits contain tractable deltas focused on the implementation — no conversation artifacts, no debug output, no intermediate states.
 
-4. **Brutalist unavailability is a hard error.** Brutalist is essential infrastructure. If it becomes unavailable during an ASSESS cycle, the coordinator escalates as `blocked` to the supervisor, which informs the user. The coordinator does not proceed without quality assessment.
+4. **Required quality gate unavailability is a hard error.** The active harness template's required quality gates are essential infrastructure (DB-11). If a required gate becomes unavailable during an ASSESS or VERIFY cycle, the coordinator escalates as `blocked` to the supervisor, which informs the user. The coordinator does not proceed without quality assessment. For the software-construction template, this means Brutalist. Other templates specify their own required gates.
 
-5. **Structural validation of golden context at cycle boundaries.** The orchestrator validates golden context file structure after each cycle. If validation fails: git-revert golden context files to pre-cycle state, restart the same cycle with error feedback, escalate to supervisor after 3 consecutive validation failures. The orchestrator validates structure (required sections, valid format), not content quality.
+5. **Structural validation of golden context at cycle boundaries.** The orchestrator validates golden context file structure after each cycle. If validation fails: git-revert golden context files to pre-cycle state, restart the same cycle with error feedback, escalate to supervisor after 3 consecutive validation failures. Validation is tiered (DB-12): AST for compose.py, strict key-value parsing for checkpoint files (active/coordinator.md, status.md), form-only checks for narrative files (execution.md, decisions.md). The orchestrator validates structure, not content quality — content quality is the quality gate's responsibility.
 
 6. **Inter-phase smoke tests via golden path walking.** At phase completion boundaries, before advancing to the next phase, the coordinator dispatches an integrative smoke test — not "does it compile" but end-to-end golden path verification that exercises the journey across all completed phases. This catches cascading compositional failures early.
 
@@ -55,9 +55,9 @@ These failures were resolved by earlier decisions:
 **Resolved by DB-03.** Session-per-cycle makes this trivial. If `active/coordinator.md` hasn't advanced, the orchestrator restarts the same cycle. The new session reads golden context and picks up from the last complete cycle boundary.
 
 #### F2.2: Coordinator loops infinitely
-**Cause:** Brutalist keeps finding issues, fixes create new issues, exit condition never met
+**Cause:** Quality gate keeps finding issues, fixes create new issues, exit condition never met
 **Impact:** Token burn, no progress
-**Recovery:** 20-cycle milestone limit. The coordinator critically evaluates each Brutalist finding — is this a real issue? Does it matter for this milestone? Is the fix proportionate? — and decides whether to enter another cycle or proceed. When the cap is hit, the coordinator writes an escalation with:
+**Recovery:** 20-cycle milestone limit. The coordinator critically evaluates each gate finding — is this a real issue? Does it matter for this milestone? Is the fix proportionate? — and decides whether to enter another cycle or proceed. When the cap is hit, the coordinator writes an escalation with:
 - Cycle history summary
 - Unresolved findings and why they persist
 - Recommendation (ship as-is, rework scope, or abandon)
@@ -67,7 +67,7 @@ The escalation type is `blocked` with severity `blocking`.
 #### F2.3: Coordinator produces invalid plan
 **Resolved by DB-02.** Orchestrator validates `compose.py` via AST parsing. PostToolUse hook rejects invalid call graphs with specific error messages. The coordinator fixes and rewrites until validation passes.
 
-#### F2.4: Coordinator overrides valid Brutalist feedback incorrectly
+#### F2.4: Coordinator overrides valid quality gate feedback incorrectly
 **Cause:** LLM misjudgment about feedback validity
 **Impact:** Real issues ship to the user
 **Recovery:** `decisions.md` captures every override with reasoning. The supervisor reviews decisions during milestone completion evaluation. If bad overrides are a pattern, the supervisor can tighten delegated authority for future milestones.
@@ -89,7 +89,7 @@ The supervisor informs the user. The crash exits the coordinator loop — it doe
 **Impact:** Wrong code changes, conflicts with other teammates
 **Recovery:**
 - Coordinator reviews `execution.md` and `git diff` during ASSESS cycle
-- Brutalist catches quality issues
+- Quality gate catches quality issues
 - Coordinator reverts and reassigns if necessary
 - Coordinator-only commits ensure bad changes don't persist in git history
 
@@ -106,16 +106,16 @@ The supervisor informs the user. The crash exits the coordinator loop — it doe
 
 ### Infrastructure Failures
 
-#### F4.1: Brutalist MCP is unavailable
-**Cause:** npm package issue, network problem, CLI not installed
+#### F4.1: Required quality gate is unavailable
+**Cause:** MCP server issue, network problem, CLI not installed
 **Impact:** Coordinator can't run quality assessment
-**Recovery:** Hard error. The coordinator writes an escalation:
+**Recovery:** Hard error (Decision 4). The coordinator writes an escalation:
 - Type: `blocked`
 - Severity: `blocking`
-- Evidence: the specific error from the Brutalist invocation
-- Recommendation: check Brutalist installation, network, npm registry
+- Evidence: the specific error from the gate invocation
+- Recommendation: check gate installation, network, dependencies (for software-construction: Brutalist npm package)
 
-The supervisor reads the escalation and informs the user. The coordinator does not proceed without Brutalist — quality assessment is not optional.
+The supervisor reads the escalation and informs the user. The coordinator does not proceed without quality assessment — required gates are essential infrastructure (DB-11).
 
 #### F4.2: Playwright MCP fails during verification
 **Cause:** Browser binary missing, server not responding, timeout
@@ -144,7 +144,7 @@ The orchestrator validates golden context structure at cycle boundaries — afte
 
 - Content quality (the orchestrator doesn't judge whether decisions are good)
 - Semantic correctness (the orchestrator doesn't check if phase status is accurate)
-- Code quality (that's Brutalist's job)
+- Code quality (that's the quality gate's job)
 
 ### Failure handling
 
@@ -175,7 +175,7 @@ At phase completion, before advancing to the next phase, the coordinator dispatc
 
 ### What smoke tests do NOT cover
 
-- Full Brutalist assessment (that's the ASSESS cycle)
+- Full quality gate assessment (that's the ASSESS cycle)
 - Comprehensive edge cases (that's the VERIFY phase at milestone end)
 - Code quality review (coordinator handles that)
 
@@ -202,7 +202,7 @@ Agent teams write code via Write/Edit tools. They do NOT run `git commit`. The c
 ### Commit Timing
 
 - **Phase completion:** Primary commit point. All changes from a phase in one commit.
-- **Rework cycles:** If ASSESS triggers rework, the rework changes are committed with the next phase completion or as a separate commit referencing the Brutalist finding.
+- **Rework cycles:** If ASSESS triggers rework, the rework changes are committed with the next phase completion or as a separate commit referencing the quality gate finding.
 
 ### Rollback
 

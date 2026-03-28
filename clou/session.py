@@ -15,6 +15,7 @@ Design principles (from research-foundations §4b):
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -82,8 +83,19 @@ def sessions_dir(project_dir: Path) -> Path:
     return d
 
 
+_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def _validate_session_id(session_id: str) -> str:
+    """Validate session_id is a safe filename component."""
+    if not _SESSION_ID_RE.match(session_id):
+        raise ValueError(f"Invalid session ID: {session_id!r}")
+    return session_id
+
+
 def session_path(project_dir: Path, session_id: str) -> Path:
     """Return the JSONL file path for a session."""
+    _validate_session_id(session_id)
     return sessions_dir(project_dir) / f"{session_id}.jsonl"
 
 
@@ -141,22 +153,34 @@ def read_transcript(project_dir: Path, session_id: str) -> list[SessionEntry]:
     with p.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 entries.append(SessionEntry.from_json(line))
+            except (json.JSONDecodeError, KeyError):
+                continue  # skip corrupt/torn lines
     return entries
 
 
 def list_sessions(project_dir: Path) -> list[SessionInfo]:
-    """List all sessions for a project, most recent first."""
+    """List all sessions for a project, most recent first.
+
+    Skips empty sessions (header-only files with no actual messages).
+    """
     d = sessions_dir(project_dir)
     sessions: list[SessionInfo] = []
     for p in d.glob("*.jsonl"):
         try:
             with p.open(encoding="utf-8") as f:
                 first_line = f.readline().strip()
-                if first_line:
-                    entry = SessionEntry.from_json(first_line)
-                    sessions.append(SessionInfo.from_entry(entry))
+                if not first_line:
+                    continue
+                # Skip header-only files — abandoned sessions.
+                second_line = f.readline().strip()
+                if not second_line:
+                    continue
+                entry = SessionEntry.from_json(first_line)
+                sessions.append(SessionInfo.from_entry(entry))
         except (json.JSONDecodeError, KeyError):
             continue
     sessions.sort(key=lambda s: s.started_at, reverse=True)
@@ -167,6 +191,31 @@ def latest_session_id(project_dir: Path) -> str | None:
     """Return the most recent session ID, or None."""
     sessions = list_sessions(project_dir)
     return sessions[0].session_id if sessions else None
+
+
+def session_preview(project_dir: Path, session_id: str, max_chars: int = 60) -> str:
+    """Return the first user message content, truncated, for display.
+
+    Reads lines sequentially — O(lines until first user message), not O(file).
+    """
+    p = session_path(project_dir, session_id)
+    if not p.exists():
+        return ""
+    with p.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = SessionEntry.from_json(line)
+            except (json.JSONDecodeError, KeyError):
+                continue
+            if entry.role == "user":
+                text = entry.content.replace("\n", " ").strip()
+                if len(text) > max_chars:
+                    return text[:max_chars] + "..."
+                return text
+    return ""
 
 
 def session_summary(project_dir: Path, session_id: str) -> dict[str, object]:

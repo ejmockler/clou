@@ -1,5 +1,11 @@
 """Token usage tracking for the Clou orchestrator.
 
+In-memory accumulator for input/output token counts.  The orchestrator
+snapshots TokenTracker state around each coordinator cycle and writes
+the deltas into the telemetry span log (see ``clou.telemetry``).
+``write_milestone_summary`` in telemetry.py aggregates those deltas
+into the golden context ``metrics.md``.
+
 Public API:
     TokenTracker — tracks input/output token counts per tier and milestone.
 """

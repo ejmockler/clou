@@ -2,7 +2,7 @@
 
 <objective>
 Evaluate the verification agent's perceptual record against acceptance
-criteria. Invoke Brutalist roast_product on the experience evidence.
+criteria. Invoke quality gate verify tools on the experience evidence.
 Determine: rework needed, additional verification needed, or ready for
 handoff.
 </objective>
@@ -12,12 +12,12 @@ handoff.
 2. Read verification/artifacts/ — key raw captures (accessibility
    snapshots, screenshots, response bodies).
 3. Compare perceptual record against requirements.md acceptance criteria.
-4. Invoke Brutalist roast_product on:
+4. Invoke quality gate verify tools on:
    - Verifier's experience narrative from execution.md
    - Key raw artifacts (snapshots, screenshots, response bodies)
    - Acceptance criteria from requirements.md
-   Brutalist experience assessment is structural — it always runs.
-5. Evaluate Brutalist findings against requirements.md scope.
+   Quality gate experience assessment is structural — it always runs.
+5. Evaluate quality gate findings against requirements.md scope.
 6. For each finding, decide and log in decisions.md:
    - Accept (code issue): create rework EXECUTE task. Log finding,
      action, reasoning.
@@ -40,15 +40,15 @@ handoff.
 
 decisions.md entries for VERIFY (newest cycle first):
 ```
-## Cycle {N} — Brutalist Experience Assessment
+## Cycle {N} — Quality Gate Experience Assessment
 
 ### Accepted: {finding title}
-**Brutalist said:** "{exact finding}"
+**Finding:** "{exact finding}"
 **Action:** {rework EXECUTE | additional verification pass}
 **Reasoning:** {why this finding warrants action}
 
 ### Overridden: "{finding title}"
-**Brutalist said:** "{exact finding}"
+**Finding:** "{exact finding}"
 **Action:** Override — no changes
 **Reasoning:** {why this finding does not warrant action}
 ```
@@ -60,7 +60,7 @@ decisions.md entries for VERIFY (newest cycle first):
 - Environment materializes cleanly?
 - Golden paths pass end-to-end?
 - Exploratory testing findings addressed or documented?
-- Brutalist experience findings valid against requirements.md scope?
+- Quality gate experience findings valid against requirements.md scope?
 - Security and accessibility issues require action regardless of scope.
 - Performance/polish suggestions outside milestone scope: override
   with reasoning, note for future milestones.

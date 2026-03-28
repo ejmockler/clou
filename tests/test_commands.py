@@ -412,43 +412,15 @@ class TestModel:
             assert "opus" in text
 
     @pytest.mark.asyncio
-    async def test_model_switch(self) -> None:
+    async def test_model_switch_deferred(self) -> None:
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
             await dispatch(app, "/model sonnet")
-            assert app._model == "sonnet"
+            # Model should NOT change — switching is deferred.
+            assert app._model == "opus"
             conv = app.query_one(ConversationWidget)
             text = _history_text(conv)
-            assert "sonnet" in text
-
-    @pytest.mark.asyncio
-    async def test_model_invalid(self) -> None:
-        async with ClouApp().run_test() as pilot:
-            await dispatch(pilot.app, "/model gpt4")
-            conv = pilot.app.query_one(ConversationWidget)
-            text = _history_text(conv)
-            assert "unknown model" in text
-
-    @pytest.mark.asyncio
-    async def test_model_already_active(self) -> None:
-        async with ClouApp().run_test() as pilot:
-            await dispatch(pilot.app, "/model opus")
-            conv = pilot.app.query_one(ConversationWidget)
-            text = _history_text(conv)
-            assert "already" in text
-
-    @pytest.mark.asyncio
-    async def test_model_rejected_in_breath(self) -> None:
-        async with ClouApp().run_test() as pilot:
-            from clou.ui.messages import ClouCoordinatorSpawned
-
-            app: ClouApp = pilot.app  # type: ignore[assignment]
-            app.post_message(ClouCoordinatorSpawned(milestone="m1"))
-            await pilot.pause()
-            result = await dispatch(app, "/model sonnet")
-            assert result is True
-            # Should not have changed.
-            assert app._model == "opus"
+            assert "not yet implemented" in text
 
 
 # ---------------------------------------------------------------------------
@@ -461,61 +433,88 @@ class TestModel:
 # ---------------------------------------------------------------------------
 
 
-class TestSessions:
+class TestResume:
     @pytest.mark.asyncio
-    async def test_sessions_registered(self) -> None:
-        cmd = get("sessions")
+    async def test_resume_registered(self) -> None:
+        cmd = get("resume")
         assert cmd is not None
+        assert cmd.items_factory is not None
 
     @pytest.mark.asyncio
-    async def test_sessions_shows_current(self, tmp_path: Path) -> None:
-        """The current session always appears in /sessions output."""
+    async def test_sessions_removed(self) -> None:
+        assert get("sessions") is None
+
+    @pytest.mark.asyncio
+    async def test_resume_no_args_lists_sessions(self, tmp_path: Path) -> None:
+        """Bare /resume lists available sessions."""
         (tmp_path / ".clou").mkdir()
         async with ClouApp(project_dir=tmp_path).run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
-            await dispatch(app, "/sessions")
+            # Create a past session with content.
+            from clou.session import Session
+            old = Session(tmp_path, session_id="old123")
+            old.append("user", "hello from the past")
+            await dispatch(app, "/resume")
             conv = app.query_one(ConversationWidget)
             text = _history_text(conv)
-            # At minimum, the current session appears.
-            assert app._session is not None
-            assert app._session.session_id in text
+            assert "old123" in text
 
     @pytest.mark.asyncio
-    async def test_sessions_lists_current(self, tmp_path: Path) -> None:
+    async def test_resume_no_previous_sessions(self, tmp_path: Path) -> None:
+        """Bare /resume with no past sessions shows error."""
         (tmp_path / ".clou").mkdir()
         async with ClouApp(project_dir=tmp_path).run_test() as pilot:
-            app: ClouApp = pilot.app  # type: ignore[assignment]
-            # The app creates a session on mount.
-            assert app._session is not None
-            await dispatch(app, "/sessions")
-            conv = app.query_one(ConversationWidget)
+            await dispatch(pilot.app, "/resume")
+            conv = pilot.app.query_one(ConversationWidget)
             text = _history_text(conv)
-            # Current session ID should appear.
-            assert app._session.session_id in text
+            assert "no previous sessions" in text
 
     @pytest.mark.asyncio
-    async def test_sessions_detail(self, tmp_path: Path) -> None:
+    async def test_resume_nonexistent_error(self, tmp_path: Path) -> None:
         (tmp_path / ".clou").mkdir()
         async with ClouApp(project_dir=tmp_path).run_test() as pilot:
-            app: ClouApp = pilot.app  # type: ignore[assignment]
-            assert app._session is not None
-            # Add a message so the session has content.
-            app._session.append("user", "hello")
-            sid = app._session.session_id
-            await dispatch(app, f"/sessions {sid}")
-            conv = app.query_one(ConversationWidget)
-            text = _history_text(conv)
-            assert sid in text
-            assert "messages" in text
-
-    @pytest.mark.asyncio
-    async def test_sessions_detail_not_found(self, tmp_path: Path) -> None:
-        (tmp_path / ".clou").mkdir()
-        async with ClouApp(project_dir=tmp_path).run_test() as pilot:
-            await dispatch(pilot.app, "/sessions nonexistent")
+            await dispatch(pilot.app, "/resume nonexistent")
             conv = pilot.app.query_one(ConversationWidget)
             text = _history_text(conv)
             assert "not found" in text
+
+    @pytest.mark.asyncio
+    async def test_resume_same_session_error(self, tmp_path: Path) -> None:
+        """Cannot resume the current session."""
+        (tmp_path / ".clou").mkdir()
+        async with ClouApp(project_dir=tmp_path).run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            sid = app._session.session_id
+            await dispatch(app, f"/resume {sid}")
+            conv = app.query_one(ConversationWidget)
+            text = _history_text(conv)
+            assert "already in this session" in text
+
+    @pytest.mark.asyncio
+    async def test_resume_items_factory(self, tmp_path: Path) -> None:
+        """items_factory returns SubItems for available sessions."""
+        (tmp_path / ".clou").mkdir()
+        async with ClouApp(project_dir=tmp_path).run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            # Create a past session.
+            from clou.session import Session
+            old = Session(tmp_path, session_id="factory1")
+            old.append("user", "test message")
+            cmd = get("resume")
+            items = cmd.items_factory(app)
+            assert len(items) >= 1
+            assert any(sub.args == "factory1" for sub in items)
+
+    @pytest.mark.asyncio
+    async def test_resume_items_factory_excludes_current(self, tmp_path: Path) -> None:
+        """items_factory excludes the current session."""
+        (tmp_path / ".clou").mkdir()
+        async with ClouApp(project_dir=tmp_path).run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            cmd = get("resume")
+            items = cmd.items_factory(app)
+            current_id = app._session.session_id
+            assert not any(sub.args == current_id for sub in items)
 
 
 # ---------------------------------------------------------------------------

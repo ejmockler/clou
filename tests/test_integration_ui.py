@@ -106,6 +106,9 @@ class TestSupervisorRouting:
                 f"{_P}._build_mcp_server",
                 return_value=MagicMock(),
             ),
+            patch(f"{_P}.read_template_name", return_value="software-construction"),
+            patch(f"{_P}.load_template", return_value=MagicMock(quality_gates=[])),
+            patch(f"{_P}.template_mcp_servers", return_value={}),
         ):
             yield
 
@@ -115,6 +118,7 @@ class TestSupervisorRouting:
         text_msg = _make_assistant_msg("hello from supervisor")
         client = _mock_sdk_client([text_msg])
         mock_app = MagicMock()
+        mock_app._resume_session_id = None
 
         with (
             patch(f"{_P}.ClaudeSDKClient", return_value=client),
@@ -125,7 +129,11 @@ class TestSupervisorRouting:
             (tmp_path / ".clou" / "active").mkdir(parents=True)
             await run_supervisor(tmp_path, app=mock_app)
 
-        mock_route.assert_called_once_with(text_msg, mock_app.post_message)
+        # _post resolves to app.query_one(ConversationWidget).post_message
+        # (falls back to app.post_message only when query_one raises).
+        mock_route.assert_called_once_with(
+            text_msg, mock_app.query_one.return_value.post_message
+        )
 
     @pytest.mark.asyncio
     async def test_display_used_when_no_app(self, tmp_path: Path) -> None:

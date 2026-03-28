@@ -37,6 +37,19 @@ CommandHandler = Callable[["ClouApp", str], Awaitable[None]]
 
 
 @dataclass(frozen=True)
+class SubItem:
+    """A sub-option within a command's submenu."""
+
+    label: str
+    description: str
+    args: str  # appended to the parent command when dispatched
+
+
+#: Factory that produces sub-items dynamically (e.g. session list).
+ItemsFactory = Callable[["ClouApp"], tuple[SubItem, ...]]
+
+
+@dataclass(frozen=True)
 class Command:
     """A single slash command."""
 
@@ -45,6 +58,8 @@ class Command:
     handler: CommandHandler
     shortcut: str = ""
     modes: frozenset[Mode] = field(default_factory=lambda: _ALL_MODES)
+    items: tuple[SubItem, ...] = ()  # static submenu entries
+    items_factory: ItemsFactory | None = None  # dynamic submenu entries
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +229,10 @@ register(
         description="token usage and cost",
         handler=_cmd_cost,
         shortcut="⌃T",
+        items=(
+            SubItem("summary", "quick overview", ""),
+            SubItem("detail", "detailed breakdown", "detail"),
+        ),
     )
 )
 
@@ -307,6 +326,10 @@ register(
         name="diff",
         description="show git diff",
         handler=_cmd_diff,
+        items=(
+            SubItem("all", "staged and unstaged", ""),
+            SubItem("staged", "staged changes only", "staged"),
+        ),
     )
 )
 
@@ -339,6 +362,10 @@ register(
         name="export",
         description="export conversation to markdown",
         handler=_cmd_export,
+        items=(
+            SubItem("standard", "conversation only", ""),
+            SubItem("full", "include tool calls", "--full"),
+        ),
     )
 )
 
@@ -460,41 +487,21 @@ register(
 )
 
 
-_MODEL_ALIASES: dict[str, str] = {
-    "opus": "opus",
-    "sonnet": "sonnet",
-    "haiku": "haiku",
-}
-
-
 async def _cmd_model(app: ClouApp, args: str) -> None:
-    """Show or switch the model."""
-    if not args.strip():
+    """Show current model. Switching is not yet implemented."""
+    if args.strip():
         result = Text()
-        result.append("  model  ", style=_DIM_HEX)
-        result.append(app._model, style=f"bold {_GOLD_HEX}")
+        result.append(
+            "  model switching is not yet implemented",
+            style=_DIM_HEX,
+        )
+        result.append(f"\n  current model: {app._model}", style=f"bold {_GOLD_HEX}")
         render_command_output(app, result)
         return
 
-    alias = args.strip().lower()
-    if alias not in _MODEL_ALIASES:
-        valid = ", ".join(sorted(_MODEL_ALIASES.keys()))
-        _render_error(app, f"unknown model: {alias} (valid: {valid})")
-        return
-
-    model = _MODEL_ALIASES[alias]
-    if model == app._model:
-        render_command_output(app, f"  already using {model}")
-        return
-
-    app._model = model
-    app._model_switch_requested = model
     result = Text()
-    result.append(f"  model → {model}", style=f"bold {_GOLD_HEX}")
-    result.append(
-        "\n  takes effect on next supervisor message",
-        style=_DIM_HEX,
-    )
+    result.append("  model  ", style=_DIM_HEX)
+    result.append(app._model, style=f"bold {_GOLD_HEX}")
     render_command_output(app, result)
 
 
@@ -504,6 +511,11 @@ register(
         description="show or switch model",
         handler=_cmd_model,
         modes=frozenset({Mode.DIALOGUE}),
+        items=(
+            SubItem("opus", "claude opus", "opus"),
+            SubItem("sonnet", "claude sonnet", "sonnet"),
+            SubItem("haiku", "claude haiku", "haiku"),
+        ),
     )
 )
 
@@ -522,70 +534,91 @@ register(
 )
 
 
-async def _cmd_sessions(app: ClouApp, args: str) -> None:
-    """List past sessions or show session details."""
+def _relative_time(timestamp: float) -> str:
+    """Format a timestamp as a human-readable relative time."""
+    delta = time.time() - timestamp
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        mins = int(delta / 60)
+        return f"{mins}m ago"
+    if delta < 86400:
+        hrs = int(delta / 3600)
+        return f"{hrs}h ago"
+    if delta < 172800:
+        return "yesterday"
     from datetime import datetime
+    return datetime.fromtimestamp(timestamp, tz=UTC).strftime("%b %d")
 
-    from clou.session import list_sessions, session_summary
 
+def _resume_items_factory(app: ClouApp) -> tuple[SubItem, ...]:
+    """Build dynamic sub-items from available sessions."""
+    from clou.session import list_sessions, session_preview
+
+    sessions = list_sessions(app._project_dir)
+    current_id = app._session.session_id if app._session else ""
+    items: list[SubItem] = []
+    for info in sessions[:10]:
+        if info.session_id == current_id:
+            continue
+        preview = session_preview(app._project_dir, info.session_id, max_chars=50)
+        label = _relative_time(info.started_at)
+        desc = f'"{preview}"  {info.model}' if preview else info.model
+        items.append(SubItem(label=label, description=desc, args=info.session_id))
+    return tuple(items)
+
+
+async def _cmd_resume(app: ClouApp, args: str) -> None:
+    """Resume a previous session or list available sessions."""
     if args.strip():
-        # Show details for a specific session.
         sid = args.strip()
-        summary = session_summary(app._project_dir, sid)
-        if summary.get("message_count", 0) == 0:
+        # Reject resuming current session.
+        current_id = app._session.session_id if app._session else ""
+        if sid == current_id:
+            _render_error(app, "already in this session")
+            return
+        # Validate session exists.
+        from clou.session import session_path
+        if not session_path(app._project_dir, sid).exists():
             _render_error(app, f"session not found: {sid}")
             return
-
-        result = Text()
-        result.append("  session  ", style=_DIM_HEX)
-        result.append(str(summary["session_id"]), style=f"bold {_GOLD_HEX}")
-        result.append("\n  model    ", style=_DIM_HEX)
-        result.append(str(summary.get("model", "unknown")))
-        started = summary.get("started_at")
-        if isinstance(started, (int, float)):
-            ts = datetime.fromtimestamp(started, tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
-            result.append("\n  started  ", style=_DIM_HEX)
-            result.append(ts)
-        duration = summary.get("duration_s")
-        if isinstance(duration, (int, float)) and duration > 0:
-            mins, secs = divmod(int(duration), 60)
-            hrs, mins = divmod(mins, 60)
-            dur_str = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
-            result.append("\n  duration ", style=_DIM_HEX)
-            result.append(dur_str)
-        result.append("\n  messages ", style=_DIM_HEX)
-        result.append(str(summary.get("message_count", 0)))
-        render_command_output(app, result)
+        app.resume_session(sid)
         return
 
-    # List recent sessions.
+    # No args — list available sessions.
+    from clou.session import list_sessions, session_preview
+
     sessions = list_sessions(app._project_dir)
-    if not sessions:
-        _render_error(app, "no sessions found")
+    current_id = app._session.session_id if app._session else ""
+    resumable = [s for s in sessions if s.session_id != current_id][:10]
+    if not resumable:
+        _render_error(app, "no previous sessions to resume")
         return
 
     result = Text()
-    for i, info in enumerate(sessions[:10]):
+    for i, info in enumerate(resumable):
         if i > 0:
             result.append("\n")
-        ts = datetime.fromtimestamp(info.started_at, tz=UTC).strftime("%m-%d %H:%M")
-        current = info.session_id == (app._session.session_id if app._session else "")
-        marker = " ●" if current else "  "
-        result.append(f"  {info.session_id}", style=f"bold {_GOLD_HEX}")
-        result.append(f"  {ts}  {info.model}", style=_DIM_HEX)
-        if current:
-            result.append(marker, style=f"bold {_GOLD_HEX}")
+        preview = session_preview(app._project_dir, info.session_id, max_chars=50)
+        rel = _relative_time(info.started_at)
+        result.append(f"  {rel:<12}", style=_DIM_HEX)
+        if preview:
+            result.append(f'"{preview}"', style=f"italic {_DIM_HEX}")
+            result.append(f"  {info.model}", style=_MUTED_HEX)
+        else:
+            result.append(info.model, style=_MUTED_HEX)
+        result.append(f"  {info.session_id}", style=_MUTED_HEX)
 
-    if len(sessions) > 10:
-        result.append(f"\n  ... and {len(sessions) - 10} more", style=_DIM_HEX)
-
+    result.append(f"\n\n  /resume <id>", style=f"bold {_GOLD_HEX}")
+    result.append(" to resume a session", style=_DIM_HEX)
     render_command_output(app, result)
 
 
 register(
     Command(
-        name="sessions",
-        description="list past sessions",
-        handler=_cmd_sessions,
+        name="resume",
+        description="resume a previous session",
+        handler=_cmd_resume,
+        items_factory=_resume_items_factory,
     )
 )

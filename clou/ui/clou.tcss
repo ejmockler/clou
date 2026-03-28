@@ -77,12 +77,10 @@ Screen {
 #wake-indicator {
     display: none;
     height: 1fr;
-    background: $surface-deep;
 }
 
 #wake-activity {
     height: 1fr;
-    background: $surface-deep;
     scrollbar-size-vertical: 0;
 }
 
@@ -91,8 +89,7 @@ Screen {
 }
 
 #wake-wave {
-    height: 1;
-    background: $surface-deep;
+    height: 7;
 }
 
 .wake-line {

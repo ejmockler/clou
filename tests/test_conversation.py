@@ -16,6 +16,7 @@ from clou.ui.messages import (
     ClouToolResult,
     ClouToolUse,
     ClouTurnComplete,
+    ClouTurnContentReady,
 )
 from clou.ui.widgets.conversation import ConversationWidget, _tool_summary
 import clou.ui.widgets.conversation as _conv_mod
@@ -79,6 +80,80 @@ class TestUserMessage:
             widget.add_user_message("hello")
             await pilot.pause()
             assert _msg_count(widget) >= 1
+
+    @pytest.mark.asyncio
+    async def test_queued_message_renders_queued_suffix(self) -> None:
+        """Message submitted with queued=True shows dimmed text + 'queued'."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget.add_user_message("hello", queued=True)
+            await pilot.pause()
+            user_msgs = widget.query(_conv_mod._UserMessage)
+            assert len(user_msgs) >= 1
+            rendered = user_msgs.last().render()
+            assert "queued" in rendered.plain
+
+    @pytest.mark.asyncio
+    async def test_mark_active_clears_queued(self) -> None:
+        """mark_active() transitions queued message to active rendering."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget.add_user_message("hello", queued=True)
+            await pilot.pause()
+            user_msg = widget.query(_conv_mod._UserMessage).last()
+            assert user_msg._queued is True
+            user_msg.mark_active()
+            assert user_msg._queued is False
+            rendered = user_msg.render()
+            assert "queued" not in rendered.plain
+
+    @pytest.mark.asyncio
+    async def test_processing_started_marks_active(self) -> None:
+        """ClouProcessingStarted should clear queued state on latest message."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget.add_user_message("hello", queued=True)
+            await pilot.pause()
+            user_msg = widget.query(_conv_mod._UserMessage).last()
+            assert user_msg._queued is True
+            widget.post_message(ClouProcessingStarted(text="hello"))
+            await pilot.pause()
+            assert user_msg._queued is False
+
+    @pytest.mark.asyncio
+    async def test_processing_started_fifo_order(self) -> None:
+        """ClouProcessingStarted marks the FIRST queued message, not the last."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget.add_user_message("msg A", queued=True)
+            widget.add_user_message("msg B", queued=True)
+            await pilot.pause()
+            msgs = list(widget.query(_conv_mod._UserMessage))
+            assert msgs[0]._queued is True
+            assert msgs[1]._queued is True
+            # First ClouProcessingStarted should mark A (first queued), not B.
+            widget.post_message(ClouProcessingStarted(text="msg A"))
+            await pilot.pause()
+            assert msgs[0]._queued is False  # A marked active
+            assert msgs[1]._queued is True   # B still queued
+            # Second ClouProcessingStarted marks B.
+            widget.post_message(ClouProcessingStarted(text="msg B"))
+            await pilot.pause()
+            assert msgs[1]._queued is False
+
+    @pytest.mark.asyncio
+    async def test_reset_turn_state_clears_queued_badges(self) -> None:
+        """reset_turn_state() should clear stale queued badges."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget.add_user_message("msg1", queued=True)
+            widget.add_user_message("msg2", queued=True)
+            await pilot.pause()
+            user_msgs = widget.query(_conv_mod._UserMessage)
+            assert all(m._queued for m in user_msgs)
+            widget.reset_turn_state()
+            await pilot.pause()
+            assert all(not m._queued for m in user_msgs)
 
 
 # ---------------------------------------------------------------------------
@@ -286,8 +361,8 @@ class TestToolSummary:
     def test_read_shows_filename(self) -> None:
         assert _tool_summary("Read", {"file_path": "/a/b/main.py"}) == "Read main.py"
 
-    def test_write_shows_filename(self) -> None:
-        assert _tool_summary("Write", {"file_path": "/tmp/out.txt"}) == "Write out.txt"
+    def test_write_shows_filename_with_new(self) -> None:
+        assert _tool_summary("Write", {"file_path": "/tmp/out.txt"}) == "Write out.txt  (new)"
 
     def test_bash_shows_command(self) -> None:
         result = _tool_summary("Bash", {"command": "npm test | head -20"})
@@ -308,6 +383,230 @@ class TestToolSummary:
     def test_agent_shows_description(self) -> None:
         result = _tool_summary("Agent", {"description": "explore the codebase"})
         assert result == "Agent explore the codebase"
+
+    def test_edit_shows_stats(self) -> None:
+        result = _tool_summary("Edit", {
+            "file_path": "/a/hooks.py",
+            "old_string": "old\n",
+            "new_string": "new\nline\n",
+        })
+        assert "hooks.py" in result
+        assert "+2" in result
+        assert "−1" in result
+
+    def test_multi_edit_shows_stats(self) -> None:
+        result = _tool_summary("MultiEdit", {
+            "file_path": "/a/main.py",
+            "edits": [
+                {"old_string": "a\n", "new_string": "b\nc\n"},
+            ],
+        })
+        assert "main.py" in result
+        assert "+2" in result
+        assert "−1" in result
+
+
+# ---------------------------------------------------------------------------
+# Edit disclosure
+# ---------------------------------------------------------------------------
+
+
+class TestEditDisclosure:
+    @pytest.mark.asyncio
+    async def test_edit_tool_creates_disclosure(self) -> None:
+        """Edit tool call mounts an _EditDisclosure widget."""
+        from clou.ui.widgets.conversation import _EditDisclosure
+
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(name="Edit", tool_input={
+                    "file_path": "/tmp/foo.py",
+                    "old_string": "old\n",
+                    "new_string": "new\n",
+                })
+            )
+            await pilot.pause()
+            disclosures = widget.query(_EditDisclosure)
+            assert len(disclosures) >= 1
+
+    @pytest.mark.asyncio
+    async def test_edit_disclosure_shows_colored_stats(self) -> None:
+        """Edit disclosure summary includes +N and −M."""
+        from clou.ui.widgets.conversation import _EditDisclosure
+
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(name="Edit", tool_input={
+                    "file_path": "/tmp/foo.py",
+                    "old_string": "a\nb\n",
+                    "new_string": "c\n",
+                })
+            )
+            await pilot.pause()
+            disclosure = widget.query_one(_EditDisclosure)
+            rendered = disclosure.render()
+            text = rendered.plain
+            assert "+1" in text
+            assert "−2" in text
+
+    @pytest.mark.asyncio
+    async def test_edit_disclosure_shows_diff_body(self) -> None:
+        """Edit disclosure shows inline diff when expanded."""
+        from clou.ui.widgets.conversation import _EditDisclosure
+
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(name="Edit", tool_input={
+                    "file_path": "/tmp/foo.py",
+                    "old_string": "removed\n",
+                    "new_string": "added\n",
+                })
+            )
+            await pilot.pause()
+            disclosure = widget.query_one(_EditDisclosure)
+            rendered = disclosure.render()
+            text = rendered.plain
+            assert "- removed" in text
+            assert "+ added" in text
+
+    @pytest.mark.asyncio
+    async def test_write_tool_creates_disclosure(self) -> None:
+        """Write tool call mounts an _EditDisclosure widget."""
+        from clou.ui.widgets.conversation import _EditDisclosure
+
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(name="Write", tool_input={
+                    "file_path": "/tmp/new_file.py",
+                    "content": "print('hello')\n",
+                })
+            )
+            await pilot.pause()
+            disclosures = widget.query(_EditDisclosure)
+            assert len(disclosures) >= 1
+
+    @pytest.mark.asyncio
+    async def test_disclosure_collapses_after_settle(self) -> None:
+        """Disclosure collapses when update_lifecycle passes settle threshold."""
+        import time as _time
+        from clou.ui.widgets.conversation import _EditDisclosure, _DISCLOSURE_SETTLE
+
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(name="Edit", tool_input={
+                    "file_path": "/tmp/foo.py",
+                    "old_string": "old\n",
+                    "new_string": "new\n",
+                })
+            )
+            await pilot.pause()
+            disclosure = widget.query_one(_EditDisclosure)
+            assert disclosure._expanded is True
+            # Simulate passage of time
+            changed = disclosure.update_lifecycle(
+                disclosure._birth + _DISCLOSURE_SETTLE + 0.1
+            )
+            assert changed is True
+            assert disclosure._expanded is False
+
+    @pytest.mark.asyncio
+    async def test_click_toggles_and_pins(self) -> None:
+        """Clicking a disclosure toggles expansion and pins it."""
+        from clou.ui.widgets.conversation import _EditDisclosure
+
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(name="Edit", tool_input={
+                    "file_path": "/tmp/foo.py",
+                    "old_string": "old\n",
+                    "new_string": "new\n",
+                })
+            )
+            await pilot.pause()
+            disclosure = widget.query_one(_EditDisclosure)
+            # Collapse it first
+            disclosure._expanded = True
+            disclosure.on_click()
+            assert disclosure._expanded is False
+            assert disclosure._pinned is True
+            # Click again to re-expand
+            disclosure.on_click()
+            assert disclosure._expanded is True
+
+    @pytest.mark.asyncio
+    async def test_pinned_disclosure_does_not_auto_collapse(self) -> None:
+        """Pinned disclosures ignore lifecycle collapse."""
+        from clou.ui.widgets.conversation import _EditDisclosure, _DISCLOSURE_SETTLE
+
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(name="Edit", tool_input={
+                    "file_path": "/tmp/foo.py",
+                    "old_string": "old\n",
+                    "new_string": "new\n",
+                })
+            )
+            await pilot.pause()
+            disclosure = widget.query_one(_EditDisclosure)
+            disclosure._pinned = True
+            changed = disclosure.update_lifecycle(
+                disclosure._birth + _DISCLOSURE_SETTLE + 1.0
+            )
+            assert changed is False
+            assert disclosure._expanded is True
+
+
+# ---------------------------------------------------------------------------
+# Tool activity compaction
+# ---------------------------------------------------------------------------
+
+
+class TestToolActivityLines:
+    """Each tool call renders as its own dim line — no compaction."""
+
+    @pytest.mark.asyncio
+    async def test_each_tool_gets_own_line(self) -> None:
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            initial = _msg_count(widget)
+            for name, inp in [
+                ("Read", {"file_path": "/a/one.py"}),
+                ("Grep", {"pattern": "foo"}),
+                ("Read", {"file_path": "/a/two.py"}),
+            ]:
+                widget.post_message(ClouToolUse(name=name, tool_input=inp))
+                await pilot.pause()
+            assert _msg_count(widget) == initial + 3
+
+    @pytest.mark.asyncio
+    async def test_working_alive_during_tool_calls(self) -> None:
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.add_user_message("do stuff")
+            await pilot.pause()
+            assert widget._working is True
+            for i in range(5):
+                widget.post_message(
+                    ClouToolUse(name="Read", tool_input={"file_path": f"/a/{i}.py"})
+                )
+                await pilot.pause()
+            assert widget._working is True
 
 
 # ---------------------------------------------------------------------------
@@ -479,20 +778,29 @@ class TestMessageBubbling:
 
 class TestProcessingStarted:
     @pytest.mark.asyncio
-    async def test_processing_started_shows_user_message(self) -> None:
-        """ClouProcessingStarted should display the user message in history."""
+    async def test_processing_started_ensures_working(self) -> None:
+        """ClouProcessingStarted should ensure the working indicator is alive."""
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
-            widget.post_message(ClouProcessingStarted(text="hello world"))
+            # Simulate: user message shown at submit, working started,
+            # then stopped by some event before model picks up the message.
+            widget.add_user_message("query")
             await pilot.pause()
-            assert _msg_count(widget) >= 1
-            assert "hello world" in _all_text(widget)
+            widget._stop_working()
+            assert widget._working is False
+            # ProcessingStarted restarts working.
+            widget.post_message(ClouProcessingStarted(text="query"))
+            await pilot.pause()
+            assert widget._working is True
 
     @pytest.mark.asyncio
-    async def test_processing_started_starts_working(self) -> None:
-        """ClouProcessingStarted should start the working indicator."""
+    async def test_processing_started_noop_when_already_working(self) -> None:
+        """ClouProcessingStarted should not disrupt existing working state."""
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
+            widget.add_user_message("query")
+            await pilot.pause()
+            assert widget._working is True
             widget.post_message(ClouProcessingStarted(text="query"))
             await pilot.pause()
             assert widget._working is True
@@ -514,6 +822,18 @@ class TestQueueIndicator:
             indicator = widget.query_one("#queue-indicator", Static)
             rendered = str(indicator.render())
             assert "2" in rendered
+
+    @pytest.mark.asyncio
+    async def test_queue_count_one_shows_indicator(self) -> None:
+        """Queue count 1 should show indicator."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget.update_queue_count(1)
+            await pilot.pause()
+            indicator = widget.query_one("#queue-indicator", Static)
+            rendered = str(indicator.render())
+            assert "1" in rendered
+            assert "queued" in rendered
 
     @pytest.mark.asyncio
     async def test_queue_count_zero_clears_indicator(self) -> None:
@@ -652,3 +972,218 @@ class TestStartupLifecycle:
             widget.post_message(ClouSupervisorText(text="Hi!", model="opus"))
             await pilot.pause()
             assert wake._timer is None
+
+
+# ---------------------------------------------------------------------------
+# Persistence boundary — ClouTurnContentReady captures both paths
+# ---------------------------------------------------------------------------
+
+
+class _ContentCapture:
+    """Captures ClouTurnContentReady messages posted by the widget."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def __call__(self, msg: ClouTurnContentReady) -> None:
+        self.messages.append(msg.content)
+
+
+class TestPersistenceBoundary:
+    """Ensure ClouTurnContentReady carries all assistant text, not just streams."""
+
+    @pytest.mark.asyncio
+    async def test_streamed_turn_persisted(self) -> None:
+        """Streamed content fires ClouTurnContentReady."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(ClouStreamChunk(text="streamed answer", uuid="u1"))
+            await pilot.pause()
+            widget.post_message(
+                ClouTurnComplete(input_tokens=0, output_tokens=0, cost_usd=0, duration_ms=0)
+            )
+            await pilot.pause()
+            # _turn_text should be empty (streamed path), stream buffer was consumed.
+            assert widget._stream_buffer == ""
+
+    @pytest.mark.asyncio
+    async def test_non_streamed_turn_persisted(self) -> None:
+        """ClouSupervisorText (non-streaming) accumulates in _turn_text."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(ClouSupervisorText(text="direct response", model="opus"))
+            await pilot.pause()
+            assert widget._turn_text == "direct response"
+            widget.post_message(
+                ClouTurnComplete(input_tokens=0, output_tokens=0, cost_usd=0, duration_ms=0)
+            )
+            await pilot.pause()
+            # After turn complete, _turn_text is cleared.
+            assert widget._turn_text == ""
+
+    @pytest.mark.asyncio
+    async def test_flushed_pending_text_persisted(self) -> None:
+        """Pending text flushed as response accumulates in _turn_text."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.add_user_message("question")
+            await pilot.pause()
+            widget.post_message(ClouSupervisorText(text="short", model="opus"))
+            await pilot.pause()
+            assert widget._pending_text == "short"
+            widget.post_message(
+                ClouTurnComplete(input_tokens=0, output_tokens=0, cost_usd=0, duration_ms=0)
+            )
+            await pilot.pause()
+            # Pending text was flushed and accumulated, then cleared on turn complete.
+            assert widget._pending_text is None
+            assert widget._turn_text == ""
+
+    @pytest.mark.asyncio
+    async def test_multiple_supervisor_texts_accumulated(self) -> None:
+        """Multiple ClouSupervisorText in one turn accumulate in _turn_text."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(ClouSupervisorText(text="A" * 201, model="opus"))
+            await pilot.pause()
+            widget.post_message(ClouSupervisorText(text="B" * 201, model="opus"))
+            await pilot.pause()
+            assert "A" * 201 in widget._turn_text
+            assert "B" * 201 in widget._turn_text
+
+    @pytest.mark.asyncio
+    async def test_turn_text_cleared_on_new_user_message(self) -> None:
+        """_turn_text resets when a new user message starts a fresh turn."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(ClouSupervisorText(text="A" * 201, model="opus"))
+            await pilot.pause()
+            assert widget._turn_text != ""
+            widget.add_user_message("next question")
+            await pilot.pause()
+            assert widget._turn_text == ""
+
+
+# ---------------------------------------------------------------------------
+# Agent disclosure
+# ---------------------------------------------------------------------------
+
+
+class TestAgentDisclosure:
+    """Agent tool calls render as collapsible _AgentDisclosure widgets."""
+
+    @pytest.mark.asyncio
+    async def test_agent_tool_creates_disclosure(self) -> None:
+        """Agent tool_use mounts an _AgentDisclosure in history."""
+        from clou.ui.widgets.conversation import _AgentDisclosure
+
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(
+                    name="Agent",
+                    tool_input={"description": "Find bugs"},
+                    tool_use_id="toolu_1",
+                )
+            )
+            await pilot.pause()
+            disclosures = list(widget.query(_AgentDisclosure))
+            assert len(disclosures) == 1
+            assert disclosures[0]._description == "Find bugs"
+            assert disclosures[0]._status == "running"
+
+    @pytest.mark.asyncio
+    async def test_disclosure_starts_collapsed(self) -> None:
+        from clou.ui.widgets.conversation import _AgentDisclosure
+
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(
+                    name="Agent",
+                    tool_input={"description": "Explore code"},
+                    tool_use_id="toolu_2",
+                )
+            )
+            await pilot.pause()
+            d = list(widget.query(_AgentDisclosure))[0]
+            assert not d._expanded
+
+    @pytest.mark.asyncio
+    async def test_tool_result_fills_disclosure(self) -> None:
+        """Matching tool_result completes the disclosure."""
+        from clou.ui.widgets.conversation import _AgentDisclosure
+
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(
+                    name="Agent",
+                    tool_input={"description": "Research"},
+                    tool_use_id="toolu_3",
+                )
+            )
+            await pilot.pause()
+            widget.post_message(
+                ClouToolResult(
+                    tool_use_id="toolu_3",
+                    content="Found the answer.",
+                    is_error=False,
+                )
+            )
+            await pilot.pause()
+            d = list(widget.query(_AgentDisclosure))[0]
+            assert d._status == "success"
+            assert d._result == "Found the answer."
+            assert "toolu_3" not in widget._pending_agents
+
+    @pytest.mark.asyncio
+    async def test_error_result_marks_disclosure(self) -> None:
+        from clou.ui.widgets.conversation import _AgentDisclosure
+
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(
+                    name="Agent",
+                    tool_input={"description": "Broken task"},
+                    tool_use_id="toolu_4",
+                )
+            )
+            await pilot.pause()
+            widget.post_message(
+                ClouToolResult(
+                    tool_use_id="toolu_4",
+                    content="Agent crashed",
+                    is_error=True,
+                )
+            )
+            await pilot.pause()
+            d = list(widget.query(_AgentDisclosure))[0]
+            assert d._status == "error"
+
+    @pytest.mark.asyncio
+    async def test_non_agent_error_still_renders(self) -> None:
+        """Non-agent tool errors still show the ✗ whisper."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            initial = _msg_count(widget)
+            widget.post_message(
+                ClouToolResult(
+                    tool_use_id="toolu_other",
+                    content="permission denied",
+                    is_error=True,
+                )
+            )
+            await pilot.pause()
+            assert _msg_count(widget) > initial

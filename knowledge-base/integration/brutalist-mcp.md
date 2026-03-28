@@ -4,6 +4,8 @@
 
 `@brutalist/mcp` is a multi-perspective code analysis engine that deploys Claude Code, Codex, and Gemini CLI agents to independently critique code, architecture, security, and ideas. The tagline: "All AIs are sycophants. This one demolishes your work before users do."
 
+**Brutalist is the quality gate for the software-construction harness template** (DB-11). The pattern — invoke gate, coordinator evaluates critically, accept/override/escalate — is domain-agnostic and fixed. Brutalist is the first instance of this pluggable pattern. Other templates may use different gates. See [DB-11](../decision-boundaries/11-harness-architecture.md) for the quality gate pluggability design.
+
 **Package:** `@brutalist/mcp` on npm
 **URL:** https://www.npmjs.com/package/@brutalist/mcp
 
@@ -129,43 +131,35 @@ Brutalist is expensive — it spawns multiple CLI agents (Claude, Codex, Gemini)
 
 ## Configuration
 
-Brutalist is added as an MCP server available to the coordinator and agent teams:
+Brutalist is configured as an MCP server in the software-construction harness template and made available to coordinator sessions and agent teams:
 
 ```bash
 # User-scope installation (available to all sessions)
 claude mcp add brutalist --scope user -- npx -y @brutalist/mcp@latest
 ```
 
-In SDK options:
+In the orchestrator, MCP servers are derived from the active harness template (DB-11):
 ```python
-options = ClaudeAgentOptions(
-    mcp_servers={
-        "brutalist": {
-            "command": "npx",
-            "args": ["-y", "@brutalist/mcp@latest"],
-            "type": "stdio"
-        }
-    },
-    allowed_tools=[
-        "mcp__brutalist__roast_codebase",
-        "mcp__brutalist__roast_architecture",
-        "mcp__brutalist__roast_security",
-        "mcp__brutalist__roast_product",
-        # ... as needed
-    ]
-)
+# Coordinator sessions get all template MCP servers.
+mcp_servers=template_mcp_servers(template)
+
+# Supervisor sessions get only quality gate servers + clou.
+gate_servers = {g.mcp_server for g in template.quality_gates}
+all_mcp = template_mcp_servers(template)
+supervisor_mcp = {name: spec for name, spec in all_mcp.items() if name in gate_servers}
+supervisor_mcp["clou"] = clou_server
 ```
 
 ## Brutalist Availability
 
-Brutalist is essential infrastructure, not advisory tooling. If Brutalist MCP becomes unavailable during an ASSESS cycle, this is a **blocking error**:
+Brutalist is a required quality gate in the software-construction template (`required=True` in DB-11). If Brutalist MCP becomes unavailable during an ASSESS cycle, this is a **blocking error**:
 
 1. The coordinator writes a `blocked` escalation with the specific error (connection refused, npm failure, etc.)
 2. The coordinator exits the cycle — it does not proceed without quality assessment
 3. The supervisor reads the escalation and informs the user
 4. Resolution: user fixes Brutalist installation/network, then coordinator resumes
 
-Brutalist unavailability is treated identically to any other blocking infrastructure failure. The coordinator does not skip assessment, degrade to self-review, or proceed without external verification. See [DB-05](../decision-boundaries/05-error-recovery.md).
+This behavior is driven by the template's `quality_gates[].required` flag. A template with `required=False` would fall back to coordinator self-assessment (weakest configuration). Brutalist's `required=True` status reflects Design Principle 10 (fail loud) and DB-05 (essential infrastructure). See [DB-11](../decision-boundaries/11-harness-architecture.md) for the full quality gate pluggability design.
 
 ## What Brutalist Does NOT Replace
 

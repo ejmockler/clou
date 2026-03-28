@@ -10,6 +10,12 @@ Clou emerged from a whiteboard with two halves:
 
 The critical insight: **the planning layer is the bottleneck, not code generation.** The project management ontology (roadmaps, milestones, phases) should be a first-class, persistent, human-readable structure the agent maintains — not an ephemeral chain-of-thought that vanishes after execution.
 
+## What Clou Is
+
+Clou is an orchestrator for structured work. It manages a three-tier agent hierarchy, persistent planning state, quality gates, and verification — turning LLM sessions into a system that can execute multi-milestone projects with human oversight at natural boundaries.
+
+Software construction is the first domain. The architecture (session hierarchy, judgment loops, golden context, typed task DAGs) is domain-agnostic. What varies per domain is the tool configuration, quality gates, verification modalities, and write permissions — collectively, the **harness template** (DB-11). The orchestrator reads the active template and configures itself accordingly.
+
 ## System Structure
 
 ```
@@ -51,7 +57,7 @@ The user's direct interface. An agent session that is always available for conve
 
 An agent session scoped to a single milestone's lifecycle. Spawned by the supervisor when a milestone begins.
 
-**Owns:** Task planning (building the DAG), agent team orchestration, quality assessment (Brutalist), critical evaluation of feedback, escalation authoring, verification orchestration.
+**Owns:** Task planning (building the DAG), agent team orchestration, quality assessment (via template's quality gate), critical evaluation of feedback, escalation authoring, verification orchestration.
 
 **Overall: a judgment loop, not a dispatch loop.** The coordinator doesn't just assign work and collect results. It evaluates the evaluator (Brutalist), makes calls within its delegated authority, logs reasoning, and escalates what it can't resolve. The judgment is decomposed across cycle types: PLAN (decomposition), ASSESS (evaluation), VERIFY (experience assessment). EXECUTE is the one cycle where judgment is deliberately absent — it is a mechanical dispatch loop following compose.py's call graph (DB-10).
 
@@ -63,15 +69,15 @@ An agent session scoped to a single milestone's lifecycle. Spawned by the superv
 
 One agent per compose.py function, spawned by the coordinator via the SDK's Agent tool during EXECUTE cycles. Each agent gets a fresh context scoped to a single function signature.
 
-**Owns:** Code. Tests. Execution artifacts.
+**Owns:** Execution artifacts. For software construction: code, tests, and codebase changes. Agent definitions (tools, capabilities) come from the active harness template.
 
-**Communicates:** Stigmergic coordination through the filesystem only. Workers write code to the codebase and results to execution.md. No mailbox, no SendMessage, no TaskCreate, no inter-worker communication. The codebase IS the inter-agent communication channel — typed dependencies in compose.py mean each agent finds prior agents' artifacts via function argument types.
+**Communicates:** Stigmergic coordination through the filesystem only. Workers write results to execution.md and (for software) code to the codebase. No mailbox, no SendMessage, no TaskCreate, no inter-worker communication. Typed dependencies in compose.py mean each agent finds prior agents' artifacts via function argument types.
 
-**Produces:** `execution.md` within assigned phases, codebase changes.
+**Produces:** `execution.md` within assigned phases, plus domain-specific artifacts (codebase changes for software).
 
 **Lifecycle:** Per-EXECUTE-cycle. Fresh agents each cycle. Teams end when the coordinator session exits at cycle boundary.
 
-**Key characteristic:** Agent teams are the only tier that touches the codebase directly.
+**Key characteristic:** Agent teams are the only tier that produces domain-specific artifacts directly.
 
 ## Key Architectural Decisions
 
@@ -92,9 +98,11 @@ Each milestone depends on the previous. The roadmap is a linked list. The archit
 
 **Starting constraint:** Serial execution. Earn parallel.
 
-### 3. Brutalist is essential infrastructure
+### 3. Quality gates are essential infrastructure
 
-Brutalist MCP is not advisory — it's a blocking requirement. If Brutalist is unavailable, the coordinator cannot proceed past ASSESS. This is a hard error that escalates to the supervisor and user. The coordinator critically evaluates Brutalist feedback (not deferential, not reflexive), but the evaluation requires Brutalist to be present.
+External quality assessment is a blocking requirement. The coordinator cannot self-assess quality — research shows self-reflection produces false beliefs that persist indefinitely (§9, §10). A required quality gate that is unavailable is a hard error that escalates to the supervisor and user.
+
+Brutalist MCP is the quality gate for the software-construction template. The coordinator critically evaluates Brutalist feedback (not deferential, not reflexive), but the evaluation requires Brutalist to be present. Other templates may use different gates — the pattern (invoke gate → evaluate critically → accept/override/escalate) is fixed; the specific gate is a template parameter. See [DB-11](./decision-boundaries/11-harness-architecture.md).
 
 ### 4. The coordinator builds the task DAG
 
@@ -114,14 +122,14 @@ Each tier's system prompt is a small XML template (~800–2,000 tokens) containi
 
 This is grounded in research (see [Research Foundations](./research-foundations.md)): system prompts have no architectural privilege, instruction density degrades past a threshold, decomposition outperforms monolithic prompts, and first tokens are architecturally privileged (attention sinks). No CLAUDE.md — all prompt content via SDK `system_prompt`.
 
-### 7. Brutalist is quality gate; coordinator is judge
+### 7. Quality gate provides feedback; coordinator is judge
 
-Brutalist MCP provides raw, unsweetened feedback from multiple model perspectives. The coordinator evaluates this feedback against the milestone's requirements and constraints:
+The quality gate (Brutalist MCP for software construction) provides raw, unsweetened feedback from multiple model perspectives. The coordinator evaluates this feedback against the milestone's requirements and constraints:
 - Valid feedback → rework cycle
 - Invalid feedback → override logged in `decisions.md` with reasoning
 - Feedback exceeding coordinator authority → escalation to supervisor
 
-The coordinator's relationship with Brutalist is critical, not deferential.
+The coordinator's relationship with the quality gate is critical, not deferential. The gate provides signal; the coordinator decides what to do with it.
 
 ### 8. Verification is a full phase
 
@@ -146,13 +154,25 @@ All tiers use Opus — maximum quality at every tier. Cost control comes from th
 
 Mock at the boundary of your control, never within it. Your own services run real. Third-party services use their sandbox/test mode. The only acceptable mock is for external services that provide no testing infrastructure at all.
 
+## Harness Template Layer
+
+Between the orchestrator and the agent definitions sits the **harness template** — a capability profile that specifies what tools each tier has, what quality gates run, what verification modalities are available, and what write permissions apply.
+
+The orchestrator reads the active template (recorded in `project.md`) and configures agent definitions, MCP servers, and hook enforcement accordingly. The supervisor selects the template during project initialization based on user intent. The user never interacts with the harness directly.
+
+Software construction is the first (and currently only) template. The architecture supports additional templates for other domains — the three-tier hierarchy, judgment loop, golden context, and session-per-cycle are domain-agnostic infrastructure. See [DB-11](./decision-boundaries/11-harness-architecture.md) for the full template schema and decisions.
+
 ## System Topology
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  clou_orchestrator.py (Python)                               │
 │    │                                                          │
-│    ├─ Hooks: write boundary enforcement per tier              │
+│    ├─ Harness template: loaded from clou/harnesses/<name>.py │
+│    │    configures: agent tools, quality gates, MCP servers,  │
+│    │    write permissions, compose conventions                │
+│    │                                                          │
+│    ├─ Hooks: write boundary enforcement per tier (from template)│
 │    ├─ MCP: clou_spawn_coordinator, clou_status, clou_init  │
 │    ├─ Token tracking: per session, cumulative                 │
 │    ├─ Session-per-cycle: golden context as sole compaction     │
@@ -163,6 +183,7 @@ Mock at the boundary of your control, never within it. Your own services run rea
 │    │  Supervisor (agent session)                          │     │
 │    │    │ reads: .clou/project.md, roadmap.md, requests  │     │
 │    │    │ writes: project.md, roadmap.md, milestone specs │     │
+│    │    │ selects: harness template                       │     │
 │    │    │ calls: clou_spawn_coordinator(milestone)       │     │
 │    │    └────────────────────────────────────────────────┘     │
 │    │                                                          │
@@ -170,17 +191,17 @@ Mock at the boundary of your control, never within it. Your own services run rea
 │    │  Coordinator (agent session)                        │     │
 │    │    │ reads: milestone.md, requirements.md, project   │     │
 │    │    │ writes: compose.py, status.md, decisions.md       │     │
-│    │    │ invokes: Brutalist MCP                          │     │
+│    │    │ invokes: quality gate (from template)           │     │
 │    │    │                                                 │     │
 │    │    ↓ manages (native Agent Teams)                    │     │
-│    │  Agent Teams (worker agents)                         │     │
+│    │  Agent Teams (per-template agent definitions)        │     │
 │    │    │ reads: compose.py, phase.md, codebase            │     │
 │    │    │ writes: execution.md, code changes              │     │
 │    │    │                                                 │     │
 │    │    ↓ verification phase                              │     │
-│    │  Verification Agent (teammate)                       │     │
+│    │  Verification Agent (per-template tools)             │     │
 │    │    │ materializes: dev environment                    │     │
-│    │    │ walks: golden paths (Playwright/HTTP/CLI)        │     │
+│    │    │ walks: golden paths (per verification modalities)│     │
 │    │    │ writes: handoff.md                               │     │
 │    │    └────────────────────────────────────────────────┘     │
 │    │                                                          │
@@ -195,11 +216,12 @@ Mock at the boundary of your control, never within it. Your own services run rea
 | Session hierarchy | 2-tier (lead → teammates) | 3-tier (supervisor → coordinator → teams) |
 | Session lifecycle | Manual | Orchestrator manages spawn, monitor, restart |
 | Persistent planning state | None (context window only) | `.clou/` golden context |
-| Quality gates | None | Brutalist MCP with critical evaluation |
+| Quality gates | None | Pluggable quality gates with critical evaluation (DB-11) |
+| Domain-adaptive tool configuration | Hardcoded | Harness templates configure tools, gates, verification per domain (DB-11) |
 | Human-in-the-loop | Ad hoc conversation | Structured escalation protocol |
 | Verification | Manual | Agentic path walking + prepared handoff |
 | Third-party services | Manual setup | Credential management protocol |
 | Crash recovery | Session resume (experimental) | Session-per-cycle + golden context checkpoints |
-| Write boundary enforcement | None | Orchestrator hooks per tier |
+| Write boundary enforcement | None | Orchestrator hooks per tier (from template) |
 | Token tracking | Per-session only | Orchestrator tracks cumulative tokens per milestone |
 | Audit trail | Git history only | `decisions.md`, escalation dispositions |

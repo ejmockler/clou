@@ -2,7 +2,7 @@
 
 How transformers digest context at scale, what works for multi-agent prompt architectures, and what current approaches are missing. This document grounds Clou's design decisions in research rather than intuition.
 
-Last updated: 2026-03-19
+Last updated: 2026-03-25
 
 ## 1. Context Is Adversarial at Scale
 
@@ -63,9 +63,19 @@ LLMs assign disproportionate attention to the first token regardless of semantic
 
 Mixture of Sparse Attention (CoLM 2025) automatically assigns different sliding-window lengths to different heads/layers. Some heads expand focus for longer inputs while others maintain fixed local windows. Increased effective context length by 3.9x at the same average window size.
 
+### Attention as Associative Memory
+
+The attention mechanism is not analogous to pattern retrieval — it IS pattern retrieval. Ramsauer et al. (2020) proved that transformer attention is mathematically equivalent to the update rule of a modern Hopfield network with continuous states. Hopfield networks store patterns and retrieve the nearest match given a partial cue. Each forward pass through attention retrieves stored patterns (from weights and from the context window) that best match the current query.
+
+**Induction heads** are the specific circuit. Crosbie & Shutova (NAACL 2025 Findings) showed ablating 1-3% of induction heads degrades performance by up to 32% on abstract pattern tasks — reducing accuracy to near-random. These heads perform "fuzzy prefix matching": prototype-like similarity matching over distributed representations.
+
+**In-context learning is implicit Bayesian inference.** Xie et al. (ICLR 2022) showed that when pretraining data has long-range coherence, the transformer infers a latent "situation type" from in-context examples — computing a Bayesian posterior in its forward pass. Confirmed by Zhang et al. (ICLR 2024). Extended by Reuter et al. (ICML 2025), who demonstrated transformers performing full posterior inference comparable to MCMC. Li Ji-An et al. (NeurIPS 2024) showed induction heads share behavioral, functional, and mechanistic parallels with human episodic memory (the Contextual Maintenance and Retrieval model).
+
 ### Clou Implication
 
 The attention sink means the opening of any Clou prompt — the very first tokens — gets disproportionate architectural weight. The single most important behavioral constraint should come first, not be buried after role preamble. The middle of a long prompt is a dead zone.
+
+The Hopfield equivalence is mechanistically illuminating but operationally equivalent to §1's conclusion: curated read sets per cycle shape what the model retrieves. The Hopfield framing explains *why* targeted context works (it selects the retrieval pattern library); the context degradation research (§1) explains why untargeted context fails (dilution and distraction). Both converge on the same design constraint: include only what's relevant.
 
 **Sources:**
 - Xiao et al., StreamingLLM / Attention Sinks, ICLR 2024: [arXiv:2309.17453](https://arxiv.org/abs/2309.17453)
@@ -73,6 +83,12 @@ The attention sink means the opening of any Clou prompt — the very first token
 - DuoAttention, ICLR 2025: [arXiv:2410.10819](https://arxiv.org/abs/2410.10819)
 - Infini-attention, Google 2024: [arXiv:2404.07143](https://arxiv.org/abs/2404.07143)
 - MoA, CoLM 2025: [arXiv:2406.14909](https://arxiv.org/abs/2406.14909)
+- Ramsauer et al., "Hopfield Networks is All You Need," 2020: [arXiv:2008.02217](https://arxiv.org/abs/2008.02217)
+- Crosbie & Shutova, "Induction Heads as Essential Mechanism for Pattern Matching," NAACL 2025: [arXiv:2407.07011](https://arxiv.org/abs/2407.07011)
+- Xie et al., "In-context Learning as Implicit Bayesian Inference," ICLR 2022: [arXiv:2111.02080](https://arxiv.org/abs/2111.02080)
+- Zhang et al., "In-Context Learning through the Bayesian Prism," ICLR 2024: [arXiv:2306.04891](https://arxiv.org/abs/2306.04891)
+- Reuter et al., "Can Transformers Learn Full Bayesian Inference in Context?" ICML 2025: [arXiv:2501.16825](https://arxiv.org/abs/2501.16825)
+- Li Ji-An et al., "Linking In-context Learning to Human Episodic Memory," NeurIPS 2024: [arXiv:2405.14992](https://arxiv.org/abs/2405.14992)
 
 ---
 
@@ -493,6 +509,32 @@ Fine-tuning produces minimal improvement. Self-critique iterations actually *wor
 
 The only configuration shown to produce reliable plans: LLM generates candidates, **external verifiers** check them. The verification must be external to the LLM. Generate-test-critique with external critics.
 
+### Reasoning Models: Improvement Without Understanding
+
+Kambhampati's follow-up (September 2024) evaluated OpenAI o1 on PlanBench:
+- Standard Blocksworld: **97.8%** accuracy (vs. 62.6% for prior best LLM).
+- **Obfuscated** Blocksworld (renamed actions/objects): 52.8%. Classical planners are unaffected.
+- Larger problems (20-40 step solutions): **23.63%**.
+- Unsolvable instances: only 27% correctly identified; 54% generated false plans.
+
+Reasoning models improve on known distributions but still lack formal planning capabilities.
+
+### Intermediate Tokens Are Not Reasoning
+
+Kambhampati (2025) compiled evidence that chain-of-thought traces are statistical scaffolding, not interpretable reasoning:
+
+- Models trained on **intentionally incorrect** intermediate traces paired with correct solutions **outperform** models trained on correct traces (Bhambri et al.).
+- Arbitrarily removing steps from A* search traces (destroying semantic validity) still improved accuracy (Dualformer).
+- DeepSeek R1-Zero (mixing incoherent English/Chinese tokens) outperformed R1 with human-annotated traces.
+
+**Intermediate tokens function as prompt augmentations optimized for answer correctness, not as steps in a reasoning process.** This reinforces LLM-Modulo: verify outputs through external means. Do not trust chain-of-thought explanations as evidence of plan validity or quality.
+
+### Failure-Driven Re-Decomposition
+
+ADaPT (NAACL 2024 Findings): when an LLM fails to execute a sub-task, decompose it further into finer-grained steps. Success rates 28.3% higher in ALFWorld, 27% in WebShop, 33% in TextCraft over baselines. Dynamically adjusts decomposition granularity to both task complexity and executor capability.
+
+ADaPT implements the downward half of aspiration adaptation (Simon): lower granularity on failure. The upward half (coarser plans after repeated success) remains unimplemented in any framework.
+
 ### Compositionality Breaks at Two Hops
 
 - **Reversal Curse** (ICLR 2024): Trained on "A is B" → cannot answer "B is A." Fundamental, nothing mitigates it.
@@ -503,13 +545,18 @@ The only configuration shown to produce reliable plans: LLM generates candidates
 ### Clou Implication
 
 - `compose.py` validated by AST parsing (external verifier) — directly implements LLM-Modulo.
-- Brutalist MCP as external quality gate — the coordinator does not self-assess quality.
-- Coordinator ASSESS cycle with explicit criteria — not self-generated judgment but criteria-driven evaluation.
-- Agent team outputs (execution.md) are inspected by the coordinator, not self-validated by workers.
-- Risk: cascading failures across phases if execution.md contains errors the ASSESS cycle doesn't catch. Brutalist helps here.
+- Quality gates as external verification — the coordinator does not self-assess quality. The "intermediate tokens aren't reasoning" finding makes this non-negotiable: coordinator reasoning in `decisions.md` is pattern completion, not verifiable reasoning. The quality gate is the only reliable signal.
+- Coordinator ASSESS cycle with explicit criteria — criteria-driven evaluation against requirements.md, not self-generated judgment.
+- Agent team outputs (execution.md) inspected by the coordinator, not self-validated by workers.
+- ADaPT's failure-driven re-decomposition could improve the ASSESS→rework transition: when rework is triggered, the coordinator could decompose the failed task more finely rather than retrying at the same granularity. This is a template-level optimization, not an architectural change — the compose conventions determine whether re-decomposition is available.
+- Risk: cascading failures across phases if execution.md contains errors the ASSESS cycle doesn't catch. Quality gates help here.
 
 **Sources:**
 - Kambhampati et al., "LLMs Can't Plan, But Can Help Planning," ICML 2024: [arXiv:2402.01817](https://arxiv.org/abs/2402.01817)
+- Kambhampati, "LLMs Still Can't Plan; Can LRMs?" 2024: [arXiv:2409.13373](https://arxiv.org/abs/2409.13373)
+- Kambhampati, "Stop Anthropomorphizing Intermediate Tokens," 2025: [arXiv:2504.09762](https://arxiv.org/abs/2504.09762)
+- Kambhampati, "(How) Do Reasoning Models Reason?" Annals NYAS 2025: [doi:10.1111/nyas.15339](https://nyaspubs.onlinelibrary.wiley.com/doi/10.1111/nyas.15339)
+- Prasad et al., "ADaPT: As-Needed Decomposition and Planning," NAACL 2024: [aclanthology.org/2024.findings-naacl.264](https://aclanthology.org/2024.findings-naacl.264/)
 - Berglund et al., "The Reversal Curse," ICLR 2024: [arXiv:2309.12288](https://arxiv.org/abs/2309.12288)
 - Bao et al., "Understanding and Patching Compositional Reasoning," ACL 2024: [arXiv:2402.14328](https://arxiv.org/abs/2402.14328)
 
@@ -536,6 +583,8 @@ The only configuration shown to produce reliable plans: LLM generates candidates
 **Inception prompting** (CAMEL, ChatDev): Carefully crafted initialization prompt that assigns roles, prevents role-flipping, and encourages consistency. Prompt engineering occurs only at initialization — agents prompt each other autonomously after.
 
 **Observation masking > LLM summarization** for context management (JetBrains 2025): 2.6% higher solve rate at 52% lower cost.
+
+**Cognitive load theory validates selective parallelism.** The CoThinker architecture (NeurIPS 2025 submission) mapped Sweller's three cognitive load types (intrinsic, extraneous, germane) to multi-agent LLM systems. Multi-agent coordination showed strongest improvements on high-complexity tasks but **underperformed on low-complexity tasks** — coordination overhead creates extraneous load that exceeds the benefit of distributing intrinsic load. Attention entropy increased from 4.44 to 5.04 across complexity levels, confirming distributed attention under higher demand. The implication: split across agents only when intrinsic task complexity exceeds individual capacity.
 
 ### What Fails
 
@@ -565,10 +614,27 @@ However: the 41–86.7% production failure rate demands Clou build explicit coun
 - ChatDev, ACL 2024: [aclanthology.org/2024.acl-long.810](https://aclanthology.org/2024.acl-long.810/)
 - CAMEL, NeurIPS 2023: [arXiv:2303.17760](https://arxiv.org/abs/2303.17760)
 - AutoGen, COLM 2024: [arXiv:2308.08155](https://arxiv.org/abs/2308.08155)
+- CoThinker, "Coordination of LLMs under Cognitive Load Theory," NeurIPS 2025: [arXiv:2506.06843](https://arxiv.org/abs/2506.06843)
 
 ---
 
-## 11. What Cognitive Science Says AI Ignores
+## 11. Cognitive Science and Transformer Behavior
+
+### Where Transformers Align with Cognitive Models
+
+Recent research reveals structural parallels — not analogies, but shared mathematical substrates:
+
+**Recognition-Primed Decision Making (Klein).** RPD describes expert decision-making: perceive a situation, match to a prototype from experience, mentally simulate one course of action forward. Transformers implement the pattern-matching half via attention-as-Hopfield-retrieval (§2). The prototype library is the training distribution plus the current context window. What transformers lack is the feedback loop that refines prototypes through domain experience with outcome feedback. The training distribution is frozen; experts accumulate.
+
+**Situated cognition (Suchman).** Plans are resources consulted during action, not blueprints executed mechanically. Understanding emerges from interaction with the material, not from analysis before touching it. Multi-agent failure research (§10) validates this empirically — systems that treat plans as rigid commitments fail at specification/coordination. The architectural response is plans that adapt through execution-assessment loops.
+
+**Satisficing (Simon).** The cost of searching for optimal solutions exceeds the marginal benefit. Generate one candidate, verify against aspiration criteria, proceed. SITAlign (2025) operationalized satisficing for LLM alignment: maximizing a primary objective subject to threshold constraints on secondary criteria achieved a 22.3% margin improvement. The pattern: don't search the solution space, verify the first plausible candidate.
+
+**Dual-process mapping.** Base LLMs operate as System 1 — fast, associative, pattern-completing (Nature Reviews Psychology 2025, Bellini-Leite 2024). Chain-of-thought imposes System-2-like deliberation, but the mechanism is still pattern completion (§9: intermediate tokens are not reasoning). LLM "cognitive biases" reflect training data patterns, not genuine heuristic processing. LLMs also exhibit non-human biases (hallucinations) with no cognitive analogue.
+
+**Episodic memory.** Li Ji-An et al. (NeurIPS 2024) showed induction heads share behavioral, functional, and mechanistic parallels with human episodic memory (the CMR model — see §2). Structured records of what happened, what was decided, what was produced serve the same role as episodic memory that transformers architecturally lack within a session.
+
+### What Remains Missing
 
 ### Working Memory Limits Are a Feature
 
@@ -600,14 +666,22 @@ The memory survey's central claim: "memory deserves the same engineering investm
 
 ### Clou Implication
 
-Clou's golden context implements several cognitive principles:
+The architecture embodies the cognitive principles that align with transformer mechanics and addresses several of the gaps:
 
+**Alignments already in the architecture:**
+
+- **RPD alignment**: Per-cycle read sets provide the prototype library. The training distribution covers pattern matching. Quality gates compensate for unreliable "mental simulation" (chain-of-thought — see §9). The quality of decomposition depends on the training data density axis (DB-11): high-density domains (software) get better prototypes than sparse ones.
+- **Situated cognition alignment**: Session-per-cycle treats plans as resources. The EXECUTE→ASSESS→rework loop is situated action — plans adapt to what execution reveals. The coordinator consults compose.py, doesn't mechanically execute it.
+- **Satisficing alignment**: One decomposition, structural validation via AST, proceed. No plan comparison, no alternative enumeration.
 - **Chunking**: Each golden context file is a semantic chunk (compose.py = plan, execution.md = results, decisions.md = reasoning). Files, not token ranges, are the unit of context management.
-- **Forgetting via session-per-cycle**: Each cycle starts fresh. Only what's written to golden context persists — implicit forgetting of within-cycle reasoning that wasn't deemed worth recording.
-- **Event segmentation via phases**: Each phase is an explicit boundary. Git commits at phase completion. Clean separation between episodes.
-- **Hierarchical memory**: The golden context has multiple levels — project.md (long-term), milestone.md (medium-term), execution.md (short-term), active/coordinator.md (working state).
+- **Forgetting via session-per-cycle**: Each cycle starts fresh. Only what's externalized to golden context persists — implicit forgetting of within-cycle reasoning.
+- **Event segmentation via phases**: Each phase is an explicit boundary. Git commits at phase completion.
+- **Hierarchical memory**: project.md (long-term), milestone.md (medium-term), execution.md (short-term), active/coordinator.md (working state).
+- **Episodic memory**: Golden context files are structured episodic records that serve the function induction heads cannot maintain across sessions.
 
-What Clou lacks: metacognition (no self-monitoring of confusion or overload) and attention gating (the coordinator reads all pointed files equally, with no priority mechanism within the read set).
+**Convergence with the user — the supervisor as sensemaking mechanism.** The supervisor-user dialogue is where domain context enters the system. The supervisor matches user intent to a harness template (RPD prototype matching at the project level), proposes one milestone spec (satisficing), and refines through conversation. The architecture does not need a separate "exploration phase" at the domain-agnostic level — the supervisor IS the exploration mechanism. Domain-specific exploration (e.g., codebase reading before planning in software) is a template-level concern: a template can define an exploration agent type with appropriate tools and read permissions.
+
+**What Clou lacks**: metacognition (no self-monitoring of confusion or overload) and attention gating (the coordinator reads all pointed files equally, with no priority mechanism within the read set).
 
 **Sources:**
 - "Cognitive Workspace," 2025: [arXiv:2508.13171](https://arxiv.org/abs/2508.13171)
@@ -615,6 +689,12 @@ What Clou lacks: metacognition (no self-monitoring of confusion or overload) and
 - "Memory for Autonomous LLM Agents," 2026: [arXiv:2603.07670](https://arxiv.org/abs/2603.07670)
 - MemGPT / Letta, 2023: [arXiv:2310.08560](https://arxiv.org/abs/2310.08560)
 - A-Mem, 2025: [arXiv:2502.12110](https://arxiv.org/abs/2502.12110)
+- Klein, "Recognition-Primed Decision Model," 1993
+- Suchman, "Plans and Situated Actions," 1987
+- Simon, "Models of Bounded Rationality," 1982
+- "Bounded Rationality for LLMs: SITAlign," 2025: [arXiv:2505.23729](https://arxiv.org/abs/2505.23729)
+- "Dual-process theory and decision-making in LLMs," Nature Reviews Psychology 2025: [doi:10.1038/s44159-025-00506-1](https://www.nature.com/articles/s44159-025-00506-1)
+- Bellini-Leite, "Dual Process Theory for LLMs," Adaptive Behavior 2024: [doi:10.1177/10597123231206604](https://journals.sagepub.com/doi/10.1177/10597123231206604)
 
 ---
 
@@ -640,6 +720,101 @@ Clou should not rely on the model's ability to synthesize across large contexts.
 
 ---
 
+## 13. Harness Engineering: The Hard Part Is Not the Model
+
+The 2026 consensus in agent infrastructure: **the harness — tools, environments, and orchestration — is the hard part**, not the model. Models are commodity; what differentiates agent systems is how they're configured, what tools they have, and how quality is enforced.
+
+### The Harness Thesis
+
+Philipp Schmid (Hugging Face, 2026): "Start simple. Provide robust atomic tools. Let the model make the plan." The argument: elaborate planning frameworks add complexity without proportional improvement. What matters is tool reliability and clear invocation contracts. A well-harnessed weak model outperforms a poorly-harnessed strong one.
+
+LangChain's agent anatomy (2026) decomposes agents into model, tools, instructions, and orchestration — with tools and orchestration as the engineering-dominant components. The model is a commodity input; the harness is the differentiator.
+
+### Tool Creation as First-Class Capability
+
+**ToolMaker** (ACL 2025, arXiv:2502.11705): Agents that create their own tools from GitHub repositories. Three-phase pipeline: dispatch (select tool-creation strategy), build (implement and test), and verify (end-to-end validation). 80% success rate on novel tool creation. Key insight: tool creation is decomposable into subtasks that existing LLMs handle well individually.
+
+**Tool-R0** (arXiv:2504.15979): Self-evolving tool-use reasoning. Agents improve their tool usage through reinforcement learning without human annotation. Demonstrates that tool-use proficiency is trainable, not just prompt-engineered.
+
+### Dynamic Tool Selection: The Accuracy Cliff
+
+Agent accuracy collapses past ~30 tools when tool descriptions overlap semantically. This is documented across multiple systems:
+
+- **Gorilla** (Berkeley, 2023): API call generation degrades with similar-description tools
+- **AgentBench** (ICLR 2024): Tool selection accuracy inversely correlated with tool count
+- **Empirical observation in MCP ecosystems**: Connecting all available MCP servers to an agent degrades performance vs. curated subsets
+
+The implication: tool curation is essential. Providing "everything available" is worse than providing "what's relevant." This directly motivates template-level tool selection (DB-11).
+
+### TEA Protocol: Tools, Environments, and Agents as Resources
+
+**AgentOrchestra** (arXiv:2506.12508) introduces the TEA Protocol — treating tools, environments, and agents as first-class resources with explicit lifecycles, versioned interfaces, and a registry for discovery. Scored 89.04% on GAIA Level 3 (previous SOTA: ~67%). Key architectural elements:
+
+- **Tool lifecycle management**: Tools are created, versioned, tested, and retired — not just listed
+- **Environment synthesis**: Agents create execution environments on demand (sandboxed Docker containers, virtual filesystems)
+- **Registry-based discovery**: Agents find tools by capability description, not by knowing tool names in advance
+
+Clou's template system (DB-11) is a static version of TEA's resource model — appropriate for the current architecture where configuration is per-project, not per-turn. TEA informs future evolution: templates could eventually declare capabilities needed rather than specific tools.
+
+### Clou Implication
+
+The harness thesis validates Clou's architecture: the orchestrator, golden context, and quality gates ARE the hard part. The model is an input. DB-11's template system formalizes this by making the harness configuration explicit and parameterizable.
+
+The ~30-tool accuracy cliff validates template-level tool curation. The assessor gets Brutalist tools; the verifier gets CDP tools; the implementer gets editing tools. No agent gets everything. Templates enforce this curation per domain.
+
+ToolMaker and TEA are future capabilities, not current requirements. They inform the template schema design (tools as lists today, capability declarations tomorrow) but don't change the initial implementation.
+
+**Sources:**
+- Qian et al., "ToolMaker: Automatic Tool Creation for LLM Agents," ACL 2025: [arXiv:2502.11705](https://arxiv.org/abs/2502.11705)
+- AgentOrchestra, "TEA Protocol," 2025: [arXiv:2506.12508](https://arxiv.org/abs/2506.12508)
+- Tool-R0, "Self-Evolving Tool-Use Reasoning," 2025: [arXiv:2504.15979](https://arxiv.org/abs/2504.15979)
+- Schmid, "The Agent Harness," 2026: [philschmid.de/agent-harness-2026](https://philschmid.de/agent-harness-2026)
+- Gorilla, UC Berkeley, 2023: [arXiv:2305.15334](https://arxiv.org/abs/2305.15334)
+- AgentBench, ICLR 2024: [arXiv:2308.03688](https://arxiv.org/abs/2308.03688)
+
+---
+
+## 14. Tool Discovery and MCP Registry Infrastructure
+
+As the MCP ecosystem matures, tool discovery becomes a systems problem. The question shifts from "what tools does this agent have?" to "how does an agent find the right tools?"
+
+### MCP Registry and Semantic Search
+
+**MCP Gateway Registry** (agentic-community/mcp-gateway): Implements FAISS-indexed semantic search over MCP tool descriptions. An agent describes what it needs in natural language; the registry returns ranked tool matches. This decouples tool knowledge from the agent — the agent doesn't need to know tool names, only capabilities.
+
+**Anthropic AAIF Registry Spec** (2026): Proposed standard for MCP tool registries with capability-based indexing, version management, and trust scoring. Not yet widely implemented, but signals the direction: tool discovery as infrastructure, not configuration.
+
+### Environment Synthesis
+
+**ScaleEnv / EnvScaler** (arXiv:2505.11389): Automated synthesis of execution environments for agent evaluation. Generates diverse, realistic environments from seed specifications. Relevant to Clou's verification phase — future templates could specify environment requirements and have the system synthesize them.
+
+### The Discovery-Curation Tension
+
+Registry-based discovery and template-based curation are complementary, not competing:
+
+- **Templates curate**: The template author selects tools known to work for the domain. Static, reliable, tested.
+- **Registries discover**: At runtime, an agent can query a registry for tools not in the template. Dynamic, broader, untested.
+
+The tension: discovered tools haven't been tested with the template's quality gates, verification modalities, or compose conventions. A tool discovered at runtime might work perfectly or might produce outputs the coordinator can't evaluate.
+
+Resolution (DB-11): templates use static tool lists today. Registry discovery is a future capability that requires:
+1. A trust model for discovered tools (who verified this tool works?)
+2. Integration with the quality gate (can the gate evaluate outputs from this tool?)
+3. Sandbox execution (discovered tools run in isolation until validated)
+
+### Clou Implication
+
+MCP registries are relevant infrastructure for Clou's future evolution. The template schema (DB-11) is designed to accommodate this: tool lists today can become capability declarations tomorrow, with a registry resolver replacing static enumeration. But the initial implementation uses static lists — the registry infrastructure isn't mature enough to depend on.
+
+The discovery-curation tension maps directly to DB-11's capability axes: high tool availability domains (software) can curate effectively; low tool availability domains might need discovery to fill gaps.
+
+**Sources:**
+- MCP Gateway Registry, agentic-community: [github.com/agentic-community/mcp-gateway](https://github.com/agentic-community/mcp-gateway)
+- ScaleEnv, 2025: [arXiv:2505.11389](https://arxiv.org/abs/2505.11389)
+- Anthropic, "Agent Interoperability Framework," 2026
+
+---
+
 ## Summary: Research-Grounded Design Principles
 
 | Research Finding | Clou Design Response |
@@ -660,3 +835,16 @@ Clou should not rely on the model's ability to synthesize across large contexts.
 | Forgetting is computationally useful | Session-per-cycle implicitly forgets within-cycle reasoning |
 | Event segmentation enables structured memory | Phases as explicit boundaries, git at phase completion |
 | 79% of multi-agent failures are specification/coordination | compose.py, typed function signatures, structured execution.md |
+| The harness is the hard part, not the model | Orchestrator, golden context, quality gates are the engineering investment |
+| Agent accuracy collapses past ~30 tools | Template-level tool curation; no agent gets all tools |
+| Tool creation is decomposable (80% success) | Future: templates declare capabilities, not specific tools |
+| MCP registries enable semantic tool discovery | Future: registry resolver replaces static tool lists in templates |
+| Attention is associative memory (Hopfield equivalence) | Curated read sets select the retrieval pattern library; same design constraint as §1 through different mechanism |
+| Intermediate tokens are not reasoning (Kambhampati 2025) | External verification is the only reliable signal; decisions.md is not evidence of reasoning |
+| Reasoning models improve quantitatively, not qualitatively | Quality gates remain non-negotiable even as models improve |
+| CLT: multi-agent overhead hurts on simple tasks | "Start serial, earn parallel"; parallelism only when complexity warrants |
+| Failure-driven re-decomposition +28-33% (ADaPT) | Template-level optimization for ASSESS→rework: decompose finer on failure |
+| Satisficing outperforms optimization for bounded agents | One decomposition, verify, proceed; no plan comparison |
+| Situated cognition: plans as resources | Session-per-cycle + EXECUTE→ASSESS→rework loops; plans adapt to execution reality |
+| RPD prototype matching ≈ transformer pattern retrieval | Quality of decomposition tracks training data density (DB-11 capability axis) |
+| Supervisor-user dialogue is the sensemaking mechanism | No separate exploration phase at the domain-agnostic level; domain-specific exploration is a template concern |

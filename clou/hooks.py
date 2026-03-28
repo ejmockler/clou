@@ -13,7 +13,10 @@ import fnmatch
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from clou.harness import HarnessTemplate
 
 from clou.graph import validate
 
@@ -36,15 +39,13 @@ WRITE_PERMISSIONS: dict[str, list[str]] = {
         "milestones/*/escalations/*.md",
         "milestones/*/phases/*/phase.md",
         "active/coordinator.md",
-        "services/*/setup.md",
-        "services/*/.env.example",
-        "services/*/status.md",
     ],
     "worker": [
         "milestones/*/phases/*/execution.md",
     ],
     "verifier": [
         "milestones/*/phases/verification/execution.md",
+        "milestones/*/phases/verification/artifacts/*",
         "milestones/*/handoff.md",
     ],
     "assessor": [
@@ -88,6 +89,7 @@ def _make_pre_hook(
     *,
     milestone: str | None = None,
     agent_tier_map: dict[str, str] | None = None,
+    permissions: dict[str, list[str]] | None = None,
 ) -> HookCallback:
     """Create a PreToolUse hook callback for write boundary enforcement.
 
@@ -97,13 +99,19 @@ def _make_pre_hook(
     ``hooks`` field — the coordinator's hook enforces on behalf of its
     subagents using the correct tier.
     """
-    lead_scoped = _scoped_permissions(tier, milestone)
+    lead_scoped = _scoped_permissions(tier, milestone, permissions)
 
     # Pre-compute scoped permissions for each subagent tier.
     sub_scoped: dict[str, list[str]] = {}
     if agent_tier_map:
         for agent_type, sub_tier in agent_tier_map.items():
-            sub_scoped[agent_type] = _scoped_permissions(sub_tier, milestone)
+            sub_scoped[agent_type] = _scoped_permissions(
+                sub_tier, milestone, permissions,
+            )
+
+    _ALLOW: dict[str, Any] = {
+        "hookSpecificOutput": {"hookEventName": "PreToolUse"},
+    }
 
     async def pre_hook(
         input_data: dict[str, Any],
@@ -112,20 +120,20 @@ def _make_pre_hook(
     ) -> dict[str, Any]:
         tool_name: object = input_data.get("tool_name")
         if not isinstance(tool_name, str) or tool_name not in _WRITE_TOOLS:
-            return {}
+            return _ALLOW
 
         tool_input: object = input_data.get("tool_input")
         if not isinstance(tool_input, dict):
-            return {}
+            return _ALLOW
 
         file_path = _extract_file_path(tool_input)
         if file_path is None:
-            return {}
+            return _ALLOW
 
         relative = _is_clou_path(file_path, project_dir)
         if relative is None:
             # Writes outside .clou/ are always allowed.
-            return {}
+            return _ALLOW
 
         # Determine which tier's permissions to enforce.
         # If agent_type is present (subagent context), enforce that tier's
@@ -140,11 +148,14 @@ def _make_pre_hook(
             else:
                 # Unknown subagent type — block all .clou/ writes.
                 return {
-                    "decision": "block",
-                    "reason": (
-                        f"Unknown agent type '{agent_type}' cannot write "
-                        f"to .clou/{relative}"
-                    ),
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"Unknown agent type '{agent_type}' cannot write "
+                            f"to .clou/{relative}"
+                        ),
+                    },
                 }
         else:
             # No agent_type, no tier map, or non-string — lead agent's permissions.
@@ -152,11 +163,16 @@ def _make_pre_hook(
             effective_tier = tier
 
         if any(fnmatch.fnmatch(relative, p) for p in scoped):
-            return {}
+            return _ALLOW
 
         return {
-            "decision": "block",
-            "reason": f"{effective_tier} tier cannot write to .clou/{relative}",
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"{effective_tier} tier cannot write to .clou/{relative}"
+                ),
+            },
         }
 
     return pre_hook
@@ -167,6 +183,10 @@ def _make_post_hook(
 ) -> HookCallback:
     """Create a PostToolUse hook callback for compose.py validation."""
 
+    _PASS: dict[str, Any] = {
+        "hookSpecificOutput": {"hookEventName": "PostToolUse"},
+    }
+
     async def post_hook(
         input_data: dict[str, Any],
         tool_use_id: str | None,
@@ -174,56 +194,66 @@ def _make_post_hook(
     ) -> dict[str, Any]:
         tool_name: object = input_data.get("tool_name")
         if not isinstance(tool_name, str) or tool_name not in _WRITE_TOOLS:
-            return {}
+            return _PASS
 
         tool_input: object = input_data.get("tool_input")
         if not isinstance(tool_input, dict):
-            return {}
+            return _PASS
 
         file_path = _extract_file_path(tool_input)
         if file_path is None:
-            return {}
+            return _PASS
 
         resolved = Path(file_path).resolve()
         if resolved.name != "compose.py":
-            return {}
+            return _PASS
 
         clou_dir = project_dir / ".clou"
         try:
             resolved.relative_to(clou_dir.resolve())
         except ValueError:
-            return {}
+            return _PASS
 
         # Read the file and validate.
         try:
             source = resolved.read_text()
         except OSError:
-            return {}
+            return _PASS
 
         errors = validate(source)
         if not errors:
-            return {}
+            return _PASS
 
         error_list = "\n".join(errors)
         return {
             "hookSpecificOutput": {
-                "message": "Composition errors:\n"
-                + error_list
-                + "\nFix the call graph."
+                "hookEventName": "PostToolUse",
+                "additionalContext": (
+                    "Composition errors:\n"
+                    + error_list
+                    + "\nFix the call graph."
+                ),
             }
         }
 
     return post_hook
 
 
-def _scoped_permissions(tier: str, milestone: str | None) -> list[str]:
+def _scoped_permissions(
+    tier: str,
+    milestone: str | None,
+    permissions: dict[str, list[str]] | None = None,
+) -> list[str]:
     """Return write permission patterns, optionally scoped to a milestone.
 
     When *milestone* is provided, ``milestones/*`` patterns are narrowed to
     ``milestones/{milestone}`` — preventing a coordinator from writing to
     another milestone's golden context.
+
+    When *permissions* is provided, uses that dict instead of the
+    module-level ``WRITE_PERMISSIONS`` (for template-driven configuration).
     """
-    patterns = WRITE_PERMISSIONS.get(tier, [])
+    patterns = (permissions or WRITE_PERMISSIONS).get(tier, [])
     if milestone is None:
         return patterns
 
@@ -251,6 +281,7 @@ def build_hooks(
     project_dir: Path,
     *,
     milestone: str | None = None,
+    template: HarnessTemplate | None = None,
 ) -> dict[str, list[HookConfig]]:
     """Build tier-specific hooks for write boundary enforcement.
 
@@ -259,6 +290,8 @@ def build_hooks(
         project_dir: Project root directory.
         milestone: When provided, write boundary patterns are scoped to this
             milestone — ``milestones/*`` becomes ``milestones/{milestone}``.
+        template: When provided, write permissions and agent tier map are
+            derived from the template instead of module-level constants.
 
     Returns a hooks dict in the format expected by ClaudeAgentOptions:
     {
@@ -266,19 +299,32 @@ def build_hooks(
         "PostToolUse": [HookConfig(matcher=..., hooks=[callback])],
     }
     """
-    # Coordinator hooks also enforce subagent write boundaries.
-    agent_map = AGENT_TIER_MAP if tier == "coordinator" else None
+    # Derive permissions and tier map from template or module-level constants.
+    if template is not None:
+        from clou.harness import template_agent_tier_map
+
+        permissions: dict[str, list[str]] | None = template.write_permissions
+        agent_map = (
+            template_agent_tier_map(template) if tier == "coordinator" else None
+        )
+    else:
+        permissions = None  # use WRITE_PERMISSIONS default
+        agent_map = AGENT_TIER_MAP if tier == "coordinator" else None
 
     matcher = "Write|Edit|MultiEdit"
     hooks: dict[str, list[HookConfig]] = {
         "PreToolUse": [
             HookConfig(
                 matcher=matcher,
-                hooks=[_make_pre_hook(
-                    tier, project_dir,
-                    milestone=milestone,
-                    agent_tier_map=agent_map,
-                )],
+                hooks=[
+                    _make_pre_hook(
+                        tier,
+                        project_dir,
+                        milestone=milestone,
+                        agent_tier_map=agent_map,
+                        permissions=permissions,
+                    )
+                ],
             ),
         ],
     }

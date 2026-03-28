@@ -102,7 +102,8 @@ def test_parse_resume_flag_continue(
     from clou.session import Session
 
     (tmp_path / ".clou").mkdir()
-    Session(tmp_path, session_id="latest")
+    s = Session(tmp_path, session_id="latest")
+    s.append("user", "hello")
     monkeypatch.setattr(sys, "argv", ["clou", "--continue"])
     with patch(
         "clou.project.resolve_project_dir_or_exit",

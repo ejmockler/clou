@@ -14,11 +14,11 @@ Your own services run real. Third-party services use their sandbox infrastructur
 
 **Implication:** The verification phase starts real servers, runs real migrations, seeds real data. `docker compose up`, not `jest.mock()`. The `services/` protocol exists specifically to handle the credential boundary where automation meets authorization.
 
-## 3. The agent experiences the software before the user does
+## 3. The agent experiences the output before the user does
 
-Verification is not test suites passing. It's the agent walking user flows against a live environment and handing off a prepared room, not a construction site. The dev environment is left running. The user walks into a guided tour.
+Verification is not automated checks passing. It's the agent perceiving the output as a user would and handing off a prepared room, not a construction site. For software: the dev environment is left running, user flows are walked. For other domains: the output is experienced through the appropriate verification modalities (DB-09, DB-11).
 
-**Implication:** Every milestone ends with `handoff.md` — a document written by the verification agent that includes running services, walk-through steps, and what to look for. The user's first interaction with completed work is structured and prepared.
+**Implication:** Every milestone ends with `handoff.md` — a document written by the verification agent that includes what was produced, walk-through steps, and what to look for. The user's first interaction with completed work is structured and prepared.
 
 ## 4. Escalations are engineered artifacts, not cries for help
 
@@ -40,7 +40,7 @@ Milestones are sequential by default. Parallel coordinators are a future capabil
 
 ## 7. The coordinator is a judgment loop, not a dispatcher
 
-The coordinator evaluates the evaluator (Brutalist), makes calls within its delegated authority, and escalates what it can't resolve. The loop runs until the milestone is genuinely complete, not until the first green signal.
+The coordinator evaluates the evaluator (the quality gate), makes calls within its delegated authority, and escalates what it can't resolve. The loop runs until the milestone is genuinely complete, not until the first green signal.
 
 **Implication:** The coordinator's exit condition is conjunctive (ALL criteria must be met). The coordinator has a defined authority boundary (from `milestone.md`) and logs every exercise of judgment in `decisions.md`. It is accountable for its decisions.
 
@@ -58,9 +58,9 @@ The agent maximizes the surface area of what it can do autonomously while being 
 
 ## 10. Fail loud, not silent
 
-Crashes, infrastructure failures, and structural validation errors escalate to the supervisor and user. The system does not silently retry operations that may indicate systemic issues. The 20-cycle milestone cap, structural validation at cycle boundaries, and Brutalist as essential infrastructure (not advisory) all enforce this principle: the system surfaces problems rather than masking them.
+Crashes, infrastructure failures, and structural validation errors escalate to the supervisor and user. The system does not silently retry operations that may indicate systemic issues. The 20-cycle milestone cap, structural validation at cycle boundaries, and required quality gates as essential infrastructure (not advisory) all enforce this principle: the system surfaces problems rather than masking them.
 
-**Implication:** Agent team crashes exit the coordinator loop and escalate. Brutalist unavailability is a blocking error. Malformed golden context triggers revert-and-retry with explicit error feedback, then escalation after 3 failures. The user always knows when something is wrong.
+**Implication:** Agent team crashes exit the coordinator loop and escalate. Required quality gate unavailability is a blocking error (DB-11). Malformed golden context triggers revert-and-retry with explicit error feedback, then escalation after 3 failures. The user always knows when something is wrong.
 
 ## 11. The breathing conversation is the interface; the orchestrator is invisible
 

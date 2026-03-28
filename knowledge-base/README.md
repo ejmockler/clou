@@ -1,6 +1,8 @@
 # Clou Knowledge Base
 
-Clou is an agentic coding system that orchestrates software construction through a three-tier hierarchy of agent sessions. Clou's thesis: the planning layer — not code generation — is the bottleneck in agentic development. The system maintains a persistent, human-readable golden context (`.clou/`) that serves as both the agent's working memory and the human's legibility surface.
+Clou is an orchestrator for structured work — it manages a three-tier hierarchy of agent sessions, persistent planning state, quality gates, and verification. Clou's thesis: the planning layer — not generation — is the bottleneck in agentic systems. The system maintains a persistent, human-readable golden context (`.clou/`) that serves as both the agent's working memory and the human's legibility surface.
+
+Software construction is the first domain. The architecture is domain-agnostic; what varies per domain is the harness template — tool configuration, quality gates, verification modalities, and write permissions. See [DB-11](./decision-boundaries/11-harness-architecture.md).
 
 ## Knowledge Base Structure
 
@@ -34,7 +36,7 @@ Clou is an agentic coding system that orchestrates software construction through
 - [Slash Commands](./implementation/slash-commands.md) — Dispatch layer, completion menu, and per-command design plans for the discoverable harness surface.
 
 ### Decision Boundaries
-Architectural decisions resolved during the design phase. Each documents the problem, options with tradeoffs, constraints from the SDK, research basis, and final decision. All 10 boundaries are decided.
+Architectural decisions resolved during the design phase. Each documents the problem, options with tradeoffs, constraints from the SDK, research basis, and final decision.
 
 - [DB-01: Spawning Mechanism](./decision-boundaries/01-spawning-mechanism.md) — **DECIDED**: Orchestrator wrapper (Option B)
 - [DB-02: Task DAG Implementation](./decision-boundaries/02-task-dag-implementation.md) — **DECIDED**: Sequential phases + typed-function composition (`compose.py`)
@@ -46,3 +48,5 @@ Architectural decisions resolved during the design phase. Each documents the pro
 - [DB-08: File Schemas](./decision-boundaries/08-file-schemas.md) — **DECIDED**: `roadmap.md` (numbered milestones + dependency annotations), `execution.md` (front-loaded failure summary + execution-order tasks), `decisions.md` (newest-first, cycle-grouped), no separate schema files
 - [DB-09: Verification Generalization](./decision-boundaries/09-verification-generalization.md) — **DECIDED**: Verification modalities (composable, coordinator-selected), mediated perception for Brutalist, three perception stages + structural experience assessment, manual as declared residual
 - [DB-10: Team Communication](./decision-boundaries/10-team-communication.md) — **DECIDED**: Mechanical dispatch with circuit breakers, one agent per function, stigmergy only, no mailbox/SendMessage/TaskCreate
+- [DB-11: Harness Architecture](./decision-boundaries/11-harness-architecture.md) — **DECIDED**: Harness templates (capability profiles per domain), Python module format, supervisor selects, quality gate pluggability, capability axes not domain taxonomy, environment detection as template capability
+- [DB-12: Validation Tiers](./decision-boundaries/12-validation-tiers.md) — **DECIDED**: Three-tier golden context validation (AST for compose.py, strict parsing for checkpoints, form-only for narratives)

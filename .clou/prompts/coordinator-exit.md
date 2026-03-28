@@ -3,7 +3,7 @@
 <objective>
 Dispatch handoff preparation, write final milestone status, and exit
 the coordinator loop. The milestone is complete — verification passed,
-Brutalist assessments resolved.
+quality gate assessments resolved.
 </objective>
 
 <procedure>
@@ -15,7 +15,7 @@ Brutalist assessments resolved.
    ```
    You are preparing the handoff for milestone '{{milestone}}'.
 
-   Read your protocol file: .clou/prompts/worker.md
+   Read your protocol file: .clou/prompts/verifier.md
 
    Then read these files:
    - .clou/milestones/{{milestone}}/phases/verification/execution.md

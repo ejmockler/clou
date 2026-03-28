@@ -13,6 +13,7 @@ from clou.session import (
     list_sessions,
     read_transcript,
     session_path,
+    session_preview,
     session_summary,
     sessions_dir,
 )
@@ -181,10 +182,21 @@ class TestListSessions:
         (tmp_path / ".clou").mkdir()
         d = sessions_dir(tmp_path)
         (d / "bad.jsonl").write_text("not json\n")
-        Session(tmp_path, session_id="good")
+        s = Session(tmp_path, session_id="good")
+        s.append("user", "hello")
         sessions = list_sessions(tmp_path)
         assert len(sessions) == 1
         assert sessions[0].session_id == "good"
+
+    def test_empty_session_skipped(self, tmp_path: Path) -> None:
+        """Header-only sessions (abandoned on startup) are filtered out."""
+        (tmp_path / ".clou").mkdir()
+        Session(tmp_path, session_id="empty")
+        s = Session(tmp_path, session_id="real")
+        s.append("user", "hello")
+        sessions = list_sessions(tmp_path)
+        assert len(sessions) == 1
+        assert sessions[0].session_id == "real"
 
 
 # ---------------------------------------------------------------------------
@@ -195,8 +207,10 @@ class TestListSessions:
 class TestLatestSessionId:
     def test_returns_most_recent(self, tmp_path: Path) -> None:
         (tmp_path / ".clou").mkdir()
-        Session(tmp_path, session_id="old")
-        Session(tmp_path, session_id="new")
+        s1 = Session(tmp_path, session_id="old")
+        s1.append("user", "hello")
+        s2 = Session(tmp_path, session_id="new")
+        s2.append("user", "hello")
         assert latest_session_id(tmp_path) == "new"
 
     def test_none_when_empty(self, tmp_path: Path) -> None:
@@ -245,3 +259,48 @@ class TestPaths:
         p = session_path(tmp_path, "abc123")
         assert p.name == "abc123.jsonl"
         assert p.parent.name == "sessions"
+
+
+# ---------------------------------------------------------------------------
+# session_preview
+# ---------------------------------------------------------------------------
+
+
+class TestSessionPreview:
+    def test_returns_first_user_message(self, tmp_path: Path) -> None:
+        s = Session(tmp_path, session_id="prev1")
+        s.append("assistant", "Hello!")
+        s.append("user", "implement the auth flow")
+        assert session_preview(tmp_path, "prev1") == "implement the auth flow"
+
+    def test_truncates_long_message(self, tmp_path: Path) -> None:
+        s = Session(tmp_path, session_id="prev2")
+        s.append("user", "x" * 100)
+        result = session_preview(tmp_path, "prev2", max_chars=20)
+        assert result == "x" * 20 + "..."
+
+    def test_empty_session(self, tmp_path: Path) -> None:
+        s = Session(tmp_path, session_id="prev3")
+        assert session_preview(tmp_path, "prev3") == ""
+
+    def test_no_user_messages(self, tmp_path: Path) -> None:
+        s = Session(tmp_path, session_id="prev4")
+        s.append("assistant", "Hello!")
+        s.append("assistant", "How can I help?")
+        assert session_preview(tmp_path, "prev4") == ""
+
+    def test_nonexistent_session(self, tmp_path: Path) -> None:
+        assert session_preview(tmp_path, "nonexistent") == ""
+
+    def test_corrupt_lines_skipped(self, tmp_path: Path) -> None:
+        p = session_path(tmp_path, "corrupt1")
+        with p.open("w") as f:
+            f.write('{"role":"system","content":"header","timestamp":1}\n')
+            f.write("not valid json\n")
+            f.write('{"role":"user","content":"hello world","timestamp":2}\n')
+        assert session_preview(tmp_path, "corrupt1") == "hello world"
+
+    def test_newlines_collapsed(self, tmp_path: Path) -> None:
+        s = Session(tmp_path, session_id="prev5")
+        s.append("user", "line one\nline two\nline three")
+        assert session_preview(tmp_path, "prev5") == "line one line two line three"

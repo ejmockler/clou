@@ -2,9 +2,9 @@
 
 ## Role
 
-The coordinator owns a single milestone's lifecycle. It is an agent session that runs an autonomous judgment loop: plan the work, dispatch agent teams, collect results, run Brutalist for quality assessment, critically evaluate feedback, and decide whether to accept, rework, or escalate. The coordinator exits when the milestone's acceptance criteria are met.
+The coordinator owns a single milestone's lifecycle. It is an agent session that runs an autonomous judgment loop: plan the work, dispatch agent teams, collect results, run quality gates for assessment, critically evaluate feedback, and decide whether to accept, rework, or escalate. The coordinator exits when the milestone's acceptance criteria are met.
 
-The coordinator is NOT a dispatcher. It does not simply assign work and collect results. It exercises judgment at every step. Its relationship with Brutalist is critical, not deferential — it evaluates the evaluator.
+The coordinator is NOT a dispatcher. It does not simply assign work and collect results. It exercises judgment at every step. Its relationship with the quality gate is critical, not deferential — it evaluates the evaluator. The specific quality gate (e.g., Brutalist for software construction) comes from the active harness template (DB-11).
 
 ## Coordinator Loop
 
@@ -47,20 +47,22 @@ The coordinator is NOT a dispatcher. It does not simply assign work and collect 
    f. Write active/coordinator.md checkpoint
 
 4. ASSESS
-   a. Run Brutalist MCP on completed work — query all relevant implementation domains:
-      - roast_codebase (always)
-      - roast_architecture (structural changes)
-      - roast_security (security-relevant changes)
-      - roast_infrastructure (infrastructure changes)
-      - roast_dependencies (dependency changes)
-      - roast_test_coverage (before verification)
-      - roast_file_structure (major restructuring)
-   b. Evaluate Brutalist's feedback critically against:
+   a. Run quality gate tools on completed work — invoke the assess agent
+      defined by the active harness template (DB-11). For software-construction:
+      query all relevant Brutalist domains (roast_codebase, roast_architecture,
+      roast_security, roast_infrastructure, roast_dependencies,
+      roast_test_coverage, roast_file_structure — based on what changed).
+   b. Evaluate quality gate feedback critically against:
       - Milestone requirements and constraints
       - Delegated authority boundaries
       - Project-level principles from project.md
    c. For each finding:
       - Valid feedback → create rework tasks, loop to EXECUTE
+        If repeated rework on the same task fails, the coordinator may
+        re-decompose the failed task into finer subtasks rather than
+        retrying at the same granularity (ADaPT pattern — see Research
+        Foundations §9). Re-decomposition updates compose.py and is
+        re-validated by the orchestrator via AST parsing.
       - Invalid feedback → log override reasoning in decisions.md
       - Exceeds authority → file escalation
    d. Write active/coordinator.md checkpoint
@@ -73,8 +75,9 @@ The coordinator is NOT a dispatcher. It does not simply assign work and collect 
       - Stage 2: Golden path walking (with perceptual record capture)
       - Stage 3: Exploratory testing (scope per coordinator's plan)
    d. Coordinator reads perceptual record (verification/execution.md + artifacts/)
-   e. Coordinator invokes Brutalist roast_product on perceptual record
-   f. Coordinator evaluates verifier findings + Brutalist assessment against acceptance criteria
+   e. Coordinator invokes quality gate verify tools on perceptual record
+      (for software-construction: Brutalist roast_product)
+   f. Coordinator evaluates verifier findings + quality gate assessment against acceptance criteria
    g. If issues → rework EXECUTE with findings, then re-VERIFY
    h. If satisfied → dispatch handoff preparation, proceed to EXIT
    i. Write active/coordinator.md checkpoint
@@ -93,9 +96,9 @@ The coordinator exits when ALL of:
 
 - [ ] All implementation phases complete
 - [ ] Acceptance criteria from `requirements.md` are met
-- [ ] Brutalist code assessment has been run and all findings resolved (accepted or overridden with reasoning)
+- [ ] Quality gate code assessment has been run and all findings resolved (accepted or overridden with reasoning)
 - [ ] Verification phase has produced `handoff.md` with confirmed golden paths
-- [ ] Brutalist experience assessment has been run within VERIFY and all findings resolved
+- [ ] Quality gate experience assessment has been run within VERIFY and all findings resolved
 - [ ] No open blocking escalations
 - [ ] Dev environment is running and accessible
 - [ ] All service dependencies are configured and verified
@@ -112,11 +115,11 @@ Before dispatching any work, the coordinator:
 
 This planning phase is distinct from execution. The coordinator does not start writing code until it has a validated composition. The composition is a written artifact (`compose.py`) that can be reviewed, validated by the orchestrator, and that survives session restarts.
 
-## Coordinator's Relationship with Brutalist
+## Coordinator's Relationship with the Quality Gate
 
-Brutalist provides feedback. The coordinator decides what to do with it. The coordinator's judgment criteria:
+The quality gate (Brutalist for software-construction, per DB-11) provides feedback. The coordinator decides what to do with it. The coordinator's judgment criteria:
 
-1. **Does the feedback address a real issue?** — Brutalist may flag a pattern as problematic when it's an intentional architectural decision documented in `project.md`.
+1. **Does the feedback address a real issue?** — The quality gate may flag a pattern as problematic when it's an intentional architectural decision documented in `project.md`.
 
 2. **Does the issue matter for this milestone?** — A code quality suggestion may be valid but out of scope for the current acceptance criteria.
 
@@ -125,7 +128,7 @@ Brutalist provides feedback. The coordinator decides what to do with it. The coo
 4. **Is the cost of fixing proportionate?** — A minor style issue found in the last assessment cycle shouldn't trigger a full rework if the milestone is otherwise complete.
 
 Every exercise of judgment is logged in `decisions.md`, newest-first, grouped by cycle. Two entry types:
-- **Brutalist Assessment** (accepted/overridden): what Brutalist said → action → reasoning
+- **Quality Gate Assessment** (accepted/overridden): what the gate said → action → reasoning
 - **Coordinator Judgment** (tradeoffs, authority edge cases): context → decision → reasoning
 
 New cycle groups are prepended at the top of the file — most recent judgments occupy the attention sink position. See [DB-08](../decision-boundaries/08-file-schemas.md) for the full schema.
@@ -158,7 +161,7 @@ For the full lifecycle design, see [DB-03](../decision-boundaries/03-context-win
 |---|---|---|
 | `compose.py` | During PLAN step | Typed-function call graph for entire milestone |
 | `phase.md` per phase | During PLAN step | Narrative scope for agent teams |
-| `decisions.md` entries | During ASSESS step | Judgment log for Brutalist overrides and tradeoffs |
+| `decisions.md` entries | During ASSESS step | Judgment log for quality gate overrides and tradeoffs |
 | `escalations/*.md` | Anytime | Structured signals to supervisor |
 | `status.md` | Each cycle boundary | Current progress visible to supervisor |
 | `active/coordinator.md` | Each checkpoint | Crash recovery state |
@@ -171,7 +174,7 @@ The coordinator tracks cycle number (how many PLAN-EXECUTE-ASSESS iterations hav
 - **Termination awareness:** A high cycle count indicates thrashing
 - **Cost awareness:** Each cycle consumes tokens across multiple agent sessions
 
-**Hard limit: 20 cycles per milestone.** The coordinator critically evaluates Brutalist feedback at each ASSESS cycle — is this finding valid? Does it matter for this milestone? Is the fix proportionate? — and decides whether to enter another cycle or proceed. The 20-cycle cap is a safety net, not the primary termination mechanism. The coordinator's critical evaluation of whether each cycle is productive IS the primary mechanism.
+**Hard limit: 20 cycles per milestone.** The coordinator critically evaluates quality gate feedback at each ASSESS cycle — is this finding valid? Does it matter for this milestone? Is the fix proportionate? — and decides whether to enter another cycle or proceed. The 20-cycle cap is a safety net, not the primary termination mechanism. The coordinator's critical evaluation of whether each cycle is productive IS the primary mechanism.
 
 When the cap is hit, the coordinator escalates to the supervisor with:
 - Cycle history summary and pattern analysis

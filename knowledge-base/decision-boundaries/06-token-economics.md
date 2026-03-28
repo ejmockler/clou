@@ -2,7 +2,7 @@
 
 **Status:** DECIDED
 **Severity:** Medium — affects cost and model selection
-**Decisions:** Opus everywhere, coordinator queries all relevant Brutalist domains, track cost in tokens, no budget limit, hardcoded model selection
+**Decisions:** Opus everywhere, coordinator queries all relevant quality gate tools (per active template, DB-11), track cost in tokens, no budget limit, hardcoded model selection
 
 **Prior resolutions that constrain this decision:**
 | Decision | Impact on DB-06 |
@@ -23,9 +23,11 @@ All tiers use Opus (Claude's most capable model). Maximum quality at every tier.
 
 **Rationale:** Clou's thesis is that the planning layer is the bottleneck. Degrading model quality at any tier introduces rework cycles that cost more than the savings from cheaper models. The coordinator's critical evaluation of Brutalist feedback, the agent teams' code quality, and the verification agent's accuracy all benefit from maximum capability. Cost control comes from the 20-cycle cap (DB-05) and the coordinator's judgment about when to proceed, not from model downgrading.
 
-### 2. Brutalist Tool Selection: All Relevant Domains
+### 2. Quality Gate Tool Selection: All Relevant Domains
 
-The coordinator queries all Brutalist tools relevant to the implementation domain. This is not a fixed subset — the coordinator determines which tools are relevant based on what changed:
+The coordinator queries all quality gate tools relevant to the implementation domain, as defined by the active harness template (DB-11). This is not a fixed subset — the coordinator determines which tools are relevant based on what changed. The assessor agent's tool list (from the template) is the single source of truth for available gate tools.
+
+For the software-construction template (Brutalist MCP):
 
 - `roast_codebase` — always, after implementation phases
 - `roast_architecture` — when structural changes were made
@@ -36,13 +38,13 @@ The coordinator queries all Brutalist tools relevant to the implementation domai
 - `roast_test_coverage` — before verification phase
 - `roast_file_structure` — after major restructuring
 
-The coordinator critically evaluates all feedback for validity. The judgment criteria (documented in [Coordinator Protocol](../protocols/coordinator.md)) apply to every finding from every tool: Is it real? Does it matter for this milestone? Is the fix within authority? Is the cost proportionate?
+Other templates define their own quality gate tools (DB-11 D4). The coordinator's judgment criteria are gate-agnostic: Is the feedback real? Does it matter for this milestone? Is the fix within authority? Is the cost proportionate?
 
-### 3. No Separate Brutalist Cycle Cap
+### 3. No Separate Quality Gate Cycle Cap
 
-The 20-cycle milestone limit (DB-05) already caps the worst-case number of assessment-rework loops. The coordinator's critical evaluation of Brutalist feedback — is this valid? does it matter? is the fix proportionate? — is the primary termination mechanism. A separate Brutalist-specific cycle cap is redundant and would add unnecessary complexity.
+The 20-cycle milestone limit (DB-05) already caps the worst-case number of assessment-rework loops. The coordinator's critical evaluation of quality gate feedback — is this valid? does it matter? is the fix proportionate? — is the primary termination mechanism. A separate gate-specific cycle cap is redundant.
 
-If the coordinator is spending too many cycles on Brutalist-driven rework, the 20-cycle cap will catch it, and the coordinator will escalate with a diagnosis of why convergence failed.
+If the coordinator is spending too many cycles on gate-driven rework, the 20-cycle cap will catch it, and the coordinator will escalate with a diagnosis of why convergence failed.
 
 ### 4. Cost Tracking: Tokens
 
@@ -61,6 +63,8 @@ The orchestrator tracks per-cycle token usage from `ResultMessage.usage`:
 ```
 
 The orchestrator also maintains a global token tracker across all sessions (supervisor, coordinators, agent teams) for milestone-level and project-level totals.
+
+At milestone completion, the orchestrator writes `metrics.md` (see DB-08) by aggregating the JSONL span log (`clou.telemetry`). This persists per-cycle token deltas, agent token usage, and incident counts into golden context for the supervisor's future planning. The in-memory `TokenTracker` (`clou.tokens`) provides the per-cycle snapshots; the span log provides the persistence layer.
 
 ### 5. No Budget Limit
 
@@ -97,10 +101,11 @@ Configurability (e.g., a `model_selection` field in `project.md`) is deferred un
 - Context window fill: 60-90% on large codebases
 - Multiple concurrent sessions
 
-**Brutalist:**
+**Quality Gate (Brutalist for software-construction):**
 - Very high — spawns 3+ independent model sessions per roast
 - Each roast tool fires Claude Code, Codex, and Gemini CLI agents independently
-- Cost multiplied by number of roast tools invoked per assessment cycle
+- Cost multiplied by number of gate tools invoked per assessment cycle
+- Other templates' gates may have different cost profiles
 
 ### Cost Multipliers
 
@@ -108,7 +113,7 @@ A single milestone might involve:
 - 1 supervisor session (low)
 - 1 coordinator with 3-5 cycles × Opus (moderate-high)
 - 3-5 agent team sessions per phase × 3-5 phases × Opus (high)
-- 1-3 Brutalist invocations × 3 models each (very high)
+- 1-3 quality gate invocations × 3 models each for Brutalist (very high)
 - 1 verification session with Playwright × Opus (moderate)
 
 ### Cost Control Mechanisms

@@ -21,6 +21,7 @@ from textual.widget import Widget
 
 from clou.ui.messages import (
     ClouAgentComplete,
+    ClouAgentProgress,
     ClouAgentSpawned,
     ClouBreathEvent,
     ClouCoordinatorSpawned,
@@ -216,23 +217,26 @@ class BreathWidget(Widget):
         self.shimmer_active = False
 
     def on_clou_agent_spawned(self, message: ClouAgentSpawned) -> None:
-        """Handle an agent dispatch event."""
-        self._add_event(
-            text=f"agent:{message.task_id}  dispatched  {message.description}",
-            cycle_type="EXECUTE",
-        )
+        """Handle an agent dispatch — one curated line per spawn."""
         self._active_agent_count += 1
         self.shimmer_active = True
+        desc = message.description.strip()[:60] or "agent"
+        self._add_event(text=f"dispatching  {desc}", cycle_type="EXECUTE")
+
+    def on_clou_agent_progress(self, message: ClouAgentProgress) -> None:
+        """Agent mid-flight progress — ambient only, no visible line.
+
+        The shimmer is the progress indicator. Per-tool-call lines are a
+        log stream, not a breath (interface.md §4).
+        """
 
     def on_clou_agent_complete(self, message: ClouAgentComplete) -> None:
-        """Handle an agent completion event."""
-        self._add_event(
-            text=f"agent:{message.task_id}  {message.status}  {message.summary}",
-            cycle_type="EXECUTE",
-        )
+        """Handle an agent completion — one curated line."""
         self._active_agent_count = max(0, self._active_agent_count - 1)
         if self._active_agent_count == 0:
             self.shimmer_active = False
+        summary = message.summary.strip()[:60] if message.summary else message.status
+        self._add_event(text=f"{summary}  {message.status}", cycle_type="EXECUTE")
 
     def on_clou_cycle_complete(self, message: ClouCycleComplete) -> None:
         """Handle a cycle completion event."""

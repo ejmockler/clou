@@ -10,7 +10,7 @@ The `.clou/` directory is the system of record for all Clou planning state. It i
 ├── roadmap.md                          # [supervisor writes]
 ├── requests.md                         # [user appends, supervisor reads]
 │
-├── prompts/                            # [orchestrator reads, developer maintains]
+├── prompts/                            # [project-local copies; orchestrator reads from bundled clou/_prompts/]
 │   ├── supervisor-system.xml           # Supervisor system prompt template (identity + invariants)
 │   ├── supervisor.md                   # Supervisor protocol (agent reads on startup)
 │   ├── coordinator-system.xml          # Coordinator system prompt template ({{milestone}})
@@ -38,6 +38,7 @@ The `.clou/` directory is the system of record for all Clou planning state. It i
 │       ├── compose.py                  # [coordinator writes] — typed-function call graph
 │       ├── decisions.md                # [coordinator writes]
 │       ├── handoff.md                  # [verification agent writes]
+│       ├── metrics.md                  # [orchestrator writes — telemetry summary]
 │       ├── escalations/
 │       │   └── <timestamp>-<slug>.md   # [coordinator writes, supervisor resolves]
 │       │
@@ -64,9 +65,11 @@ The `.clou/` directory is the system of record for all Clou planning state. It i
 #### `project.md`
 The single source of truth for project-level everything. Vision, scope, constraints, architectural principles, tech stack decisions, global patterns. This replaces a separate top-level `requirements.md` — project-wide constraints live here because they are part of the project definition.
 
-**Written by:** Supervisor
-**Read by:** All tiers
-**Updated:** When the user changes project scope, constraints, or direction
+Includes a `template:` field (immediately after the heading) that records the active harness template name. The orchestrator extracts this via regex to configure agent definitions, quality gates, MCP servers, and write permissions. Defaults to `software-construction` if missing or malformed. See [DB-11](./decision-boundaries/11-harness-architecture.md).
+
+**Written by:** Supervisor (including template selection)
+**Read by:** All tiers; orchestrator reads `template:` field at coordinator spawn
+**Updated:** When the user changes project scope, constraints, or direction; when the supervisor changes the active template
 
 #### `roadmap.md`
 Ordered list of milestones. Sequential dependencies by default (each depends on the previous). The structure must support future independence annotations for parallel coordinators.
@@ -88,6 +91,8 @@ Raw user input: feature requests, change requests, feedback, priorities. The use
 
 Clou uses a two-layer prompt architecture (DB-04, decided). Each tier has a **system prompt template** (small, identity + invariants, loaded by orchestrator into `system_prompt`) and a **protocol file** (full behavioral specification, read by the agent as its first action). This is grounded in research: system prompts have no architectural privilege over read content, instruction density degrades past a threshold, and decomposition outperforms monolithic prompts. See [Research Foundations](./research-foundations.md) §5–7 and [DB-04](./decision-boundaries/04-prompt-system-architecture.md).
 
+**Bundled vs. project-local:** The canonical prompt files are **bundled with the package** in `clou/_prompts/`. The orchestrator always loads from the bundled directory. The `.clou/prompts/` directory holds project-local copies for reference and inspection — the orchestrator does not read from it.
+
 #### System Prompt Templates (`*-system.xml`)
 
 Small XML-structured templates (~800–2,000 tokens) containing identity anchor, critical invariants, and pointer to protocol file. Loaded by the orchestrator via `ClaudeAgentOptions.system_prompt`. Parameterized with `{{milestone}}`, `{{phase}}`, etc.
@@ -98,23 +103,23 @@ Small XML-structured templates (~800–2,000 tokens) containing identity anchor,
 - `verifier-system.xml` — ~600–800 tokens (parameterized with `{{milestone}}`)
 
 **Maintained by:** Developer (part of Clou's core engineering)
-**Read by:** Orchestrator (at session creation)
+**Read by:** Orchestrator (at session creation, from `clou/_prompts/`)
 
 #### Protocol Files (`*.md`)
 
-Full behavioral specifications that agents read during execution. The coordinator has per-cycle-type protocol files — each session reads exactly one.
+Full behavioral specifications that agents read during execution. The coordinator has per-cycle-type protocol files — each session reads exactly one. The orchestrator's `build_cycle_prompt()` constructs absolute paths to the bundled protocol files.
 
 - `supervisor.md` — Full supervisor protocol (read on startup)
 - `coordinator-plan.md` — PLAN cycle: read requirements, write compose.py + phase specs
 - `coordinator-execute.md` — EXECUTE cycle: dispatch agent teams, monitor
-- `coordinator-assess.md` — ASSESS cycle: evaluate results, invoke Brutalist, decide
+- `coordinator-assess.md` — ASSESS cycle: evaluate results, invoke quality gate, decide
 - `coordinator-verify.md` — VERIFY cycle: dispatch verification agent
 - `coordinator-exit.md` — EXIT cycle: evaluate handoff, write final status, exit
 - `worker.md` — Agent team member protocol
 - `verifier.md` — Verification agent protocol (three stages + handoff schema)
 
 **Maintained by:** Developer
-**Read by:** Agents (as first action in each session/cycle)
+**Read by:** Agents (as first action in each session/cycle, via absolute path to `clou/_prompts/`)
 
 ### Services (Project-Level)
 
@@ -172,11 +177,11 @@ The scoped contract between supervisor and coordinator:
 
 #### `milestones/<name>/decisions.md`
 The coordinator's judgment log. Every time the coordinator:
-- Overrides Brutalist feedback (with reasoning)
+- Overrides quality gate feedback (with reasoning)
 - Makes a non-obvious tradeoff
 - Exercises delegated authority on an edge case
 
-Entries are grouped by cycle (`## Cycle N`) and ordered newest-first — most recent cycle at top, aligning the attention sink (§2) with the most relevant content for the ASSESS coordinator. Two entry types: Brutalist Assessment (accepted/overridden findings) and Coordinator Judgment (tradeoffs, authority edge cases). See [DB-08](./decision-boundaries/08-file-schemas.md) for the full schema.
+Entries are grouped by cycle (`## Cycle N`) and ordered newest-first — most recent cycle at top, aligning the attention sink (§2) with the most relevant content for the ASSESS coordinator. Two entry types: Quality Gate Assessment (accepted/overridden findings) and Coordinator Judgment (tradeoffs, authority edge cases). See [DB-08](./decision-boundaries/08-file-schemas.md) for the full schema.
 
 **Written by:** Coordinator (prepends new cycle groups at top)
 **Read by:** Coordinator (ASSESS for continuity, EXIT for audit completeness), Supervisor (for milestone evaluation)
@@ -193,6 +198,14 @@ The prepared handoff from agent to human. Written by the verification agent afte
 
 **Written by:** Verification agent
 **Read by:** Supervisor (for completion evaluation), User (for testing)
+
+#### `milestones/<name>/metrics.md`
+Agent-readable telemetry summary for a completed milestone. Written by the orchestrator (via `clou.telemetry.write_milestone_summary`) at milestone completion. Contains aggregated token usage, cycle table, agent table, and incident log. The supervisor reads this when planning future milestones to calibrate cost and complexity expectations.
+
+**Written by:** Orchestrator (automated — not written by any agent)
+**Read by:** Supervisor (for future milestone planning and cost awareness)
+**Schema:** See [DB-08: File Schemas](./decision-boundaries/08-file-schemas.md)
+**Validation tier:** Narrative (DB-12) — consumed by supervisor, not by orchestrator control flow
 
 #### `milestones/<name>/escalations/<timestamp>-<slug>.md`
 Structured escalation from coordinator to supervisor. See [Escalation Protocol](./protocols/escalation.md) for full schema.
@@ -261,6 +274,7 @@ The checkpoint tells the orchestrator *what cycle to run next* and tells the new
 |---|---|---|
 | User | `requests.md`, credential confirmations in `services/*/status.md` | Anything (via supervisor conversation) |
 | Supervisor | `project.md`, `roadmap.md`, `requests.md` (processing), milestone creation (`milestone.md`, `requirements.md`), escalation dispositions, `active/supervisor.md` | Everything |
+| Orchestrator | `metrics.md` (automated telemetry summary at milestone completion) | Span log, golden context structure |
 | Coordinator | `compose.py`, `status.md`, `decisions.md`, `escalations/`, phase directories (`phase.md`), `active/coordinator.md` | Everything in its milestone directory + top-level project files |
 | Agent Teams | `execution.md` within assigned phase | Phase spec + codebase |
 | Verification Agent | `execution.md` in verification phase, `handoff.md` | Milestone spec + requirements + running environment |
