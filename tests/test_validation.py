@@ -1105,6 +1105,164 @@ def test_finding_has_path_attribute() -> None:
     assert f.message == "missing key"
 
 
+# ---------------------------------------------------------------------------
+# Validation scoping — terminal phases exempt from blocking errors (R1, R4)
+# ---------------------------------------------------------------------------
+
+# A status.md that marks the "setup" phase as completed and "impl" as pending.
+_STATUS_MD_SETUP_COMPLETED = """\
+# Status
+
+## Current State
+phase: impl
+cycle: 2
+last_updated: 2026-03-28
+
+## Phase Progress
+| Phase | Status | Summary |
+|---|---|---|
+| setup | completed | --- |
+| impl | in_progress | --- |
+"""
+
+# An execution.md that is missing the ## Tasks heading — normally produces ERROR.
+_BAD_EXECUTION_NO_TASKS = """\
+## Summary
+status: completed
+"""
+
+
+def test_completed_phase_errors_downgraded_to_warning(tmp_path: Path) -> None:
+    """R4 regression: completed phase with missing '## Tasks' produces WARNING, not ERROR."""
+    ms_dir = tmp_path / ".clou" / "milestones" / "m1"
+    _write(ms_dir / "status.md", _STATUS_MD_SETUP_COMPLETED)
+    _write(ms_dir / "phases" / "setup" / "execution.md", _BAD_EXECUTION_NO_TASKS)
+    findings = validate_golden_context(tmp_path, "m1")
+    # The missing '## Tasks' finding should exist but as WARNING.
+    assert any("missing '## Tasks'" in f.message for f in findings)
+    errs = errors_only(findings)
+    # No ERROR findings from the completed phase's execution.md.
+    setup_errors = [f for f in errs if "setup" in f.path]
+    assert setup_errors == []
+    # The finding is present as a WARNING.
+    warns = warnings_only(findings)
+    setup_warns = [f for f in warns if "setup" in f.path]
+    assert any("missing '## Tasks'" in f.message for f in setup_warns)
+
+
+def test_pending_phase_errors_not_downgraded(tmp_path: Path) -> None:
+    """Pending phase with missing '## Tasks' still produces ERROR — not exempt."""
+    status_md = """\
+# Status
+
+## Current State
+phase: impl
+cycle: 1
+
+## Phase Progress
+| Phase | Status |
+|---|---|
+| impl | pending |
+"""
+    ms_dir = tmp_path / ".clou" / "milestones" / "m1"
+    _write(ms_dir / "status.md", status_md)
+    _write(ms_dir / "phases" / "impl" / "execution.md", _BAD_EXECUTION_NO_TASKS)
+    findings = validate_golden_context(tmp_path, "m1")
+    errs = errors_only(findings)
+    impl_errors = [f for f in errs if "impl" in f.path]
+    assert any("missing '## Tasks'" in f.message for f in impl_errors)
+
+
+def test_failed_phase_errors_downgraded_to_warning(tmp_path: Path) -> None:
+    """Failed phase with missing '## Tasks' produces WARNING, not ERROR — terminal."""
+    status_md = """\
+# Status
+
+## Current State
+phase: other
+cycle: 2
+
+## Phase Progress
+| Phase | Status |
+|---|---|
+| broken | failed |
+"""
+    ms_dir = tmp_path / ".clou" / "milestones" / "m1"
+    _write(ms_dir / "status.md", status_md)
+    _write(ms_dir / "phases" / "broken" / "execution.md", _BAD_EXECUTION_NO_TASKS)
+    findings = validate_golden_context(tmp_path, "m1")
+    errs = errors_only(findings)
+    broken_errors = [f for f in errs if "broken" in f.path]
+    assert broken_errors == []
+    warns = warnings_only(findings)
+    broken_warns = [f for f in warns if "broken" in f.path]
+    assert any("missing '## Tasks'" in f.message for f in broken_warns)
+
+
+def test_mixed_completed_and_pending_phases(tmp_path: Path) -> None:
+    """Mixed: completed phase bad execution.md -> WARNING; pending phase bad -> ERROR."""
+    status_md = """\
+# Status
+
+## Current State
+phase: impl
+cycle: 3
+
+## Phase Progress
+| Phase | Status | Summary |
+|---|---|---|
+| setup | completed | done |
+| impl | in_progress | working |
+"""
+    ms_dir = tmp_path / ".clou" / "milestones" / "m1"
+    _write(ms_dir / "status.md", status_md)
+    # Both phases have bad execution.md (missing ## Tasks).
+    _write(ms_dir / "phases" / "setup" / "execution.md", _BAD_EXECUTION_NO_TASKS)
+    _write(ms_dir / "phases" / "impl" / "execution.md", _BAD_EXECUTION_NO_TASKS)
+    findings = validate_golden_context(tmp_path, "m1")
+    errs = errors_only(findings)
+    # Only the pending/in_progress phase should have ERROR findings.
+    error_paths = [f.path for f in errs]
+    assert any("impl" in p for p in error_paths)
+    assert not any("setup" in p for p in error_paths)
+    # The completed phase should have its findings as WARNING.
+    warns = warnings_only(findings)
+    warn_paths = [f.path for f in warns]
+    assert any("setup" in p for p in warn_paths)
+
+
+def test_no_status_md_no_downgrade(tmp_path: Path) -> None:
+    """Without status.md, no phase exemptions apply — all errors remain as ERROR."""
+    ms_dir = tmp_path / ".clou" / "milestones" / "m1"
+    # No status.md written.
+    _write(ms_dir / "phases" / "setup" / "execution.md", _BAD_EXECUTION_NO_TASKS)
+    findings = validate_golden_context(tmp_path, "m1")
+    errs = errors_only(findings)
+    assert any("missing '## Tasks'" in f.message for f in errs)
+
+
+def test_flat_execution_not_exempt(tmp_path: Path) -> None:
+    """The flat milestone-level execution.md is never subject to phase exemption."""
+    status_md = """\
+# Status
+
+## Current State
+phase: setup
+cycle: 1
+
+## Phase Progress
+| Phase | Status |
+|---|---|
+| setup | completed |
+"""
+    ms_dir = tmp_path / ".clou" / "milestones" / "m1"
+    _write(ms_dir / "status.md", status_md)
+    _write(ms_dir / "execution.md", _BAD_EXECUTION_NO_TASKS)
+    findings = validate_golden_context(tmp_path, "m1")
+    errs = errors_only(findings)
+    assert any("missing '## Tasks'" in f.message for f in errs)
+
+
 def test_mixed_errors_and_warnings_across_files(tmp_path: Path) -> None:
     """Validation returns both errors and warnings from different files."""
     # Invalid task status (WARNING) in execution.md

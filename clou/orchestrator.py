@@ -688,6 +688,18 @@ async def run_coordinator(
                 _ms_outcome = "escalated_cycle_limit"
                 return "escalated_cycle_limit"
 
+            # Extract DAG before prompt building — same data feeds UI and prompt.
+            dag_data = None
+            compose_path = clou_dir / "milestones" / milestone / "compose.py"
+            if compose_path.exists():
+                try:
+                    from clou.graph import extract_dag_data
+
+                    source = compose_path.read_text(encoding="utf-8")
+                    dag_data = extract_dag_data(source)
+                except Exception:
+                    log.debug("Could not parse DAG from compose.py", exc_info=True)
+
             prompt = build_cycle_prompt(
                 project_dir,
                 milestone,
@@ -695,6 +707,7 @@ async def run_coordinator(
                 read_set,
                 validation_errors=pending_validation_errors,
                 template=tmpl,
+                dag_data=dag_data if cycle_type == "EXECUTE" else None,
             )
             pending_validation_errors = None  # consumed
 
@@ -717,17 +730,14 @@ async def run_coordinator(
                 )
 
                 # Post DAG at cycle start too — compose.py exists from PLAN onward.
-                compose_path = clou_dir / "milestones" / milestone / "compose.py"
-                if compose_path.exists():
+                if dag_data is not None:
                     try:
-                        from clou.graph import extract_dag_data
                         from clou.ui.messages import ClouDagUpdate
 
-                        source = compose_path.read_text(encoding="utf-8")
-                        tasks, deps = extract_dag_data(source)
+                        tasks, deps = dag_data
                         _active_app.post_message(ClouDagUpdate(tasks=tasks, deps=deps))
                     except Exception:
-                        log.debug("Could not parse DAG from compose.py", exc_info=True)
+                        log.debug("Could not post DAG to UI", exc_info=True)
 
             _tok_before = _tracker.coordinator(milestone)
             with telemetry.span(

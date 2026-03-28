@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
-from clou.prompts import _BUNDLED_PROMPTS, build_cycle_prompt, load_prompt
+from clou.prompts import _BUNDLED_PROMPTS, _compute_layers, build_cycle_prompt, load_prompt
 
 # ---------------------------------------------------------------------------
 # load_prompt
@@ -158,3 +159,186 @@ def test_build_cycle_prompt_active_coordinator_routing(tmp_path: Path) -> None:
     assert "- .clou/milestones/m01/status.md" in result
     # Must NOT produce the wrong path
     assert ".clou/milestones/m01/active/coordinator.md" not in result
+
+
+# ---------------------------------------------------------------------------
+# _compute_layers -- topological layer grouping
+# ---------------------------------------------------------------------------
+
+
+class TestComputeLayers:
+    """Test the topological layer helper used for DAG dispatch context."""
+
+    def test_single_task_no_deps(self) -> None:
+        tasks = [{"name": "setup", "status": "pending"}]
+        deps: dict[str, list[str]] = {"setup": []}
+        layers = _compute_layers(tasks, deps)
+        assert layers == [["setup"]]
+
+    def test_two_independent_tasks(self) -> None:
+        """Independent tasks land in the same layer (parallel)."""
+        tasks = [
+            {"name": "alpha", "status": "pending"},
+            {"name": "beta", "status": "pending"},
+        ]
+        deps: dict[str, list[str]] = {"alpha": [], "beta": []}
+        layers = _compute_layers(tasks, deps)
+        assert layers == [["alpha", "beta"]]
+
+    def test_linear_chain(self) -> None:
+        """A -> B -> C produces three layers."""
+        tasks = [
+            {"name": "a", "status": "pending"},
+            {"name": "b", "status": "pending"},
+            {"name": "c", "status": "pending"},
+        ]
+        deps = {"a": [], "b": ["a"], "c": ["b"]}
+        layers = _compute_layers(tasks, deps)
+        assert layers == [["a"], ["b"], ["c"]]
+
+    def test_diamond_graph(self) -> None:
+        """Diamond: A -> {B, C} -> D."""
+        tasks = [
+            {"name": "a", "status": "pending"},
+            {"name": "b", "status": "pending"},
+            {"name": "c", "status": "pending"},
+            {"name": "d", "status": "pending"},
+        ]
+        deps = {"a": [], "b": ["a"], "c": ["a"], "d": ["b", "c"]}
+        layers = _compute_layers(tasks, deps)
+        assert layers == [["a"], ["b", "c"], ["d"]]
+
+    def test_mixed_parallel_and_sequential(self) -> None:
+        """Realistic compose.py graph with gather + sequential."""
+        tasks = [
+            {"name": "validation_scoping", "status": "pending"},
+            {"name": "dag_dispatch_context", "status": "pending"},
+            {"name": "integration_tests", "status": "pending"},
+        ]
+        deps = {
+            "validation_scoping": [],
+            "dag_dispatch_context": [],
+            "integration_tests": ["validation_scoping", "dag_dispatch_context"],
+        }
+        layers = _compute_layers(tasks, deps)
+        assert layers == [
+            ["dag_dispatch_context", "validation_scoping"],
+            ["integration_tests"],
+        ]
+
+    def test_empty_tasks(self) -> None:
+        layers = _compute_layers([], {})
+        assert layers == []
+
+    def test_deterministic_ordering(self) -> None:
+        """Tasks within a layer are sorted alphabetically for determinism."""
+        tasks = [
+            {"name": "zebra", "status": "pending"},
+            {"name": "alpha", "status": "pending"},
+            {"name": "mid", "status": "pending"},
+        ]
+        deps: dict[str, list[str]] = {"zebra": [], "alpha": [], "mid": []}
+        layers = _compute_layers(tasks, deps)
+        assert layers == [["alpha", "mid", "zebra"]]
+
+
+# ---------------------------------------------------------------------------
+# build_cycle_prompt -- DAG context integration (R5)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildCyclePromptDagContext:
+    """DAG data included in EXECUTE prompts for dispatch decisions."""
+
+    @pytest.fixture
+    def dag_data(
+        self,
+    ) -> tuple[list[dict[str, str]], dict[str, list[str]]]:
+        """A graph with both parallel and sequential tasks."""
+        tasks = [
+            {"name": "validation_scoping", "status": "pending"},
+            {"name": "dag_dispatch_context", "status": "pending"},
+            {"name": "integration_tests", "status": "pending"},
+        ]
+        deps = {
+            "validation_scoping": [],
+            "dag_dispatch_context": [],
+            "integration_tests": ["validation_scoping", "dag_dispatch_context"],
+        }
+        return tasks, deps
+
+    def test_execute_prompt_includes_dag_context(
+        self,
+        tmp_path: Path,
+        dag_data: tuple[list[dict[str, str]], dict[str, list[str]]],
+    ) -> None:
+        """EXECUTE cycle with dag_data includes DAG Context section."""
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m01",
+            cycle_type="EXECUTE",
+            read_set=["status.md"],
+            dag_data=dag_data,
+        )
+        assert "## DAG Context" in result
+        assert "do not re-derive from source" in result
+
+        # Task names present
+        assert "validation_scoping" in result
+        assert "dag_dispatch_context" in result
+        assert "integration_tests" in result
+
+        # Dependencies present as JSON
+        tasks_list, deps_dict = dag_data
+        assert json.dumps(deps_dict) in result
+
+        # Layers present as JSON
+        expected_layers = [
+            ["dag_dispatch_context", "validation_scoping"],
+            ["integration_tests"],
+        ]
+        assert json.dumps(expected_layers) in result
+
+    def test_no_dag_data_omits_dag_context(self, tmp_path: Path) -> None:
+        """Without dag_data, no DAG Context section appears (backward compat)."""
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m01",
+            cycle_type="EXECUTE",
+            read_set=["status.md"],
+        )
+        assert "DAG Context" not in result
+
+    def test_non_execute_cycle_omits_dag_context(
+        self,
+        tmp_path: Path,
+        dag_data: tuple[list[dict[str, str]], dict[str, list[str]]],
+    ) -> None:
+        """Non-EXECUTE cycles do not include DAG Context even if dag_data provided."""
+        for cycle_type in ("PLAN", "ASSESS", "VERIFY"):
+            result = build_cycle_prompt(
+                project_dir=tmp_path,
+                milestone="m01",
+                cycle_type=cycle_type,
+                read_set=["status.md"],
+                dag_data=dag_data,
+            )
+            assert "DAG Context" not in result, f"DAG Context in {cycle_type} prompt"
+
+    def test_dag_context_coexists_with_validation_errors(
+        self,
+        tmp_path: Path,
+        dag_data: tuple[list[dict[str, str]], dict[str, list[str]]],
+    ) -> None:
+        """DAG context and validation errors can both appear in the same prompt."""
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m01",
+            cycle_type="EXECUTE",
+            read_set=["status.md"],
+            dag_data=dag_data,
+            validation_errors=["missing ## Summary"],
+        )
+        assert "## DAG Context" in result
+        assert "WARNING: Previous cycle produced malformed golden context." in result
+        assert "missing ## Summary" in result

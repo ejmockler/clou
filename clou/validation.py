@@ -108,6 +108,10 @@ def validate_golden_context(
 
     Returns findings (empty = valid). Only checks files that exist — the
     coordinator creates files as needed, so missing files are not errors.
+
+    Phases with terminal status ("completed" or "failed") in status.md have
+    ERROR findings on their execution.md downgraded to WARNING — they already
+    passed assessment and should not block progression.
     """
     findings: list[ValidationFinding] = []
     clou_dir = project_dir / ".clou"
@@ -118,14 +122,24 @@ def validate_golden_context(
     if checkpoint.exists():
         findings += _validate_coordinator(checkpoint)
 
+    # Read phase statuses from status.md for terminal-phase exemption.
+    status_path = milestone_dir / "status.md"
+    phase_statuses = _parse_phase_statuses(status_path)
+
     # Per-phase: execution.md — check phase subdirectories (the actual write path)
     # and the flat path for backwards compatibility.
+    # The flat execution.md is not phase-specific — no exemption applied.
     execution_flat = milestone_dir / "execution.md"
     if execution_flat.exists():
         findings += _validate_execution(execution_flat)
 
+    _TERMINAL_STATUSES = frozenset({"completed", "failed"})
     for execution_phase in sorted(milestone_dir.glob("phases/*/execution.md")):
-        findings += _validate_execution(execution_phase)
+        phase_findings = _validate_execution(execution_phase)
+        phase_name = execution_phase.parent.name
+        if phase_statuses.get(phase_name) in _TERMINAL_STATUSES:
+            phase_findings = _downgrade_errors(phase_findings)
+        findings += phase_findings
 
     # Per-milestone: decisions.md
     decisions = milestone_dir / "decisions.md"
@@ -661,6 +675,63 @@ def _split_sections(content: str, header_pattern: str) -> list[str]:
         end = splits[i + 1].start() if i + 1 < len(splits) else len(content)
         blocks.append(content[start:end])
     return blocks
+
+
+def _parse_phase_statuses(status_path: Path) -> dict[str, str]:
+    """Read the Phase Progress table from status.md.
+
+    Returns a mapping of ``{phase_name: status_value}`` (lowercased status).
+    Returns an empty dict when the file does not exist or has no parseable
+    Phase Progress table.
+    """
+    if not status_path.exists():
+        return {}
+    content = status_path.read_text()
+    progress_block = _section_text(content, "## Phase Progress")
+    if not progress_block:
+        for variant in ("## Phase progress", "## phase progress"):
+            progress_block = _section_text(content, variant)
+            if progress_block:
+                break
+    if not progress_block:
+        return {}
+    result: dict[str, str] = {}
+    for line in progress_block.strip().splitlines():
+        if "|" not in line:
+            continue
+        # Skip header and divider rows.
+        if re.match(r"^\s*\|[-\s|:]+\|\s*$", line):
+            continue
+        if re.match(r"^\s*\|.*Phase.*Status", line, re.I):
+            continue
+        cells = [c.strip() for c in line.split("|") if c.strip()]
+        if len(cells) >= 2:
+            phase_name = cells[0].strip().lower()
+            status_val = cells[1].strip().lower()
+            result[phase_name] = status_val
+    return result
+
+
+def _downgrade_errors(
+    findings: list[ValidationFinding],
+) -> list[ValidationFinding]:
+    """Downgrade ERROR findings to WARNING, preserving message and path.
+
+    Used for terminal phases whose execution.md should not block progression.
+    """
+    result: list[ValidationFinding] = []
+    for f in findings:
+        if f.severity == Severity.ERROR:
+            result.append(
+                ValidationFinding(
+                    severity=Severity.WARNING,
+                    message=f.message,
+                    path=f.path,
+                )
+            )
+        else:
+            result.append(f)
+    return result
 
 
 def _check_task_statuses(

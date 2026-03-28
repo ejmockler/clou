@@ -7,13 +7,19 @@ quality — that is ASSESS's job.
 </objective>
 
 <procedure>
-1. Read compose.py — identify the current phase's function(s).
+1. Read the DAG Context section in your prompt — it provides task names,
+   dependencies, and parallel groupings extracted from compose.py. Then
+   read compose.py for function signatures and docstrings.
 2. Read phase.md — narrative context for agent briefings.
 3. Read active/coordinator.md — current phase position.
 
-4. Dispatch loop — for each task group in phase order:
+4. Dispatch loop — use DAG layers for ordering:
 
-   a. gather() group (parallel tasks):
+   Tasks in the same DAG layer have no dependency edges between them —
+   dispatch them as a gather() group. Tasks in later layers depend on
+   earlier layers — dispatch them after their dependencies complete.
+
+   a. gather() group (tasks in same layer):
       - Spawn one agent per function simultaneously.
       - Monitor TaskNotificationMessages.
       - CIRCUIT BREAKER: if any member fails, abort remaining
@@ -21,12 +27,12 @@ quality — that is ASSESS's job.
         with next_step: ASSESS. Exit.
       - Collect all completion states.
 
-   b. Sequential task:
+   b. Sequential task (single-task layer):
       - Spawn one agent.
       - On completion: read execution.md summary status line.
       - CIRCUIT BREAKER: if failures or blockers detected, write
         checkpoint with next_step: ASSESS. Exit.
-      - If clean: proceed to next task.
+      - If clean: proceed to next layer.
 
 5. Agent briefing template for each spawned worker:
    ```
