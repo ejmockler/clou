@@ -356,6 +356,7 @@ _INLINE_FALLBACK = HarnessTemplate(
             "project.md",
             "roadmap.md",
             "requests.md",
+            "understanding.md",
             "milestones/*/milestone.md",
             "milestones/*/requirements.md",
             "milestones/*/escalations/*.md",

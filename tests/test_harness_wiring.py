@@ -162,6 +162,65 @@ def test_build_hooks_template_enforces_permissions() -> None:
     assert not (isinstance(hso, dict) and hso.get("permissionDecision") == "deny")
 
 
+def test_build_hooks_template_supervisor_allows_understanding_md() -> None:
+    """Template-driven hooks allow supervisor to write understanding.md.
+
+    This tests the production code path: build_hooks with template= uses
+    template.write_permissions (not the module-level WRITE_PERMISSIONS).
+    """
+    project_dir = Path("/tmp/test-project")
+    hooks = build_hooks(
+        "supervisor", project_dir,
+        template=software_template,
+    )
+    pre_hooks = hooks["PreToolUse"]
+    assert len(pre_hooks) == 1
+
+    result = _run(
+        pre_hooks[0].hooks[0](
+            {
+                "tool_name": "Write",
+                "tool_input": {
+                    "file_path": str(
+                        project_dir / ".clou" / "understanding.md"
+                    ),
+                },
+            },
+            None,
+            {},
+        )
+    )
+    hso = result.get("hookSpecificOutput", {})
+    assert not (isinstance(hso, dict) and hso.get("permissionDecision") == "deny")
+
+
+def test_build_hooks_template_worker_blocked_from_understanding_md() -> None:
+    """Template-driven hooks block worker from writing understanding.md."""
+    project_dir = Path("/tmp/test-project")
+    hooks = build_hooks(
+        "worker", project_dir,
+        template=software_template,
+    )
+    pre_hooks = hooks["PreToolUse"]
+
+    result = _run(
+        pre_hooks[0].hooks[0](
+            {
+                "tool_name": "Write",
+                "tool_input": {
+                    "file_path": str(
+                        project_dir / ".clou" / "understanding.md"
+                    ),
+                },
+            },
+            None,
+            {},
+        )
+    )
+    hso = result.get("hookSpecificOutput", {})
+    assert isinstance(hso, dict) and hso.get("permissionDecision") == "deny"
+
+
 def test_build_hooks_template_blocks_unauthorized() -> None:
     """Template-driven hooks block unauthorized writes."""
     project_dir = Path("/tmp/test-project")
