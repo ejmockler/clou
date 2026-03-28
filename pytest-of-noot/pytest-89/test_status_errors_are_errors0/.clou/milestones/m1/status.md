@@ -1,2 +1,0 @@
-# Status
-Some text.

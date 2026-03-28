@@ -177,6 +177,39 @@ def test_supervisor_allowed_milestone_md() -> None:
     assert _is_allowed(result)
 
 
+def test_supervisor_allowed_understanding_md() -> None:
+    """Supervisor can write understanding.md."""
+    hook = _get_pre_hook("supervisor")
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/tmp/project/.clou/understanding.md"},
+            },
+            "tool-1",
+            {},
+        )
+    )
+    assert _is_allowed(result)
+
+
+def test_worker_blocked_from_understanding_md() -> None:
+    """Worker cannot write understanding.md — supervisor-only file."""
+    hook = _get_pre_hook("worker")
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/tmp/project/.clou/understanding.md"},
+            },
+            "tool-1",
+            {},
+        )
+    )
+    assert _is_denied(result)
+    assert "worker" in _deny_reason(result)
+
+
 def test_supervisor_blocked_from_compose() -> None:
     hook = _get_pre_hook("supervisor")
     result = _run(

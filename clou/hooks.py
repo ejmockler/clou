@@ -27,6 +27,7 @@ WRITE_PERMISSIONS: dict[str, list[str]] = {
         "project.md",
         "roadmap.md",
         "requests.md",
+        "understanding.md",
         "milestones/*/milestone.md",
         "milestones/*/requirements.md",
         "milestones/*/escalations/*.md",

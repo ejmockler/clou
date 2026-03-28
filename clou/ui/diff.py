@@ -1,8 +1,13 @@
-"""Diff rendering — unified diff to styled Rich Text."""
+"""Diff rendering — unified diff to styled Rich Text.
+
+Also provides ``build_edit_summary`` and ``build_diff_body`` for
+rendering edit tool calls as styled summaries and inline diffs.
+"""
 
 from __future__ import annotations
 
 import difflib
+from pathlib import PurePosixPath
 
 from rich.text import Text
 
@@ -85,6 +90,57 @@ def render_inline_diff(old_string: str, new_string: str) -> Text:
                 first = False
                 result.append(f"+ {line.rstrip()}", style=_GREEN_HEX)
     return result
+
+
+def build_edit_summary(name: str, tool_input: dict[str, object]) -> Text:
+    """Build styled Text for edit tool summaries with colored diff stats."""
+    text = Text()
+    text.append("\u25b8 ", style=_DIM_HEX)
+    fp = str(tool_input.get("file_path", ""))
+    fname = PurePosixPath(fp).name if fp else name
+    adds, rems = 0, 0
+    if name == "Edit":
+        adds, rems = compute_edit_stats(
+            str(tool_input.get("old_string", "")),
+            str(tool_input.get("new_string", "")),
+        )
+    elif name == "MultiEdit":
+        edits = tool_input.get("edits", [])
+        if isinstance(edits, list):
+            adds, rems = compute_multi_edit_stats(edits)
+    text.append(f"{name} {fname}", style=_DIM_HEX)
+    if name == "Write":
+        text.append("  (new)", style=_GREEN_HEX)
+    elif adds or rems:
+        text.append("  ", style="")
+        text.append(f"+{adds}", style=_GREEN_HEX)
+        text.append(" ", style="")
+        text.append(f"\u2212{rems}", style=_ROSE_HEX)
+    return text
+
+
+def build_diff_body(name: str, tool_input: dict[str, object]) -> Text | None:
+    """Build inline diff body for an edit tool disclosure."""
+    if name == "Edit":
+        old = str(tool_input.get("old_string", ""))
+        new = str(tool_input.get("new_string", ""))
+        return render_inline_diff(old, new) if old or new else None
+    if name == "MultiEdit":
+        edits = tool_input.get("edits", [])
+        if not isinstance(edits, list):
+            return None
+        combined = Text()
+        for i, edit in enumerate(edits):
+            if not isinstance(edit, dict):
+                continue
+            old = str(edit.get("old_string", ""))
+            new = str(edit.get("new_string", ""))
+            if old or new:
+                if i > 0 and combined.plain:
+                    combined.append("\n")
+                combined.append_text(render_inline_diff(old, new))
+        return combined if combined.plain else None
+    return None
 
 
 def render_diff(diff_text: str) -> Text:
