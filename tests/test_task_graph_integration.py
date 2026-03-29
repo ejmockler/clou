@@ -181,11 +181,11 @@ class TestAgentSpawnActivatesTask:
             await pilot.pause()
             tg = pilot.app.query_one(TaskGraphWidget)
             assert tg._model is not None
-            assert "agent-x" in tg._model.unmapped_agents
+            assert "completely_unrelated_task" in tg._model.unmapped_agents
 
     @pytest.mark.asyncio
-    async def test_early_spawn_buffered(self) -> None:
-        """ClouAgentSpawned before ClouDagUpdate -> replayed after model created."""
+    async def test_early_spawn_synthetic_model(self) -> None:
+        """ClouAgentSpawned before ClouDagUpdate -> synthetic model visible."""
         async with ClouApp().run_test() as pilot:
             pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
             await pilot.pause()
@@ -198,20 +198,24 @@ class TestAgentSpawnActivatesTask:
             )
             await pilot.pause()
             tg = pilot.app.query_one(TaskGraphWidget)
-            # Model not yet created -- spawn buffered.
-            assert tg._model is None
+            # Synthetic model created — task graph is visible.
+            assert tg._model is not None
+            assert pilot.app._synthetic_dag is True
+            assert "build_model" in tg._model.task_states
+            assert tg._model.task_states["build_model"].status == "active"
             assert len(tg._pending_spawns) == 1
 
-            # Now provide the DAG.
+            # Now provide the real DAG — replaces synthetic model.
             pilot.app.post_message(
                 ClouDagUpdate(tasks=SAMPLE_TASKS, deps=SAMPLE_DEPS)
             )
             await pilot.pause()
+            assert pilot.app._synthetic_dag is False
             assert tg._model is not None
-            state = tg._model.task_states["build_model"]
-            assert state.status == "active"
-            assert state.agent_id == "agent-early"
-            # Buffer should be drained.
+            # Real model has all sample tasks, starting fresh.
+            assert "build_model" in tg._model.task_states
+            assert "build_widget" in tg._model.task_states
+            # Buffer drained.
             assert len(tg._pending_spawns) == 0
 
 
@@ -435,9 +439,8 @@ class TestBreathEventsCoexist:
             )
             await pilot.pause()
             await pilot.pause()
-            # BreathWidget should have processed the spawn.
-            events_after = len(bw._events)
-            assert events_after > events_before
+            # BreathWidget no longer adds a visible event for spawns
+            # (the "dispatching" line comes via ClouBreathEvent instead).
             # TaskGraphWidget should have the task active.
             tg = pilot.app.query_one(TaskGraphWidget)
             assert tg._model is not None
@@ -525,7 +528,7 @@ class TestEscapeFocusTransfer:
     async def test_escape_transfers_focus_to_input(self) -> None:
         """Escape in TaskGraphWidget focuses prompt input."""
         async with ClouApp().run_test() as pilot:
-            from textual.widgets import Input
+            from clou.ui.widgets.prompt_input import ChatInput
 
             pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
             await pilot.pause()
@@ -543,7 +546,7 @@ class TestEscapeFocusTransfer:
             assert tg._focused_index == -1
             # Focus should be on the input widget.
             focused = pilot.app.focused
-            assert isinstance(focused, Input)
+            assert isinstance(focused, ChatInput)
 
 
 # ---------------------------------------------------------------------------

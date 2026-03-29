@@ -18,7 +18,7 @@ class TestCommandPalette:
     @pytest.mark.asyncio
     async def test_palette_appears_on_slash(self) -> None:
         async with ClouApp().run_test() as pilot:
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             inp.value = "/"
             await pilot.pause()
             palette = pilot.app.query_one(CommandPalette)
@@ -27,7 +27,7 @@ class TestCommandPalette:
     @pytest.mark.asyncio
     async def test_palette_filters_on_partial(self) -> None:
         async with ClouApp().run_test() as pilot:
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             inp.value = "/he"
             await pilot.pause()
             palette = pilot.app.query_one(CommandPalette)
@@ -38,7 +38,7 @@ class TestCommandPalette:
     @pytest.mark.asyncio
     async def test_palette_hides_on_no_match(self) -> None:
         async with ClouApp().run_test() as pilot:
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             inp.value = "/xyzzy_nomatch"
             await pilot.pause()
             palette = pilot.app.query_one(CommandPalette)
@@ -47,7 +47,7 @@ class TestCommandPalette:
     @pytest.mark.asyncio
     async def test_palette_hides_on_non_slash(self) -> None:
         async with ClouApp().run_test() as pilot:
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             # First show it.
             inp.value = "/"
             await pilot.pause()
@@ -61,7 +61,7 @@ class TestCommandPalette:
     @pytest.mark.asyncio
     async def test_palette_hides_on_submit(self) -> None:
         async with ClouApp().run_test() as pilot:
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             inp.value = "/help"
             await pilot.pause()
             palette = pilot.app.query_one(CommandPalette)

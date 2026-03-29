@@ -20,7 +20,7 @@ quality gate assessments resolved.
    Then read these files:
    - .clou/milestones/{{milestone}}/phases/verification/execution.md
    - .clou/milestones/{{milestone}}/phases/verification/artifacts/
-   - .clou/milestones/{{milestone}}/requirements.md
+   - .clou/milestones/{{milestone}}/intents.md
 
    Write: .clou/milestones/{{milestone}}/handoff.md
    ```

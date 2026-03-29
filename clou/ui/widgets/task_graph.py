@@ -16,7 +16,7 @@ from typing import ClassVar
 from rich.color import Color
 from rich.segment import Segment
 from rich.style import Style
-from textual.events import Key
+from textual.events import Click, Key
 from textual.reactive import reactive
 from textual.strip import Strip
 from textual.widget import Widget
@@ -187,17 +187,42 @@ class TaskGraphWidget(Widget):
         #: Expansion timestamps: task_name -> monotonic time when expanded.
         self._expansion_states: dict[str, float] = {}
 
+        #: Spawns received before the DAG model exists.
+        self._pending_spawns: list[tuple[str, str]] = []  # (task_id, description)
+
+    # -- sizing --------------------------------------------------------------
+
+    def get_content_height(self, container, viewport, width: int) -> int:
+        """Return row count so ``height: auto`` sizes to content."""
+        return len(self._row_map)
+
     # -- public API ----------------------------------------------------------
+
+    def reset(self) -> None:
+        """Clear all state for a new coordinator session."""
+        self._model = None
+        self._row_map = []
+        self._focused_index = -1
+        self._expanded.clear()
+        self._expansion_states.clear()
+        self._pending_spawns.clear()
+        self.shimmer_active = False
+        self.refresh(layout=True)
 
     def update_model(self, model: TaskGraphModel) -> None:
         """Set or replace the data model and rebuild the row map."""
+        old_height = len(self._row_map)
         self._model = model
         self._rebuild_row_map()
-        # Update shimmer based on whether any task is active.
+        # Update shimmer based on whether any task or unmapped agent is active.
         self.shimmer_active = any(
-            ts.status == "active" for ts in model.task_states.values()
+            ts.status == "active"
+            for ts in list(model.task_states.values())
+            + list(model.unmapped_agents.values())
         )
-        self.refresh()
+        # Trigger relayout when row count changes so Textual re-measures
+        # get_content_height and the widget actually appears / resizes.
+        self.refresh(layout=len(self._row_map) != old_height)
 
     # -- reactive watchers ---------------------------------------------------
 
@@ -255,6 +280,24 @@ class TaskGraphWidget(Widget):
             event.prevent_default()
             event.stop()
 
+    def on_click(self, event: Click) -> None:
+        """Click a task row to focus and toggle its expansion."""
+        y = event.y
+        if y < 0 or y >= len(self._row_map):
+            return
+        row_type, data = self._row_map[y]
+        if row_type == "task":
+            task_name = str(data)
+            # Set focus to the clicked task.
+            task_names = self._task_names_ordered()
+            try:
+                self._focused_index = task_names.index(task_name)
+            except ValueError:
+                return
+            self._toggle_expand()
+            self.focus()
+            event.stop()
+
     def on_focus(self, _event: object) -> None:
         """When widget gains focus, set _focused_index to 0 if tasks exist."""
         if self._focused_index < 0 and self._task_count() > 0:
@@ -286,19 +329,25 @@ class TaskGraphWidget(Widget):
             self._expanded.add(task_name)
             self._expansion_states[task_name] = time.monotonic()
         self._rebuild_row_map()
-        self.refresh()
+        self.refresh(layout=True)
 
     def _defocus(self) -> None:
-        """Remove focus from this widget."""
+        """Remove focus from this widget and return to prompt input."""
         self._focused_index = -1
         self.refresh()
+        try:
+            self.app.query_one("#user-input ChatInput").focus()
+        except Exception:
+            pass
 
     # -- row map construction ------------------------------------------------
 
     def _rebuild_row_map(self) -> None:
         """Compute the flat list of row entries from the model's layers.
 
-        Includes drill-down rows (tool_call, summary) for expanded tasks.
+        Renders tasks with dependency edge connectors between layers
+        instead of phase headers.  Includes drill-down rows for expanded
+        tasks and unmapped agents below the main graph.
         """
         rows: list[_RowEntry] = []
         if self._model is None:
@@ -309,8 +358,8 @@ class TaskGraphWidget(Widget):
             if not layer:
                 continue  # Skip empty layers.
             if layer_idx > 0 and rows:
-                rows.append(("spacer", None))
-            rows.append(("header", layer_idx))
+                # Edge connector between layers shows dependency flow.
+                rows.append(("edge", layer_idx))
             for task_name in layer:
                 rows.append(("task", task_name))
                 # If expanded, add drill-down rows.
@@ -321,6 +370,18 @@ class TaskGraphWidget(Widget):
                             rows.append(("tool_call", (task_name, tc_idx)))
                         if state.summary:
                             rows.append(("summary", task_name))
+
+        # Unmapped agents: active work that doesn't match compose.py tasks.
+        active_unmapped = {
+            name: st
+            for name, st in self._model.unmapped_agents.items()
+            if st.status == "active"
+        }
+        if active_unmapped:
+            if rows:
+                rows.append(("spacer", None))
+            for agent_name in active_unmapped:
+                rows.append(("task", agent_name))
 
         self._row_map = rows
 
@@ -341,8 +402,8 @@ class TaskGraphWidget(Widget):
         if row_type == "spacer":
             return Strip([Segment(" " * width, Style())], width)
 
-        if row_type == "header":
-            return self._render_header(width, data)  # type: ignore[arg-type]
+        if row_type == "edge":
+            return self._render_edge(width, data)  # type: ignore[arg-type]
 
         if row_type == "task":
             task_name = str(data)
@@ -368,18 +429,72 @@ class TaskGraphWidget(Widget):
         focused_name = self._focused_task_name()
         return focused_name == task_name
 
-    def _render_header(self, width: int, layer_index: int) -> Strip:
-        """Render a phase group header line."""
-        # Format: "-- Phase N --" centered, text-muted luminance.
-        label = f"\u2500\u2500 Phase {layer_index + 1} \u2500\u2500"
-        if len(label) < width:
-            label = label + " " * (width - len(label))
-        elif len(label) > width:
-            label = label[:width]
+    def _render_edge(self, width: int, layer_index: int) -> Strip:
+        """Render a dependency edge connector between layers.
+
+        Draws box-drawing characters showing flow from the previous
+        layer into the next.  For fan-out (one parent layer → multiple
+        children) or fan-in (multiple parents → one child) uses
+        branching/merging glyphs.
+        """
+        if self._model is None or width <= 0:
+            return Strip([Segment(" " * max(width, 0), Style())], width)
+
+        layers = self._model.layers
+        deps = self._model.deps
+
+        # How many tasks in the previous and current layers?
+        prev_count = len(layers[layer_index - 1]) if layer_index > 0 else 0
+        curr_count = len(layers[layer_index]) if layer_index < len(layers) else 0
+
+        # Check if there are actual dependency edges crossing this gap.
+        curr_layer = layers[layer_index] if layer_index < len(layers) else []
+        prev_layer = layers[layer_index - 1] if layer_index > 0 else []
+        has_deps = any(
+            any(d in prev_layer for d in deps.get(t, []))
+            for t in curr_layer
+        )
 
         r, g, b = luminance_to_rgb(_TEXT_MUTED_L)
         style = Style(color=Color.from_rgb(r, g, b))
-        segments = [Segment(ch, style) for ch in label]
+
+        if not has_deps:
+            # No edges cross this gap — blank spacer.
+            return Strip([Segment(" " * width, style)], width)
+
+        # Build the connector line.
+        line = list(" " * width)
+        icon_col = 2  # The icon sits at column 2 ("  {icon}")
+
+        if prev_count == 1 and curr_count == 1:
+            # Simple linear: │
+            if icon_col < width:
+                line[icon_col] = "\u2502"  # │
+        elif prev_count == 1 and curr_count > 1:
+            # Fan-out: ├──┐  (one parent splits to multiple children)
+            if icon_col < width:
+                line[icon_col] = "\u251c"  # ├
+            end_col = min(icon_col + 4, width - 1)
+            for x in range(icon_col + 1, end_col):
+                line[x] = "\u2500"  # ─
+            if end_col < width:
+                line[end_col] = "\u2510"  # ┐
+        elif prev_count > 1 and curr_count == 1:
+            # Fan-in: └──┘  (multiple parents merge to one child)
+            if icon_col < width:
+                line[icon_col] = "\u2514"  # └
+            end_col = min(icon_col + 4, width - 1)
+            for x in range(icon_col + 1, end_col):
+                line[x] = "\u2500"  # ─
+            if end_col < width:
+                line[end_col] = "\u2518"  # ┘
+        else:
+            # Many-to-many: just │
+            if icon_col < width:
+                line[icon_col] = "\u2502"  # │
+
+        text = "".join(line)
+        segments = [Segment(ch, style) for ch in text]
         return Strip(segments, width)
 
     def _render_task(
@@ -390,6 +505,8 @@ class TaskGraphWidget(Widget):
             return Strip([Segment(" " * width, Style())], width)
 
         state = self._model.task_states.get(task_name)
+        if state is None:
+            state = self._model.unmapped_agents.get(task_name)
         if state is None:
             return Strip([Segment(" " * width, Style())], width)
 
@@ -485,6 +602,8 @@ class TaskGraphWidget(Widget):
             return Strip([Segment(" " * width, Style())], width)
 
         state = self._model.task_states.get(task_name)
+        if state is None:
+            state = self._model.unmapped_agents.get(task_name)
         if state is None or tc_idx >= len(state.tool_calls):
             return Strip([Segment(" " * width, Style())], width)
 
@@ -511,6 +630,8 @@ class TaskGraphWidget(Widget):
             return Strip([Segment(" " * width, Style())], width)
 
         state = self._model.task_states.get(task_name)
+        if state is None:
+            state = self._model.unmapped_agents.get(task_name)
         if state is None or not state.summary:
             return Strip([Segment(" " * width, Style())], width)
 

@@ -622,3 +622,31 @@ register(
         items_factory=_resume_items_factory,
     )
 )
+
+
+async def _cmd_stop(app: ClouApp, args: str) -> None:
+    """Stop the running coordinator at the next cycle boundary."""
+    if app.mode not in (Mode.BREATH, Mode.DECISION):
+        render_command_output(
+            app,
+            Text("No coordinator running", style=_MUTED_HEX),
+        )
+        return
+    app._stop_requested.set()
+    render_command_output(
+        app,
+        Text(
+            "Stop requested — coordinator will pause at next cycle boundary",
+            style=_GOLD_HEX,
+        ),
+    )
+
+
+register(
+    Command(
+        name="stop",
+        description="stop the running coordinator",
+        handler=_cmd_stop,
+        modes=frozenset({Mode.BREATH, Mode.DECISION}),
+    )
+)

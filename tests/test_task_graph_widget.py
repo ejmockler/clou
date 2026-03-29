@@ -131,17 +131,17 @@ class TestTaskRowWidth:
                 return
         raise AssertionError("No task row found")
 
-    def test_header_matches_width(self) -> None:
+    def test_edge_matches_width(self) -> None:
         w = _make_sized_widget(80)
         model = _make_model()
         w.update_model(model)
         for y in range(len(w._row_map)):
             row_type, _ = w._row_map[y]
-            if row_type == "header":
+            if row_type == "edge":
                 strip = w.render_line(y)
                 assert strip.cell_length == 80
                 return
-        raise AssertionError("No header row found")
+        raise AssertionError("No edge row found")
 
 
 # ---------------------------------------------------------------------------
@@ -407,26 +407,25 @@ class TestShimmerOnActiveRow:
 # ---------------------------------------------------------------------------
 
 
-class TestPhaseGrouping:
-    """Tasks grouped by dependency layer."""
+class TestEdgeConnectors:
+    """Tasks connected by dependency edge lines instead of phase headers."""
 
     def test_three_layer_model(self) -> None:
         model = _make_model()
-        # build_model has 0 deps -> layer 0
-        # build_widget depends on build_model -> layer 1
-        # integrate depends on build_widget -> layer 2
+        # build_model (layer 0) → build_widget (layer 1) → integrate (layer 2)
         assert len(model.layers) == 3
 
         w = _make_sized_widget(80)
         w.update_model(model)
 
-        # Row map should have: header, task, spacer, header, task, spacer, header, task
         row_types = [rt for rt, _ in w._row_map]
-        assert row_types.count("header") == 3
+        # task, edge, task, edge, task
+        assert row_types.count("edge") == 2
         assert row_types.count("task") == 3
+        assert row_types.count("header") == 0
 
     def test_single_layer_model(self) -> None:
-        """All independent tasks go in one layer -- one header."""
+        """All independent tasks in one layer -- no edges."""
         model = TaskGraphModel(
             tasks=[{"name": "a"}, {"name": "b"}, {"name": "c"}],
             deps={"a": [], "b": [], "c": []},
@@ -437,44 +436,37 @@ class TestPhaseGrouping:
         w.update_model(model)
 
         row_types = [rt for rt, _ in w._row_map]
-        assert row_types.count("header") == 1
+        assert row_types.count("edge") == 0
         assert row_types.count("task") == 3
-        # No spacers for single group.
-        assert row_types.count("spacer") == 0
 
-    def test_header_contains_phase_number(self) -> None:
+    def test_edge_contains_box_drawing(self) -> None:
+        """Edge rows render box-drawing connector characters."""
         w = _make_sized_widget(80)
         model = _make_model()
         w.update_model(model)
         for y in range(len(w._row_map)):
             row_type, data = w._row_map[y]
-            if row_type == "header" and data == 0:
+            if row_type == "edge":
                 strip = w.render_line(y)
                 text = _strip_text(strip)
-                assert "Phase 1" in text
+                # Should contain a box-drawing character, not "Phase".
+                assert "Phase" not in text
+                assert any(
+                    ch in text for ch in "\u2502\u251c\u2514\u2500"
+                ), f"No box-drawing char in edge: {text!r}"
                 return
-        raise AssertionError("No Phase 1 header found")
+        raise AssertionError("No edge row found")
 
-    def test_tasks_appear_after_their_header(self) -> None:
-        """Within each group, tasks follow their header."""
+    def test_tasks_preserve_layer_order(self) -> None:
+        """Tasks appear in dependency-layer order."""
         w = _make_sized_widget(80)
         model = _make_model()
         w.update_model(model)
 
-        last_header_layer = -1
-        for row_type, data in w._row_map:
-            if row_type == "header":
-                last_header_layer = data  # type: ignore[assignment]
-            elif row_type == "task":
-                # This task should belong to the current layer.
-                task_name = str(data)
-                # Find which layer this task is in.
-                task_layer = None
-                for li, layer in enumerate(model.layers):
-                    if task_name in layer:
-                        task_layer = li
-                        break
-                assert task_layer == last_header_layer
+        task_order = [
+            str(data) for rt, data in w._row_map if rt == "task"
+        ]
+        assert task_order == ["build_model", "build_widget", "integrate"]
 
 
 # ---------------------------------------------------------------------------

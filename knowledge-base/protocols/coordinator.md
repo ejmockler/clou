@@ -10,7 +10,7 @@ The coordinator is NOT a dispatcher. It does not simply assign work and collect 
 
 ```
 1. INITIALIZE
-   a. Read milestone.md, requirements.md, project.md
+   a. Read milestone.md, intents.md, requirements.md, project.md
    b. Read active/coordinator.md if resuming from crash
    c. Establish delegated authority boundaries
 
@@ -95,7 +95,7 @@ The coordinator is NOT a dispatcher. It does not simply assign work and collect 
 The coordinator exits when ALL of:
 
 - [ ] All implementation phases complete
-- [ ] Acceptance criteria from `requirements.md` are met
+- [ ] Observable outcomes from `intents.md` are met
 - [ ] Quality gate code assessment has been run and all findings resolved (accepted or overridden with reasoning)
 - [ ] Verification phase has produced `handoff.md` with confirmed golden paths
 - [ ] Quality gate experience assessment has been run within VERIFY and all findings resolved
@@ -138,10 +138,10 @@ New cycle groups are prepended at the top of the file — most recent judgments 
 Each coordinator cycle (PLAN, EXECUTE, ASSESS, VERIFY, EXIT) runs as a **fresh session**. The golden context is the sole state transfer mechanism between cycles — no reliance on SDK context compression or conversational continuity. The orchestrator reads `active/coordinator.md` between cycles, determines the next cycle type, and constructs a targeted prompt pointing to the specific golden context files needed.
 
 **What the coordinator reads per cycle** (only what's needed for that cycle type):
-- PLAN: milestone.md, requirements.md, project.md
+- PLAN: milestone.md, intents.md, requirements.md, project.md
 - EXECUTE: status.md, compose.py, current phase's phase.md, active/coordinator.md
 - ASSESS: status.md, compose.py, current phase's execution.md, requirements.md, decisions.md
-- VERIFY: status.md, requirements.md, compose.py, active/coordinator.md
+- VERIFY: status.md, intents.md, compose.py, active/coordinator.md
 - EXIT: status.md, handoff.md, decisions.md, active/coordinator.md
 
 **What the coordinator does NOT read:**

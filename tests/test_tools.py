@@ -233,11 +233,15 @@ def test_init_load_prompt_works_without_init(tmp_path: Path) -> None:
 def test_create_milestone_happy_path(tmp_path: Path) -> None:
     (tmp_path / ".clou" / "milestones").mkdir(parents=True)
     result = asyncio.run(
-        clou_create_milestone(tmp_path, "m01-auth", "# Auth", "# Requirements\n")
+        clou_create_milestone(
+            tmp_path, "m01-auth", "# Auth", "# Requirements\n",
+            intents_content="When user logs in, they see a dashboard\n",
+        )
     )
     ms_dir = tmp_path / ".clou" / "milestones" / "m01-auth"
     assert ms_dir.is_dir()
     assert (ms_dir / "milestone.md").read_text() == "# Auth"
+    assert (ms_dir / "intents.md").read_text() == "When user logs in, they see a dashboard\n"
     assert (ms_dir / "requirements.md").read_text() == "# Requirements\n"
     assert "m01-auth" in result
 
@@ -264,19 +268,21 @@ def test_create_milestone_content_preserved(tmp_path: Path) -> None:
     """Verify exact content written matches input, including whitespace."""
     content_ms = "# My Milestone\n\nDetailed description.\n"
     content_req = "# Requirements\n\n- Req 1\n- Req 2\n"
+    content_int = "When user opens the app, they see a welcome screen\n"
     asyncio.run(
-        clou_create_milestone(tmp_path, "m01-auth", content_ms, content_req)
+        clou_create_milestone(tmp_path, "m01-auth", content_ms, content_req, content_int)
     )
     ms_dir = tmp_path / ".clou" / "milestones" / "m01-auth"
     assert (ms_dir / "milestone.md").read_text() == content_ms
+    assert (ms_dir / "intents.md").read_text() == content_int
     assert (ms_dir / "requirements.md").read_text() == content_req
 
 
 def test_create_milestone_does_not_create_subdirs(tmp_path: Path) -> None:
-    """Tool creates only milestone.md and requirements.md, not phases/ or escalations/."""
+    """Tool creates milestone.md, intents.md, and requirements.md only."""
     asyncio.run(
         clou_create_milestone(tmp_path, "m01-auth", "# Auth", "# Req")
     )
     ms_dir = tmp_path / ".clou" / "milestones" / "m01-auth"
     children = sorted(f.name for f in ms_dir.iterdir())
-    assert children == ["milestone.md", "requirements.md"]
+    assert children == ["intents.md", "milestone.md", "requirements.md"]

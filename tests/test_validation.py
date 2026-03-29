@@ -13,11 +13,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from clou.harness import ArtifactForm
 from clou.validation import (
+    ANTI_PATTERN_KEYS,
     Severity,
     ValidationFinding,
+    _template_to_regex,
     errors_only,
+    validate_artifact_form,
+    validate_delivery,
     validate_golden_context,
+    validate_readiness,
     warnings_only,
 )
 
@@ -70,7 +76,7 @@ phases_total: 3
 
 
 def test_valid_coordinator(tmp_path: Path) -> None:
-    _write(tmp_path / ".clou" / "active" / "coordinator.md", VALID_CHECKPOINT)
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", VALID_CHECKPOINT)
     assert validate_golden_context(tmp_path, "m1") == []
 
 
@@ -78,7 +84,7 @@ def test_coordinator_missing_required_key(tmp_path: Path) -> None:
     """Missing a required key produces an error per missing key."""
     # Missing step and next_step
     content = "cycle: 1\ncurrent_phase: p1\nphases_completed: 0\nphases_total: 1\n"
-    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     findings = validate_golden_context(tmp_path, "m1")
     msgs = _messages(findings)
     assert any("missing required key 'step'" in m for m in msgs)
@@ -88,7 +94,7 @@ def test_coordinator_missing_required_key(tmp_path: Path) -> None:
 def test_coordinator_invalid_step(tmp_path: Path) -> None:
     """Invalid step value is rejected."""
     content = VALID_CHECKPOINT.replace("step: ASSESS", "step: BANANA")
-    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     findings = validate_golden_context(tmp_path, "m1")
     msgs = _messages(findings)
     assert any("invalid step 'BANANA'" in m for m in msgs)
@@ -97,7 +103,7 @@ def test_coordinator_invalid_step(tmp_path: Path) -> None:
 def test_coordinator_invalid_next_step(tmp_path: Path) -> None:
     """Invalid next_step value is rejected."""
     content = VALID_CHECKPOINT.replace("next_step: VERIFY", "next_step: NOPE")
-    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     findings = validate_golden_context(tmp_path, "m1")
     msgs = _messages(findings)
     assert any("invalid next_step 'NOPE'" in m for m in msgs)
@@ -106,7 +112,7 @@ def test_coordinator_invalid_next_step(tmp_path: Path) -> None:
 def test_coordinator_non_integer_cycle(tmp_path: Path) -> None:
     """Non-integer cycle value is rejected."""
     content = VALID_CHECKPOINT.replace("cycle: 3", "cycle: boom")
-    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     findings = validate_golden_context(tmp_path, "m1")
     msgs = _messages(findings)
     assert any("must be an integer" in m for m in msgs)
@@ -115,7 +121,7 @@ def test_coordinator_non_integer_cycle(tmp_path: Path) -> None:
 def test_coordinator_negative_phases(tmp_path: Path) -> None:
     """Negative integer values are rejected."""
     content = VALID_CHECKPOINT.replace("phases_completed: 2", "phases_completed: -1")
-    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     findings = validate_golden_context(tmp_path, "m1")
     msgs = _messages(findings)
     assert any("non-negative" in m for m in msgs)
@@ -124,7 +130,7 @@ def test_coordinator_negative_phases(tmp_path: Path) -> None:
 def test_coordinator_completed_exceeds_total(tmp_path: Path) -> None:
     """phases_completed > phases_total is rejected."""
     content = VALID_CHECKPOINT.replace("phases_completed: 2", "phases_completed: 5")
-    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     findings = validate_golden_context(tmp_path, "m1")
     msgs = _messages(findings)
     assert any("exceeds phases_total" in m for m in msgs)
@@ -133,7 +139,7 @@ def test_coordinator_completed_exceeds_total(tmp_path: Path) -> None:
 def test_coordinator_all_keys_missing(tmp_path: Path) -> None:
     """Content with no key-value pairs produces errors for all required keys."""
     _write(
-        tmp_path / ".clou" / "active" / "coordinator.md",
+        tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md",
         "# Coordinator\nJust some text.\n",
     )
     findings = validate_golden_context(tmp_path, "m1")
@@ -145,14 +151,14 @@ def test_coordinator_valid_next_step_rework(tmp_path: Path) -> None:
     content = VALID_CHECKPOINT.replace(
         "next_step: VERIFY", "next_step: EXECUTE (rework)"
     )
-    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     assert validate_golden_context(tmp_path, "m1") == []
 
 
 def test_coordinator_valid_next_step_complete(tmp_path: Path) -> None:
     """'COMPLETE' is a valid next_step."""
     content = VALID_CHECKPOINT.replace("next_step: VERIFY", "next_step: COMPLETE")
-    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     assert validate_golden_context(tmp_path, "m1") == []
 
 
@@ -767,7 +773,7 @@ No findings.
 def test_multiple_files_all_valid(tmp_path: Path) -> None:
     """All golden context files present and valid."""
     _write(
-        tmp_path / ".clou" / "active" / "coordinator.md",
+        tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md",
         VALID_CHECKPOINT,
     )
     _write(
@@ -792,7 +798,7 @@ def test_multiple_files_all_valid(tmp_path: Path) -> None:
 def test_multiple_files_multiple_errors(tmp_path: Path) -> None:
     """Errors from different files are all collected."""
     _write(
-        tmp_path / ".clou" / "active" / "coordinator.md",
+        tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md",
         "Nothing useful.\n",
     )
     _write(
@@ -911,7 +917,7 @@ def test_phase_level_and_flat_both_checked(tmp_path: Path) -> None:
 def test_checkpoint_errors_are_errors(tmp_path: Path) -> None:
     """Missing keys and bad enums in coordinator checkpoint produce ERROR severity."""
     content = "cycle: 1\ncurrent_phase: p1\nphases_completed: 0\nphases_total: 1\n"
-    _write(tmp_path / ".clou" / "active" / "coordinator.md", content)
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     findings = validate_golden_context(tmp_path, "m1")
     assert all(f.severity == Severity.ERROR for f in findings)
     assert len(findings) >= 2  # at least step and next_step missing
@@ -1293,3 +1299,438 @@ status: completed
     warns = warnings_only(findings)
     assert len(errs) >= 1  # roadmap missing milestones
     assert len(warns) >= 1  # task invalid status
+
+
+# ---------------------------------------------------------------------------
+# ArtifactForm validation (DB-14)
+# ---------------------------------------------------------------------------
+
+_INTENTS_FORM = ArtifactForm(
+    criterion_template="When {trigger}, {observable_outcome}",
+    anti_patterns=(
+        "file paths or module names as criterion subject",
+        "implementation verbs (extract, refactor, build) as criterion",
+    ),
+)
+
+
+class TestTemplateToRegex:
+    """_template_to_regex converts criterion templates to matching regexes."""
+
+    def test_simple_template(self) -> None:
+        pat = _template_to_regex("When {trigger}, {observable_outcome}")
+        assert pat.match("When the user logs in, they see a dashboard")
+        assert pat.match("- When the user logs in, they see a dashboard")
+        assert pat.match("* When agents complete, the graph updates")
+
+    def test_case_insensitive(self) -> None:
+        pat = _template_to_regex("When {trigger}, {observable_outcome}")
+        assert pat.match("when the user logs in, they see a dashboard")
+        assert pat.match("WHEN THE USER LOGS IN, THEY SEE A DASHBOARD")
+
+    def test_no_match_without_template_structure(self) -> None:
+        pat = _template_to_regex("When {trigger}, {observable_outcome}")
+        assert not pat.match("TaskGraphWidget with keyboard nav")
+        assert not pat.match("Extract the TurnController")
+
+    def test_template_with_special_chars(self) -> None:
+        pat = _template_to_regex("Given {ctx}, when {act}, then {out}")
+        assert pat.match("Given a logged-in user, when they click save, then data persists")
+
+
+class TestValidateArtifactForm:
+    """validate_artifact_form checks content against ArtifactForm."""
+
+    def test_valid_intents(self) -> None:
+        content = "- When the user opens the app, they see a dashboard\n"
+        findings = validate_artifact_form(content, _INTENTS_FORM, "intents.md")
+        assert len(findings) == 0
+
+    def test_empty_content_warns(self) -> None:
+        findings = validate_artifact_form("", _INTENTS_FORM, "intents.md")
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.WARNING
+        assert "empty" in findings[0].message
+
+    def test_no_criteria_lines_warns(self) -> None:
+        content = "# Just a header\n\nSome preamble text.\n"
+        findings = validate_artifact_form(content, _INTENTS_FORM, "intents.md")
+        assert any("no criteria" in f.message for f in findings)
+
+    def test_non_matching_criterion_warns(self) -> None:
+        content = "- TaskGraphWidget with keyboard nav\n"
+        findings = validate_artifact_form(content, _INTENTS_FORM, "intents.md")
+        assert any("does not match" in f.message for f in findings)
+
+    def test_preamble_not_flagged(self) -> None:
+        content = (
+            "# Intents\n"
+            "These are the observable outcomes:\n\n"
+            "- When the user opens the app, they see a dashboard\n"
+        )
+        findings = validate_artifact_form(content, _INTENTS_FORM, "intents.md")
+        assert len(findings) == 0
+
+    def test_file_path_anti_pattern(self) -> None:
+        content = "- When user edits clou/ui/app.py, changes are reflected\n"
+        findings = validate_artifact_form(content, _INTENTS_FORM, "intents.md")
+        assert any("file path" in f.message for f in findings)
+
+    def test_implementation_artifact_anti_pattern(self) -> None:
+        content = "- When widget TaskGraph renders, it shows status\n"
+        findings = validate_artifact_form(content, _INTENTS_FORM, "intents.md")
+        assert any("implementation artifact" in f.message for f in findings)
+
+    def test_implementation_verb_anti_pattern(self) -> None:
+        content = "- Extract the TurnController into standalone module\n"
+        findings = validate_artifact_form(content, _INTENTS_FORM, "intents.md")
+        assert any("implementation verb" in f.message for f in findings)
+
+    def test_required_sections(self) -> None:
+        form = ArtifactForm(sections=("Functional", "Non-Functional"))
+        content = "# Functional\n- stuff\n"
+        findings = validate_artifact_form(content, form, "test.md")
+        assert any("Non-Functional" in f.message for f in findings)
+
+    def test_all_sections_present_passes(self) -> None:
+        form = ArtifactForm(sections=("Functional", "Non-Functional"))
+        content = "## Functional\n- stuff\n## Non-Functional\n- more\n"
+        findings = validate_artifact_form(content, form, "test.md")
+        assert len(findings) == 0
+
+    def test_form_with_no_constraints_passes(self) -> None:
+        form = ArtifactForm()
+        findings = validate_artifact_form("anything goes", form, "test.md")
+        assert len(findings) == 0
+
+
+class TestAntiPatternKeys:
+    """ANTI_PATTERN_KEYS is consistent with _ANTI_PATTERN_MATCHERS."""
+
+    def test_known_keys_exist(self) -> None:
+        assert "file path" in ANTI_PATTERN_KEYS
+        assert "implementation" in ANTI_PATTERN_KEYS
+        assert "file inspection" in ANTI_PATTERN_KEYS
+
+    def test_validate_template_catches_unknown_keys(self) -> None:
+        from clou.harness import HarnessTemplate, validate_template
+
+        tmpl = HarnessTemplate(
+            name="test",
+            description="test",
+            agents={},
+            quality_gates=[],
+            verification_modalities=[],
+            mcp_servers={},
+            write_permissions={},
+            artifact_forms={
+                "intents": ArtifactForm(
+                    anti_patterns=("SQL injection patterns",),
+                ),
+            },
+        )
+        errors = validate_template(tmpl)
+        assert any("SQL injection" in e for e in errors)
+
+    def test_validate_template_passes_known_keys(self) -> None:
+        from clou.harness import HarnessTemplate, validate_template
+
+        tmpl = HarnessTemplate(
+            name="test",
+            description="test",
+            agents={},
+            quality_gates=[],
+            verification_modalities=[],
+            mcp_servers={},
+            write_permissions={},
+            artifact_forms={
+                "intents": ArtifactForm(
+                    anti_patterns=("file paths in criteria",),
+                ),
+            },
+        )
+        errors = validate_template(tmpl)
+        assert not any("anti-pattern" in e for e in errors)
+
+
+class TestValidateGoldenContextWithTemplate:
+    """validate_golden_context with template drives ArtifactForm validation."""
+
+    def test_intents_validated_via_template(self, tmp_path: Path) -> None:
+        """intents.md with bad content produces warnings when template provided."""
+        from clou.harness import HarnessTemplate
+
+        ms_dir = tmp_path / ".clou" / "milestones" / "m1"
+        ms_dir.mkdir(parents=True)
+        _write(ms_dir / "intents.md", "- Extract the TurnController\n")
+        tmpl = HarnessTemplate(
+            name="test",
+            description="test",
+            agents={},
+            quality_gates=[],
+            verification_modalities=[],
+            mcp_servers={},
+            write_permissions={},
+            artifact_forms={
+                "intents": ArtifactForm(
+                    criterion_template="When {trigger}, {observable_outcome}",
+                    anti_patterns=("implementation verbs",),
+                ),
+            },
+        )
+        findings = validate_golden_context(tmp_path, "m1", template=tmpl)
+        warns = warnings_only(findings)
+        assert any("does not match" in w.message for w in warns)
+        assert any("implementation verb" in w.message for w in warns)
+
+    def test_no_template_skips_form_validation(self, tmp_path: Path) -> None:
+        """Without template, intents.md is not form-validated."""
+        ms_dir = tmp_path / ".clou" / "milestones" / "m1"
+        ms_dir.mkdir(parents=True)
+        _write(ms_dir / "intents.md", "- totally invalid stuff\n")
+        findings = validate_golden_context(tmp_path, "m1")
+        # No template → no artifact form warnings.
+        assert not any("does not match" in f.message for f in findings)
+
+
+class TestFileInspectionAntiPattern:
+    """The file_inspection anti-pattern fires on inspection-style criteria."""
+
+    def test_file_exists_flagged(self) -> None:
+        form = ArtifactForm(
+            anti_patterns=("criteria verifiable by file inspection alone",),
+        )
+        content = "- When the module exists, the system works\n"
+        findings = validate_artifact_form(content, form, "intents.md")
+        assert any("file inspection" in f.message for f in findings)
+
+    def test_file_contains_flagged(self) -> None:
+        form = ArtifactForm(
+            anti_patterns=("criteria verifiable by file inspection alone",),
+        )
+        content = "- When the directory contains tests, coverage is high\n"
+        findings = validate_artifact_form(content, form, "intents.md")
+        assert any("file inspection" in f.message for f in findings)
+
+
+class TestBoldTextNotCaptured:
+    """Bold markdown text (**Note:**) should not be treated as criteria."""
+
+    def test_bold_note_not_flagged(self) -> None:
+        form = ArtifactForm(
+            criterion_template="When {trigger}, {observable_outcome}",
+        )
+        content = "**Note:** This is context.\n- When user logs in, they see home\n"
+        findings = validate_artifact_form(content, form, "intents.md")
+        assert len(findings) == 0
+
+
+# ---------------------------------------------------------------------------
+# Communication validation — delivery and readiness
+# ---------------------------------------------------------------------------
+
+
+class TestValidateDelivery:
+    """Post-cycle delivery verification — did the coordinator write its state?"""
+
+    def test_both_present(self, tmp_path: Path) -> None:
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        cp.write_text("cycle: 1\n")
+        (milestone_dir / "status.md").write_text("phase: p1\n")
+
+        assert validate_delivery(milestone_dir, cp, "m1") == []
+
+    def test_checkpoint_missing(self, tmp_path: Path) -> None:
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        (milestone_dir / "status.md").write_text("phase: p1\n")
+        cp = milestone_dir / "active" / "coordinator.md"
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.ERROR
+        assert "checkpoint not delivered" in findings[0].message
+        assert findings[0].path == "milestones/m1/active/coordinator.md"
+
+    def test_status_missing(self, tmp_path: Path) -> None:
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        cp.write_text("cycle: 1\n")
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.ERROR
+        assert "status not delivered" in findings[0].message
+        assert findings[0].path == "milestones/m1/status.md"
+
+    def test_both_missing(self, tmp_path: Path) -> None:
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        assert len(findings) == 2
+        assert all(f.severity == Severity.ERROR for f in findings)
+
+    def test_delivery_matching_next_step(self, tmp_path: Path) -> None:
+        """Both files have same next_step -> no cross-validation finding."""
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        cp.write_text(
+            "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: impl\nphases_completed: 1\nphases_total: 3\n"
+        )
+        _write(
+            milestone_dir / "status.md",
+            "## Current State\nphase: impl\ncycle: 2\nnext_step: ASSESS\n"
+            "## Phase Progress\n| Phase | Status |\n|---|---|\n| impl | in_progress |\n",
+        )
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        assert findings == []
+
+    def test_delivery_divergent_next_step(self, tmp_path: Path) -> None:
+        """Different next_step -> ERROR finding."""
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        cp.write_text(
+            "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: impl\nphases_completed: 1\nphases_total: 3\n"
+        )
+        _write(
+            milestone_dir / "status.md",
+            "## Current State\nphase: impl\ncycle: 2\nnext_step: VERIFY\n"
+            "## Phase Progress\n| Phase | Status |\n|---|---|\n| impl | in_progress |\n",
+        )
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.ERROR
+        assert "diverges" in findings[0].message
+        assert "VERIFY" in findings[0].message
+        assert "ASSESS" in findings[0].message
+        assert findings[0].path == "milestones/m1/active/coordinator.md"
+
+    def test_delivery_status_missing_next_step(self, tmp_path: Path) -> None:
+        """status.md lacks next_step -> no cross-validation finding (graceful skip)."""
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        cp.write_text(
+            "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: impl\nphases_completed: 1\nphases_total: 3\n"
+        )
+        _write(
+            milestone_dir / "status.md",
+            "## Current State\nphase: impl\ncycle: 2\n"
+            "## Phase Progress\n| Phase | Status |\n|---|---|\n| impl | in_progress |\n",
+        )
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        assert findings == []
+
+
+class TestValidateReadiness:
+    """Pre-cycle readiness verification — can the next cycle proceed?"""
+
+    def test_all_files_present(self, tmp_path: Path) -> None:
+        clou = tmp_path / ".clou"
+        md = clou / "milestones" / "m1"
+        _write(md / "status.md", "ok")
+        _write(md / "compose.py", "ok")
+
+        findings = validate_readiness(
+            clou, md, ["status.md", "compose.py"], "EXECUTE", "m1",
+        )
+        assert findings == []
+
+    def test_structural_file_missing_is_error(self, tmp_path: Path) -> None:
+        clou = tmp_path / ".clou"
+        md = clou / "milestones" / "m1"
+        _write(md / "status.md", "ok")
+
+        findings = validate_readiness(
+            clou, md, ["status.md", "compose.py"], "EXECUTE", "m1",
+        )
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.ERROR
+        assert "compose.py" in findings[0].message
+        assert findings[0].path == "milestones/m1/compose.py"
+
+    def test_narrative_file_missing_is_warning(self, tmp_path: Path) -> None:
+        clou = tmp_path / ".clou"
+        md = clou / "milestones" / "m1"
+        _write(md / "status.md", "ok")
+
+        findings = validate_readiness(
+            clou, md, ["status.md", "decisions.md"], "ASSESS", "m1",
+        )
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.WARNING
+        assert "decisions.md" in findings[0].message
+        assert findings[0].path == "milestones/m1/decisions.md"
+
+    def test_empty_read_set(self, tmp_path: Path) -> None:
+        clou = tmp_path / ".clou"
+        md = clou / "milestones" / "m1"
+        md.mkdir(parents=True)
+        assert validate_readiness(clou, md, [], "COMPLETE", "m1") == []
+
+    def test_checkpoint_missing_is_error(self, tmp_path: Path) -> None:
+        clou = tmp_path / ".clou"
+        md = clou / "milestones" / "m1"
+        md.mkdir(parents=True)
+
+        findings = validate_readiness(
+            clou, md, ["active/coordinator.md"], "EXECUTE", "m1",
+        )
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.ERROR
+
+    def test_status_missing_is_error(self, tmp_path: Path) -> None:
+        """status.md is structural — its absence blocks the cycle."""
+        clou = tmp_path / ".clou"
+        md = clou / "milestones" / "m1"
+        _write(md / "compose.py", "ok")
+
+        findings = validate_readiness(
+            clou, md, ["status.md", "compose.py"], "EXECUTE", "m1",
+        )
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.ERROR
+        assert "status.md" in findings[0].message
+
+    def test_root_scoped_project_md(self, tmp_path: Path) -> None:
+        """project.md resolves under clou_dir, not milestone_dir."""
+        clou = tmp_path / ".clou"
+        md = clou / "milestones" / "m1"
+        md.mkdir(parents=True)
+        _write(clou / "project.md", "ok")
+        _write(md / "milestone.md", "ok")
+
+        findings = validate_readiness(
+            clou, md, ["milestone.md", "project.md"], "PLAN", "m1",
+        )
+        assert findings == []
+
+    def test_root_scoped_project_md_missing(self, tmp_path: Path) -> None:
+        """Missing root-scoped project.md — WARNING, path is .clou/-relative."""
+        clou = tmp_path / ".clou"
+        md = clou / "milestones" / "m1"
+        md.mkdir(parents=True)
+
+        findings = validate_readiness(clou, md, ["project.md"], "PLAN", "m1")
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.WARNING
+        # Root-scoped paths stay as-is (already .clou/-relative).
+        assert findings[0].path == "project.md"

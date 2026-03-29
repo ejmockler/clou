@@ -8,15 +8,17 @@ phase specifications and initial status.
 
 <procedure>
 1. Read milestone.md for scope and boundaries.
-2. Read requirements.md for acceptance criteria.
-3. Read project.md for coding conventions, tech stack, existing code.
+2. Read intents.md for observable outcomes — these orient your
+   decomposition toward what a person sees when the milestone succeeds.
+3. Read requirements.md for implementation constraints.
+4. Read project.md for coding conventions, tech stack, existing code.
 
-4. Decompose into phases. Each phase is a coherent unit of work:
+5. Decompose into phases. Each phase is a coherent unit of work:
    - Independent phases can use gather() for parallel execution.
    - Dependent phases are sequential — typed inputs from prior phases.
    - Keep phases small enough to complete in one EXECUTE cycle.
 
-5. Write compose.py — typed-function call graph:
+6. Write compose.py — typed-function call graph:
    ```python
    async def implement_auth(user_model: UserModel) -> AuthService:
        """Implement authentication service.
@@ -24,7 +26,7 @@ phase specifications and initial status.
 
    async def implement_api(auth: AuthService) -> APILayer:
        """Build API endpoints.
-       Criteria: all endpoints in requirements.md implemented."""
+       Criteria: all endpoints from intents.md observable and functional."""
 
    async def execute():
        user_model = await setup_schema()
@@ -36,15 +38,15 @@ phase specifications and initial status.
    - Type annotations express dependencies between tasks.
    - Only awaited calls in execute() are dispatched — helpers are structural.
 
-6. Write phase specs: .clou/milestones/{milestone}/phases/{phase}/phase.md
+7. Write phase specs: .clou/milestones/{milestone}/phases/{phase}/phase.md
    for each phase. Include: scope, relevant context, what the agent
    needs to know about the domain.
 
-7. Write initial status.md with all phases listed as pending.
+8. Write initial status.md with all phases listed as pending.
 
-8. Write decisions.md entry for PLAN cycle with decomposition reasoning.
+9. Write decisions.md entry for PLAN cycle with decomposition reasoning.
 
-9. Write checkpoint to active/coordinator.md:
+10. Write checkpoint to active/coordinator.md:
    - cycle: 1
    - step: PLAN
    - next_step: EXECUTE

@@ -201,6 +201,25 @@ class ClouCycleComplete(Message):
         super().__init__()
 
 
+class ClouCoordinatorPaused(Message):
+    """Coordinator paused at cycle boundary — user message pending."""
+
+    def __init__(self, cycle_num: int, reason: str) -> None:
+        self.cycle_num = cycle_num
+        self.reason = reason
+        super().__init__()
+
+
+class ClouBudgetWarning(Message):
+    """Budget threshold crossed."""
+
+    def __init__(self, spent_usd: float, budget_usd: float, pct: int) -> None:
+        self.spent_usd = spent_usd
+        self.budget_usd = budget_usd
+        self.pct = pct
+        super().__init__()
+
+
 class ClouCoordinatorComplete(Message):
     """Coordinator finished for milestone."""
 

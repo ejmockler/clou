@@ -7,7 +7,7 @@ it and configures agent definitions, hooks, and MCP servers accordingly.
 
 Public API:
     HarnessTemplate, AgentSpec, QualityGateSpec, MCPServerSpec,
-    ComposeConventions — schema dataclasses
+    ComposeConventions, ArtifactForm — schema dataclasses
     load_template(name) -> HarnessTemplate — load by name with fallback
     validate_template(template) -> list[str] — structural validation
     read_template_name(project_dir) -> str — read from project.md
@@ -82,8 +82,35 @@ class ComposeConventions:
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactForm:
+    """Cognitive affordance for a golden context artifact.
+
+    Not a schema — a generative constraint.  The form makes the right
+    kind of thinking natural and the wrong kind feel out of place.
+    Hutchins (1995): cognitive artifacts reorganise cognition through
+    structure, not content.  See DB-14.
+
+    Attributes:
+        sections: Required section headers (empty = no section constraint).
+        criterion_template: Template for individual entries, e.g.
+            ``"When {trigger}, {observable_outcome}"``.
+        anti_patterns: Descriptions of content that indicates
+            wrong-level thinking (surfaced in prompts, checked in
+            narrative-tier validation).
+    """
+
+    sections: tuple[str, ...] = ()
+    criterion_template: str | None = None
+    anti_patterns: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class HarnessTemplate:
-    """Complete harness template — a capability profile for a domain."""
+    """Complete harness template — a cognitive architecture profile.
+
+    Specifies both what agents *can do* (capabilities) and what
+    artifacts *shape their thinking* (forms).  See DB-11 and DB-14.
+    """
 
     name: str
     description: str
@@ -95,6 +122,10 @@ class HarnessTemplate:
     compose_conventions: ComposeConventions = field(
         default_factory=ComposeConventions,
     )
+    artifact_forms: dict[str, ArtifactForm] = field(
+        default_factory=dict,
+    )
+    budget_usd: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +153,21 @@ def validate_template(template: HarnessTemplate) -> list[str]:
                 f"Agent '{agent_name}' has tier '{spec.tier}' but "
                 f"write_permissions has no entry for that tier"
             )
+
+    # ArtifactForm anti-patterns must map to known matcher keys.
+    try:
+        from clou.validation import ANTI_PATTERN_KEYS
+
+        for form_name, form in template.artifact_forms.items():
+            for ap in form.anti_patterns:
+                if not any(key in ap.lower() for key in ANTI_PATTERN_KEYS):
+                    errors.append(
+                        f"Artifact form '{form_name}' has anti-pattern "
+                        f"'{ap}' that doesn't match any known matcher key "
+                        f"({', '.join(sorted(ANTI_PATTERN_KEYS))})"
+                    )
+    except ImportError:
+        pass  # validation module not available (e.g. minimal install)
 
     # Quality gate agents must exist in the agents dict.
     for gate in template.quality_gates:
@@ -358,6 +404,7 @@ _INLINE_FALLBACK = HarnessTemplate(
             "requests.md",
             "understanding.md",
             "milestones/*/milestone.md",
+            "milestones/*/intents.md",
             "milestones/*/requirements.md",
             "milestones/*/escalations/*.md",
             "active/supervisor.md",
@@ -368,7 +415,7 @@ _INLINE_FALLBACK = HarnessTemplate(
             "milestones/*/decisions.md",
             "milestones/*/escalations/*.md",
             "milestones/*/phases/*/phase.md",
-            "active/coordinator.md",
+            "milestones/*/active/coordinator.md",
         ],
         "worker": [
             "milestones/*/phases/*/execution.md",
@@ -387,4 +434,14 @@ _INLINE_FALLBACK = HarnessTemplate(
         phase_comments=True,
         validators=["graph.validate"],
     ),
+    artifact_forms={
+        "intents": ArtifactForm(
+            criterion_template="When {trigger}, {observable_outcome}",
+            anti_patterns=(
+                "file paths or module names as criterion subject",
+                "implementation verbs (extract, refactor, build) as criterion",
+                "criteria verifiable by file inspection alone",
+            ),
+        ),
+    },
 )

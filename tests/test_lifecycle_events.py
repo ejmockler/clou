@@ -84,13 +84,23 @@ def _posted_of_type(app: MagicMock, cls: type) -> list[Any]:
     ]
 
 
-def _setup_clou_dir(project_dir: Path) -> None:
+def _setup_clou_dir(project_dir: Path, milestone: str = "test-ms") -> None:
     """Create minimal .clou directory structure."""
     (project_dir / ".clou" / "active").mkdir(parents=True, exist_ok=True)
     (project_dir / ".clou" / "prompts").mkdir(parents=True, exist_ok=True)
     (project_dir / ".clou" / "prompts" / "coordinator-system.xml").write_text(
         "<system/>"
     )
+    # Milestone dir with structural files so readiness/delivery checks pass.
+    ms_dir = project_dir / ".clou" / "milestones" / milestone
+    (ms_dir / "active").mkdir(parents=True, exist_ok=True)
+    (ms_dir / "status.md").write_text("phase: p1\ncycle: 1\n")
+    (ms_dir / "active" / "coordinator.md").write_text(
+        "cycle: 1\nstep: PLAN\nnext_step: EXECUTE\n"
+        "current_phase: p1\nphases_completed: 0\nphases_total: 1\n"
+    )
+    # Milestone marker so the orchestrator doesn't clear the checkpoint.
+    (project_dir / ".clou" / ".coordinator-milestone").write_text(milestone)
 
 
 # ---------------------------------------------------------------------------

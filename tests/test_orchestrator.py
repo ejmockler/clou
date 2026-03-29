@@ -1118,6 +1118,129 @@ class TestRunCoordinator:
         assert call_count == 2
 
     @pytest.mark.asyncio
+    async def test_staleness_escalation(self, project_dir: Path) -> None:
+        """3 consecutive same-type cycles with no phase advancement -> escalated_staleness."""
+        # Write milestone marker so checkpoint is not cleared as stale.
+        marker = project_dir / ".clou" / ".coordinator-milestone"
+        marker.write_text("auth")
+
+        # Write a checkpoint with fixed phases_completed so staleness is detected.
+        cp_path = project_dir / ".clou" / "milestones" / "auth" / "active" / "coordinator.md"
+        cp_path.parent.mkdir(parents=True, exist_ok=True)
+        cp_path.write_text(
+            "cycle: 3\nstep: EXECUTE\nnext_step: EXECUTE\n"
+            "current_phase: impl\nphases_completed: 1\nphases_total: 3\n"
+        )
+
+        with (
+            patch(
+                f"{_P}.determine_next_cycle",
+                return_value=("EXECUTE", ["status.md"]),
+            ),
+            patch(f"{_P}.read_cycle_count", return_value=3),
+            patch(
+                f"{_P}.write_staleness_escalation", new_callable=AsyncMock
+            ) as mock_esc,
+        ):
+            result = await run_coordinator(project_dir, "auth")
+
+        assert result == "escalated_staleness"
+        mock_esc.assert_called_once()
+        call_args = mock_esc.call_args
+        assert call_args.args[2] == "EXECUTE"  # cycle_type
+        assert call_args.args[3] == 3  # consecutive_count
+        assert call_args.args[4] == 1  # phases_completed
+
+    @pytest.mark.asyncio
+    async def test_staleness_resets_on_phase_advance(self, project_dir: Path) -> None:
+        """phases_completed changes mid-loop -> no staleness escalation."""
+        call_count = 0
+
+        # Write milestone marker so checkpoint is not cleared as stale.
+        marker = project_dir / ".clou" / ".coordinator-milestone"
+        marker.write_text("auth")
+
+        # Write initial checkpoint
+        cp_path = project_dir / ".clou" / "milestones" / "auth" / "active" / "coordinator.md"
+        cp_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _update_checkpoint_side_effect(*args: Any, **kwargs: Any) -> str:
+            nonlocal call_count
+            call_count += 1
+            # Advance phases_completed on the second cycle
+            phases = 1 if call_count <= 1 else 2
+            cp_path.write_text(
+                f"cycle: {call_count}\nstep: EXECUTE\nnext_step: EXECUTE\n"
+                f"current_phase: impl\nphases_completed: {phases}\nphases_total: 3\n"
+            )
+            return "ok"
+
+        # Initial checkpoint
+        cp_path.write_text(
+            "cycle: 1\nstep: EXECUTE\nnext_step: EXECUTE\n"
+            "current_phase: impl\nphases_completed: 1\nphases_total: 3\n"
+        )
+
+        with (
+            patch(
+                f"{_P}.determine_next_cycle",
+                side_effect=[
+                    ("EXECUTE", ["status.md"]),
+                    ("EXECUTE", ["status.md"]),
+                    ("EXECUTE", ["status.md"]),
+                    ("COMPLETE", []),
+                ],
+            ),
+            patch(f"{_P}.read_cycle_count", return_value=1),
+            patch(f"{_P}._run_single_cycle", side_effect=_update_checkpoint_side_effect),
+            patch(f"{_P}.validate_golden_context", return_value=[]),
+            patch(f"{_P}.validate_readiness", return_value=[]),
+            patch(f"{_P}.validate_delivery", return_value=[]),
+        ):
+            result = await run_coordinator(project_dir, "auth")
+
+        # Should NOT escalate — phases_completed advanced
+        assert result == "completed"
+
+    @pytest.mark.asyncio
+    async def test_staleness_resets_on_type_change(self, project_dir: Path) -> None:
+        """cycle_type changes -> staleness counter resets, no escalation."""
+        # Write milestone marker so checkpoint is not cleared as stale.
+        marker = project_dir / ".clou" / ".coordinator-milestone"
+        marker.write_text("auth")
+
+        cp_path = project_dir / ".clou" / "milestones" / "auth" / "active" / "coordinator.md"
+        cp_path.parent.mkdir(parents=True, exist_ok=True)
+        cp_path.write_text(
+            "cycle: 1\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: impl\nphases_completed: 1\nphases_total: 3\n"
+        )
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            return "ok"
+
+        with (
+            patch(
+                f"{_P}.determine_next_cycle",
+                side_effect=[
+                    ("EXECUTE", ["status.md"]),
+                    ("ASSESS", ["status.md"]),
+                    ("EXECUTE", ["status.md"]),
+                    ("COMPLETE", []),
+                ],
+            ),
+            patch(f"{_P}.read_cycle_count", return_value=1),
+            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_P}.validate_golden_context", return_value=[]),
+            patch(f"{_P}.validate_readiness", return_value=[]),
+            patch(f"{_P}.validate_delivery", return_value=[]),
+        ):
+            result = await run_coordinator(project_dir, "auth")
+
+        # Should NOT escalate — cycle type alternates
+        assert result == "completed"
+
+    @pytest.mark.asyncio
     async def test_milestone_validation_at_coordinator_boundary(
         self, project_dir: Path
     ) -> None:

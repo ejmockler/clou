@@ -27,6 +27,7 @@ from clou.recovery import (
     read_cycle_outcome,
     write_agent_crash_escalation,
     write_cycle_limit_escalation,
+    write_staleness_escalation,
     write_validation_escalation,
 )
 from clou.validation import Severity, ValidationFinding
@@ -118,7 +119,7 @@ def test_determine_next_cycle_no_file(tmp_path: Path) -> None:
     """Missing checkpoint returns PLAN with initial read set."""
     cycle_type, read_set = determine_next_cycle(tmp_path / "nonexistent.md", "m1")
     assert cycle_type == "PLAN"
-    assert read_set == ["milestone.md", "requirements.md", "project.md"]
+    assert read_set == ["milestone.md", "intents.md", "requirements.md", "project.md"]
 
 
 def test_determine_next_cycle_plan(tmp_path: Path) -> None:
@@ -176,7 +177,7 @@ def test_determine_next_cycle_verify(tmp_path: Path) -> None:
     _write(cp_path, "cycle: 5\nstep: ASSESS\nnext_step: VERIFY\n")
     cycle_type, read_set = determine_next_cycle(cp_path, "m1")
     assert cycle_type == "VERIFY"
-    assert "requirements.md" in read_set
+    assert "intents.md" in read_set
     assert "compose.py" in read_set
 
 
@@ -325,6 +326,40 @@ def test_escalation_sections_complete(tmp_path: Path) -> None:
         "# Escalation:",
         "**Classification:**",
         "**Filed:**",
+        "## Context",
+        "## Issue",
+        "## Evidence",
+        "## Options",
+        "## Recommendation",
+        "## Disposition",
+    ]:
+        assert section in content, f"Missing section: {section}"
+
+
+def test_write_staleness_escalation(tmp_path: Path) -> None:
+    """Creates staleness escalation file with expected content."""
+    asyncio.run(
+        write_staleness_escalation(
+            tmp_path, "m1",
+            cycle_type="EXECUTE",
+            consecutive_count=3,
+            phases_completed=1,
+            next_step="EXECUTE",
+        )
+    )
+    esc_dir = tmp_path / ".clou" / "milestones" / "m1" / "escalations"
+    files = list(esc_dir.iterdir())
+    assert len(files) == 1
+    assert files[0].name.endswith("-staleness.md")
+
+    content = files[0].read_text()
+    assert "# Escalation: Staleness Detected" in content
+    assert "**Classification:** blocking" in content
+    assert "cycle_type: EXECUTE" in content
+    assert "consecutive_count: 3" in content
+    assert "phases_completed: 1" in content
+    assert "next_step: EXECUTE" in content
+    for section in [
         "## Context",
         "## Issue",
         "## Evidence",
@@ -549,7 +584,7 @@ def test_rework_overridden_when_converged(tmp_path: Path) -> None:
         decisions_path=decisions_path,
     )
     assert cycle_type == "VERIFY"
-    assert "requirements.md" in read_set
+    assert "intents.md" in read_set
     assert "compose.py" in read_set
 
 
@@ -700,7 +735,7 @@ def test_determine_next_cycle_path_traversal_execute(tmp_path: Path) -> None:
     )
     cycle_type, read_set = determine_next_cycle(cp_path, "m1")
     assert cycle_type == "PLAN"
-    assert read_set == ["milestone.md", "requirements.md", "project.md"]
+    assert read_set == ["milestone.md", "intents.md", "requirements.md", "project.md"]
 
 
 def test_determine_next_cycle_path_traversal_assess(tmp_path: Path) -> None:
@@ -712,7 +747,7 @@ def test_determine_next_cycle_path_traversal_assess(tmp_path: Path) -> None:
     )
     cycle_type, read_set = determine_next_cycle(cp_path, "m1")
     assert cycle_type == "PLAN"
-    assert read_set == ["milestone.md", "requirements.md", "project.md"]
+    assert read_set == ["milestone.md", "intents.md", "requirements.md", "project.md"]
 
 
 def test_determine_next_cycle_slash_in_phase(tmp_path: Path) -> None:
@@ -885,7 +920,7 @@ def test_git_commit_phase_timeout(
 
     monkeypatch.setattr(asyncio, "wait_for", _fast_wait_for)
 
-    with pytest.raises(RuntimeError, match="git add timed out"):
+    with pytest.raises(RuntimeError, match="timed out"):
         asyncio.run(git_commit_phase(tmp_path, "m1", "impl"))
 
     assert killed
@@ -894,7 +929,7 @@ def test_git_commit_phase_timeout(
 def test_git_commit_phase_calls_git_commands(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """git_commit_phase calls git add -A, git diff --cached --quiet, git commit."""
+    """git_commit_phase uses selective staging: git diff, git ls-files, git add, git commit."""
     commands: list[list[str]] = []
 
     async def _mock_subprocess(*args: object, **kwargs: object) -> object:
@@ -902,10 +937,14 @@ def test_git_commit_phase_calls_git_commands(
         commands.append(cmd)
 
         class _Proc:
-            # git diff --cached --quiet returns 1 = there are changes
-            returncode = 1 if "diff" in cmd else 0
+            # git diff --cached --quiet returns 1 = there are staged changes
+            returncode = 1 if ("diff" in cmd and "--cached" in cmd) else 0
 
             async def communicate(self) -> tuple[bytes, bytes]:
+                if "diff" in cmd and "--name-only" in cmd:
+                    return b"src/main.py\n", b""
+                if "ls-files" in cmd:
+                    return b"src/new.py\n", b""
                 return b"", b""
 
         return _Proc()
@@ -914,19 +953,23 @@ def test_git_commit_phase_calls_git_commands(
 
     asyncio.run(git_commit_phase(tmp_path, "m1", "design"))
 
-    assert len(commands) == 3
-    assert "add" in commands[0]
-    assert "-A" in commands[0]
-    assert "diff" in commands[1]
-    assert "--cached" in commands[1]
-    assert "commit" in commands[2]
-    assert "-m" in commands[2]
+    # Should have: diff --name-only, ls-files, add (selective),
+    # diff --cached --quiet, commit
+    assert len(commands) == 5
+    assert "diff" in commands[0] and "--name-only" in commands[0]
+    assert "ls-files" in commands[1]
+    assert "add" in commands[2]
+    assert "-A" not in commands[2]  # NOT git add -A
+    assert "src/main.py" in commands[2] or "src/new.py" in commands[2]
+    assert "diff" in commands[3] and "--cached" in commands[3]
+    assert "commit" in commands[4]
+    assert "-m" in commands[4]
 
 
 def test_git_commit_phase_skips_when_no_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When git diff --cached --quiet returns 0, no commit is made."""
+    """When no files changed, no commit is made."""
     commands: list[list[str]] = []
 
     async def _mock_subprocess(*args: object, **kwargs: object) -> object:
@@ -934,10 +977,10 @@ def test_git_commit_phase_skips_when_no_changes(
         commands.append(cmd)
 
         class _Proc:
-            returncode = 0  # all succeed; diff quiet = no changes
+            returncode = 0
 
             async def communicate(self) -> tuple[bytes, bytes]:
-                return b"", b""
+                return b"", b""  # No changed files
 
         return _Proc()
 
@@ -945,10 +988,10 @@ def test_git_commit_phase_skips_when_no_changes(
 
     asyncio.run(git_commit_phase(tmp_path, "m1", "impl"))
 
-    # Only add + diff, no commit
+    # Only diff + ls-files, no add or commit
     assert len(commands) == 2
-    assert "add" in commands[0]
-    assert "diff" in commands[1]
+    assert "diff" in commands[0]
+    assert "ls-files" in commands[1]
 
 
 def test_git_commit_phase_message_format(
@@ -962,9 +1005,11 @@ def test_git_commit_phase_message_format(
         cmd = [str(a) for a in args]
 
         class _Proc:
-            returncode = 1 if "diff" in cmd else 0
+            returncode = 1 if ("diff" in cmd and "--cached" in cmd) else 0
 
             async def communicate(self) -> tuple[bytes, bytes]:
+                if "diff" in cmd and "--name-only" in cmd:
+                    return b"src/main.py\n", b""
                 return b"", b""
 
         if "commit" in cmd:
@@ -1295,3 +1340,100 @@ def test_escalation_with_legacy_strings(tmp_path: Path) -> None:
     content = next(esc_dir.iterdir()).read_text()
     assert "**Classification:** blocking" in content
     assert "missing '## Cycle'" in content
+
+
+# ---------------------------------------------------------------------------
+# DB-15: Decisions compaction
+# ---------------------------------------------------------------------------
+
+
+def test_compact_decisions_below_threshold(tmp_path: Path) -> None:
+    """No compaction when decisions.md is below token threshold."""
+    path = tmp_path / "decisions.md"
+    path.write_text("## Cycle 1 — Assessment\nSmall content\n")
+    from clou.recovery import compact_decisions
+
+    assert compact_decisions(path) is False
+
+
+def test_compact_decisions_keeps_recent(tmp_path: Path) -> None:
+    """Recent 3 cycle groups kept in full, older compacted."""
+    from clou.recovery import compact_decisions
+
+    groups = []
+    for i in range(6):
+        groups.append(
+            f"## Cycle {6 - i} — Quality Gate Assessment\n"
+            f"### Accepted: finding-{i}a\n**Finding:** \"detail\"\n"
+            f"### Overridden: finding-{i}b\n**Finding:** \"detail\"\n"
+        )
+    path = tmp_path / "decisions.md"
+    path.write_text("# Decisions\n\n" + "\n".join(groups))
+
+    result = compact_decisions(path, token_threshold=0)  # Force compaction
+    assert result is True
+
+    content = path.read_text()
+    # Recent 3 (Cycles 6, 5, 4) should have full detail
+    assert "### Accepted: finding-0a" in content  # Cycle 6
+    assert "### Accepted: finding-1a" in content  # Cycle 5
+    assert "### Accepted: finding-2a" in content  # Cycle 4
+    # Older (Cycles 3, 2, 1) should be compacted
+    assert "(compacted)" in content
+    assert "### Accepted: finding-3a" not in content  # Cycle 3 compacted
+
+
+def test_compact_decisions_preserves_counts(tmp_path: Path) -> None:
+    """Compacted groups show accepted/overridden counts."""
+    from clou.recovery import compact_decisions
+
+    groups = []
+    for i in range(5):
+        groups.append(
+            f"## Cycle {5 - i} — Assessment\n"
+            f"### Accepted: f1\n**Finding:** \"d\"\n"
+            f"### Accepted: f2\n**Finding:** \"d\"\n"
+            f"### Overridden: f3\n**Finding:** \"d\"\n"
+        )
+    path = tmp_path / "decisions.md"
+    path.write_text("\n".join(groups))
+
+    compact_decisions(path, token_threshold=0)
+    content = path.read_text()
+    assert "Accepted: 2" in content
+    assert "Overridden: 1" in content
+
+
+# ---------------------------------------------------------------------------
+# DB-15: Selective staging excludes patterns
+# ---------------------------------------------------------------------------
+
+
+def test_staging_exclude_patterns() -> None:
+    """_STAGING_EXCLUDE_PATTERNS filters telemetry, sessions, and common artifacts."""
+    import fnmatch
+
+    from clou.recovery import _STAGING_EXCLUDE_PATTERNS
+
+    should_exclude = [
+        ".clou/telemetry/span.jsonl",
+        ".clou/sessions/abc.jsonl",
+        "node_modules/express/index.js",
+        "__pycache__/foo.cpython-313.pyc",
+        "app.pyc",
+        ".env",
+        ".env.local",
+    ]
+    should_include = [
+        "src/main.py",
+        ".clou/milestones/m1/status.md",
+        "tests/test_app.py",
+    ]
+    for f in should_exclude:
+        assert any(
+            fnmatch.fnmatch(f, pat) for pat in _STAGING_EXCLUDE_PATTERNS
+        ), f"Should exclude {f}"
+    for f in should_include:
+        assert not any(
+            fnmatch.fnmatch(f, pat) for pat in _STAGING_EXCLUDE_PATTERNS
+        ), f"Should include {f}"

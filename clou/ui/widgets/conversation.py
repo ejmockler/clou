@@ -232,6 +232,12 @@ class ConversationWidget(DragScrollMixin, Widget):
         self._mount_msg(UserMessage(text, queued=queued, classes="msg"))
         self._start_working()
 
+    def recall_last_queued(self) -> None:
+        """Remove the last queued UserMessage from the conversation."""
+        queued = [um for um in self.query(UserMessage) if um._queued]
+        if queued:
+            queued[-1].remove()
+
     def reset_turn_state(self) -> None:
         """Atomically clear all turn state — single reset point."""
         self._stop_working()
@@ -485,10 +491,14 @@ class ConversationWidget(DragScrollMixin, Widget):
     # ------------------------------------------------------------------
 
     def update_queue_count(self, count: int) -> None:
-        """Update the queue indicator with the number of pending messages."""
+        """Update the queue indicator with the number of pending messages.
+
+        Only shown when 2+ messages are pending — for a single in-flight
+        message the user can already see it in the conversation.
+        """
         try:
             indicator = self.query_one("#queue-indicator", Static)
-            if count > 0:
+            if count > 1:
                 indicator.update(Text(f"  \u00b7 {count} queued", style=f"italic {_DIM_HEX}"))
             else:
                 indicator.update("")

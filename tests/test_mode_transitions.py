@@ -370,7 +370,7 @@ class TestInputDuringBreath:
             assert pilot.app.mode is Mode.BREATH
 
             # Input should be queryable and focusable inside #conversation.
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             assert inp.display is True
             inp.value = "typing in breath"
             assert inp.value == "typing in breath"
@@ -384,7 +384,7 @@ class TestInputDuringBreath:
             assert pilot.app.mode is Mode.BREATH
 
             # Submit input.
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             inp.value = "hello from breath"  # type: ignore[union-attr]
             await inp.action_submit()  # type: ignore[union-attr]
             await pilot.pause()
@@ -410,7 +410,7 @@ class TestDialogueToHandoff:
             assert app.mode is Mode.BREATH
 
             # User types, returning to DIALOGUE.
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             inp.value = "hello"  # type: ignore[union-attr]
             await inp.action_submit()  # type: ignore[union-attr]
             await pilot.pause()
@@ -1103,7 +1103,7 @@ class TestInputDuringHandoff:
             assert app.mode is Mode.HANDOFF
 
             # Submit input.
-            input_widget = app.query_one("#user-input Input")
+            input_widget = app.query_one("#user-input ChatInput")
             input_widget.value = "hello"
             await input_widget.action_submit()
             await pilot.pause()

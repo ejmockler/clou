@@ -250,13 +250,13 @@ def determine_next_cycle(
     """Read checkpoint and determine what the next cycle should do."""
 
     if not checkpoint_path.exists():
-        return "PLAN", ["milestone.md", "requirements.md", "project.md"]
+        return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
 
     checkpoint = parse_checkpoint(checkpoint_path.read_text())
 
     match checkpoint.next_step:
         case "PLAN":
-            return "PLAN", ["milestone.md", "requirements.md", "project.md"]
+            return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
         case "EXECUTE" | "EXECUTE (rework)":
             return "EXECUTE", [
                 "status.md",
@@ -275,7 +275,7 @@ def determine_next_cycle(
             ]
         case "VERIFY":
             return "VERIFY", [
-                "status.md", "requirements.md", "compose.py",
+                "status.md", "intents.md", "compose.py",
                 "active/coordinator.md",
             ]
         case "EXIT":
@@ -286,7 +286,7 @@ def determine_next_cycle(
         case "COMPLETE":
             return "COMPLETE", []
 
-    return "PLAN", ["milestone.md", "requirements.md", "project.md"]
+    return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
 
 
 def build_cycle_prompt(

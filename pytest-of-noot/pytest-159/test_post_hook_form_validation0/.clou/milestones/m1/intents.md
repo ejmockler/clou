@@ -1,0 +1,1 @@
+- When the user opens the app, they see a dashboard

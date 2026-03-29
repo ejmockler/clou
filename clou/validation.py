@@ -17,7 +17,10 @@ Validation findings carry severity classification:
   comprehension is preserved.
 
 Public API:
-    validate_golden_context(project_dir, milestone) -> list[ValidationFinding]
+    validate_golden_context(project_dir, milestone, template) -> list[ValidationFinding]
+    validate_delivery(milestone_dir, checkpoint_path, milestone) -> list[ValidationFinding]
+    validate_readiness(clou_dir, milestone_dir, read_set, cycle_type, milestone) -> list[ValidationFinding]
+    validate_artifact_form(content, form, rel) -> list[ValidationFinding]
     validate_checkpoint(content: str) -> list[ValidationFinding]
     validate_status_checkpoint(content: str, rel: str) -> list[ValidationFinding]
     errors_only(findings: list[ValidationFinding]) -> list[ValidationFinding]
@@ -30,6 +33,10 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from clou.harness import ArtifactForm, HarnessTemplate
 
 
 class Severity(Enum):
@@ -102,13 +109,162 @@ _VALID_NEXT_STEPS = frozenset(
 )
 
 
+# ---------------------------------------------------------------------------
+# Communication validation — LLM-Modulo (§9): verify agent outputs externally
+# ---------------------------------------------------------------------------
+
+#: Files whose absence means the cycle cannot proceed (structural).
+#: These drive control flow directly — compose.py for agent dispatch,
+#: checkpoint for cycle determination, status.md for phase tracking.
+_STRUCTURAL_FILES = frozenset({
+    "compose.py",
+    "active/coordinator.md",
+    "status.md",
+})
+
+#: Paths in the read_set that resolve under .clou/ (root-scoped)
+#: rather than under .clou/milestones/{milestone}/.  Mirrors the
+#: resolution logic in ``build_cycle_prompt`` (prompts.py).
+_ROOT_SCOPED_PREFIXES = ("project.md", "active/")
+
+
+def validate_delivery(
+    milestone_dir: Path,
+    checkpoint_path: Path,
+    milestone: str,
+) -> list[ValidationFinding]:
+    """Verify the coordinator delivered its state after a cycle.
+
+    The golden context is a blackboard (research-foundations §10).
+    Stigmergy only works when messages arrive.  This function verifies
+    message *delivery*, not message *content* — that is
+    ``validate_golden_context``'s job.
+
+    Checks:
+    - checkpoint_path exists (coordinator wrote its state transfer)
+    - status.md exists (coordinator wrote its progress journal)
+    - Cross-validation: status.md next_step matches checkpoint next_step
+
+    Finding paths are ``.clou/``-relative for consistency with
+    ``validate_golden_context`` and the self-heal pipeline.
+    """
+    ms_prefix = f"milestones/{milestone}"
+    findings: list[ValidationFinding] = []
+
+    if not checkpoint_path.exists():
+        findings.append(ValidationFinding(
+            Severity.ERROR,
+            "coordinator checkpoint not delivered — state transfer between cycles broken",
+            f"{ms_prefix}/active/coordinator.md",
+        ))
+
+    status_path = milestone_dir / "status.md"
+    if not status_path.exists():
+        findings.append(ValidationFinding(
+            Severity.ERROR,
+            "milestone status not delivered — progress journal missing",
+            f"{ms_prefix}/status.md",
+        ))
+
+    # Cross-validation: compare next_step in status.md vs checkpoint.
+    # Only check when both files exist (no false positives on missing files).
+    if checkpoint_path.exists() and status_path.exists():
+        from clou.recovery import parse_checkpoint
+
+        cp = parse_checkpoint(checkpoint_path.read_text())
+        status_content = status_path.read_text()
+        status_state = _section_text(status_content, "## Current State")
+        if not status_state:
+            # Try case-insensitive variants.
+            for variant in ("## Current state", "## current state"):
+                status_state = _section_text(status_content, variant)
+                if status_state:
+                    break
+        status_next_match = re.search(r"(?m)^next_step:\s*(.+)$", status_state)
+        if status_next_match:
+            status_next = status_next_match.group(1).strip()
+            if status_next != cp.next_step:
+                findings.append(ValidationFinding(
+                    Severity.ERROR,
+                    f"status.md next_step '{status_next}' diverges from checkpoint "
+                    f"next_step '{cp.next_step}' — state representations inconsistent",
+                    f"{ms_prefix}/active/coordinator.md",
+                ))
+
+    return findings
+
+
+def validate_readiness(
+    clou_dir: Path,
+    milestone_dir: Path,
+    read_set: list[str],
+    cycle_type: str,
+    milestone: str,
+) -> list[ValidationFinding]:
+    """Verify the context a cycle needs actually exists before dispatch.
+
+    The read_set from ``determine_next_cycle`` is the orchestrator's
+    assumption about what files the coordinator will consume.  Each
+    assumption is an untested claim about LLM-written artifacts.
+    This function tests those claims (LLM-Modulo §9).
+
+    Path resolution mirrors ``build_cycle_prompt``: paths starting with
+    ``project.md`` or ``active/`` resolve under *clou_dir* (root-scoped);
+    all others resolve under *milestone_dir*.
+
+    Finding paths are ``.clou/``-relative for consistency with
+    ``validate_golden_context`` and the self-heal pipeline.
+
+    Severity:
+    - ERROR for structural files (compose.py, checkpoint, status.md) —
+      the cycle cannot proceed without them.
+    - WARNING for narrative files — the coordinator adapts gracefully.
+
+    Note: the read_set for ASSESS and EXIT includes files that are
+    *created* during those cycles (assessment.md, handoff.md).  These
+    emit non-blocking WARNINGs on first invocation, which is expected.
+    """
+    ms_prefix = f"milestones/{milestone}"
+    findings: list[ValidationFinding] = []
+
+    for rel_path in read_set:
+        # Mirror prompts.py root_prefixes resolution.
+        root_scoped = rel_path.startswith(_ROOT_SCOPED_PREFIXES)
+        if root_scoped:
+            full_path = clou_dir / rel_path
+        else:
+            full_path = milestone_dir / rel_path
+        if full_path.exists():
+            continue
+        severity = (
+            Severity.ERROR
+            if rel_path in _STRUCTURAL_FILES
+            else Severity.WARNING
+        )
+        # .clou/-relative finding path.
+        finding_path = rel_path if root_scoped else f"{ms_prefix}/{rel_path}"
+        findings.append(ValidationFinding(
+            severity,
+            f"{cycle_type} cycle needs {rel_path} but it does not exist",
+            finding_path,
+        ))
+
+    return findings
+
+
 def validate_golden_context(
-    project_dir: Path, milestone: str
+    project_dir: Path,
+    milestone: str,
+    template: HarnessTemplate | None = None,
 ) -> list[ValidationFinding]:
     """Validate golden context structure after a cycle.
 
     Returns findings (empty = valid). Only checks files that exist — the
     coordinator creates files as needed, so missing files are not errors.
+
+    When *template* is provided, any file matching a key in
+    ``template.artifact_forms`` is validated against its ``ArtifactForm``
+    (DB-14).
 
     Phases with terminal status ("completed" or "failed") in status.md have
     ERROR findings on their execution.md downgraded to WARNING — they already
@@ -119,7 +275,7 @@ def validate_golden_context(
     milestone_dir = clou_dir / "milestones" / milestone
 
     # Coordinator checkpoint (active/coordinator.md)
-    checkpoint = clou_dir / "active" / "coordinator.md"
+    checkpoint = milestone_dir / "active" / "coordinator.md"
     if checkpoint.exists():
         findings += _validate_coordinator(checkpoint)
 
@@ -155,6 +311,18 @@ def validate_golden_context(
     status = milestone_dir / "status.md"
     if status.exists():
         findings += _validate_status(status)
+
+    # ArtifactForm-driven validation (DB-14) — any file with a form
+    # in the template gets narrative-tier form checking.
+    if template is not None:
+        for artifact_name, form in template.artifact_forms.items():
+            artifact_path = milestone_dir / f"{artifact_name}.md"
+            if artifact_path.exists():
+                findings += validate_artifact_form(
+                    artifact_path.read_text(),
+                    form,
+                    _rel(artifact_path),
+                )
 
     # Project-level: roadmap.md
     roadmap = clou_dir / "roadmap.md"
@@ -766,4 +934,144 @@ def _check_task_statuses(
                     path=rel,
                 )
             )
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# ArtifactForm-driven validation (DB-14)
+# ---------------------------------------------------------------------------
+
+#: Known anti-pattern regexes keyed by description substring.
+#: When an ArtifactForm.anti_patterns entry contains a key phrase,
+#: the corresponding regex is used.  This keeps forms declarative
+#: (string descriptions) while enforcement is mechanical.
+_ANTI_PATTERN_MATCHERS: list[tuple[str, re.Pattern[str], str]] = [
+    ("file path", re.compile(r"[a-zA-Z0-9_/.-]+\.(py|ts|tsx|js|jsx|md|css|html|json|yaml|yml|toml|go|rs|sh)\b"), "file path in criterion"),
+    ("implementation", re.compile(r"\b(class|module|function|method|widget)\s+[A-Z]"), "implementation artifact name in criterion"),
+    ("implementation", re.compile(r"\b(extract|refactor|build|implement|create|add)\s+(a\s+|the\s+)?\w+", re.IGNORECASE), "implementation verb as criterion action"),
+    ("file inspection", re.compile(r"\b(file|module|class|directory|folder)\s+(exists?|contains?|has)\b", re.IGNORECASE), "criterion verifiable by file inspection"),
+]
+
+#: Known matcher keys — used by ``validate_template`` to warn on
+#: anti-pattern descriptions that don't map to any active matcher.
+ANTI_PATTERN_KEYS: frozenset[str] = frozenset(
+    key for key, _, _ in _ANTI_PATTERN_MATCHERS
+)
+
+
+def _template_to_regex(template: str) -> re.Pattern[str]:
+    """Convert a criterion_template like ``"When {trigger}, {observable_outcome}"``
+    into a loose matching regex.
+
+    Placeholder tokens ``{...}`` become ``.+`` (match any text).
+    Leading list markers (``- `` or ``* ``) are allowed.
+    Match is case-insensitive.
+    """
+    # Escape the literal parts, then replace escaped placeholders.
+    escaped = re.escape(template)
+    # \{...\} from escaping → .+
+    pattern = re.sub(r"\\{[^}]*\\}", ".+", escaped)
+    return re.compile(rf"(?i)^[-*]?\s*{pattern}")
+
+
+def validate_artifact_form(
+    content: str,
+    form: ArtifactForm,
+    rel: str,
+) -> list[ValidationFinding]:
+    """Validate content against an ArtifactForm (DB-14, narrative tier).
+
+    Pure function — no file I/O.  Used by both ``validate_golden_context``
+    (cycle-boundary) and the PostToolUse hook (write-time).
+
+    All findings are WARNING severity — form violations don't block
+    progression but give agents immediate feedback.
+    """
+    findings: list[ValidationFinding] = []
+    stripped = content.strip()
+
+    if not stripped:
+        findings.append(
+            ValidationFinding(
+                severity=Severity.WARNING,
+                message="artifact is empty — no content defined",
+                path=rel,
+            )
+        )
+        return findings
+
+    # Section checks.
+    if form.sections:
+        for section in form.sections:
+            # Accept ## or ### or #### prefix.
+            if not re.search(rf"(?m)^#{{1,4}}\s+{re.escape(section)}", stripped):
+                findings.append(
+                    ValidationFinding(
+                        severity=Severity.WARNING,
+                        message=f"missing required section '{section}'",
+                        path=rel,
+                    )
+                )
+
+    # Criterion template checks.
+    #
+    # Only bullet/list lines are treated as criteria — preamble text
+    # (paragraphs, notes) is ignored to avoid false positives.
+    if form.criterion_template:
+        criterion_re = _template_to_regex(form.criterion_template)
+        criteria_lines = [
+            line.strip()
+            for line in stripped.splitlines()
+            if line.strip()
+            and not line.strip().startswith("#")
+            and (line.strip().startswith(("- ", "* ", "When "))
+                 or line.strip().startswith(("when ",)))
+        ]
+
+        if not criteria_lines:
+            findings.append(
+                ValidationFinding(
+                    severity=Severity.WARNING,
+                    message="no criteria lines found",
+                    path=rel,
+                )
+            )
+        else:
+            for line in criteria_lines:
+                if not criterion_re.match(line):
+                    findings.append(
+                        ValidationFinding(
+                            severity=Severity.WARNING,
+                            message=(
+                                f"criterion does not match "
+                                f"'{form.criterion_template}' template: "
+                                f"'{line[:80]}'"
+                            ),
+                            path=rel,
+                        )
+                    )
+
+    # Anti-pattern checks.
+    if form.anti_patterns:
+        criteria_lines = criteria_lines if form.criterion_template else [
+            line.strip()
+            for line in stripped.splitlines()
+            if line.strip()
+            and not line.strip().startswith("#")
+            and (line.strip().startswith(("- ", "* ", "When "))
+                 or line.strip().startswith(("when ",)))
+        ]
+        for line in criteria_lines:
+            for key, pattern, desc in _ANTI_PATTERN_MATCHERS:
+                # Fire if any declared anti-pattern description contains this key.
+                if any(key in ap.lower() for ap in form.anti_patterns):
+                    if pattern.search(line):
+                        findings.append(
+                            ValidationFinding(
+                                severity=Severity.WARNING,
+                                message=f"{desc}: '{line[:80]}'",
+                                path=rel,
+                            )
+                        )
+
     return findings

@@ -19,7 +19,9 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.reactive import reactive
 from textual.timer import Timer
-from textual.widgets import Input
+from textual.widgets import TextArea
+
+from clou.ui.widgets.prompt_input import ChatInput
 from textual.worker import Worker, WorkerState
 
 from clou import telemetry
@@ -27,6 +29,9 @@ from clou.session import Session
 from clou.ui.bridge import _strip_ansi
 from clou.ui.history import ConversationEntry
 from clou.ui.messages import (
+    ClouAgentComplete,
+    ClouAgentProgress,
+    ClouAgentSpawned,
     ClouCoordinatorComplete,
     ClouCoordinatorSpawned,
     ClouDagUpdate,
@@ -44,7 +49,9 @@ from clou.ui.mode import TIMING, BreathState, BreathStateMachine, Mode, get_tran
 from clou.ui.screens.context import ContextScreen
 from clou.ui.screens.dag import DagScreen
 from clou.ui.screens.detail import DetailScreen
+from clou.ui.task_graph import TaskGraphModel, TaskState
 from clou.ui.widgets.breath import BreathWidget
+from clou.ui.widgets.task_graph import TaskGraphWidget
 from clou.ui.widgets.conversation import ConversationWidget
 from clou.ui.widgets.escalation import EscalationModal
 from clou.ui.widgets.handoff import HandoffWidget
@@ -86,7 +93,8 @@ class ClouApp(App[None]):
         self._project_dir = project_dir or Path.cwd()
         self._work_dir = work_dir or Path.cwd()
         self._resume_session_id = resume_session_id
-        self._user_input_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._user_input_queue: deque[str] = deque()
+        self._user_input_ready: asyncio.Event = asyncio.Event()
         self._animation_timer: Timer | None = None
         self._animation_time: float = 0.0
         self._breath_machine = BreathStateMachine()
@@ -99,6 +107,9 @@ class ClouApp(App[None]):
         self._pre_decision_mode: Mode = Mode.DIALOGUE
         self._dag_tasks: list[dict[str, str]] = []
         self._dag_deps: dict[str, list[str]] = {}
+        self._task_graph_model: TaskGraphModel | None = None
+        self._synthetic_dag: bool = False
+        self._agent_task_map: dict[str, str] = {}  # task_id → task_name
         self._session_start_time: float = time.monotonic()
         self._conversation_history: list[ConversationEntry] = []
         # Compact signaling: handler sets the event; orchestrator checks it.
@@ -106,6 +117,9 @@ class ClouApp(App[None]):
         self._compact_instructions: str = ""
         self._compact_complete: asyncio.Event = asyncio.Event()
         self._compaction_count: int = 0
+        # Stop signaling: /stop command sets event; orchestrator checks
+        # at cycle boundary (DB-15 Tension 1).
+        self._stop_requested: asyncio.Event = asyncio.Event()
         # Model state.
         self._model: str = "opus"
         self._queue_count: int = 0
@@ -114,6 +128,7 @@ class ClouApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield ConversationWidget(id="conversation")
+        yield TaskGraphWidget(id="task-graph")
         yield BreathWidget(id="breath-widget")
         yield HandoffWidget(id="handoff-widget")
         yield ClouStatusBar(id="status-bar")
@@ -121,7 +136,7 @@ class ClouApp(App[None]):
     def on_mount(self) -> None:
         """Apply the initial mode CSS class and start the supervisor."""
         self.add_class(self.mode.name.lower())
-        self.query_one("#user-input Input").focus()
+        self.query_one("#user-input ChatInput").focus()
         # Start session persistence and telemetry.
         self._session = Session(self._project_dir, model=self._model)
         telemetry.init(self._session.session_id, self._project_dir)
@@ -153,11 +168,8 @@ class ClouApp(App[None]):
             except LookupError:
                 pass  # Widget may not be mounted yet
             # Drain the dead queue and stale escalations.
-            while not self._user_input_queue.empty():
-                try:
-                    self._user_input_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+            self._user_input_queue.clear()
+            self._user_input_ready.clear()
             self._queue_count = 0
             self._escalation_queue.clear()
             try:
@@ -175,11 +187,8 @@ class ClouApp(App[None]):
                 self.query_one(ConversationWidget).reset_turn_state()
             except LookupError:
                 pass
-            while not self._user_input_queue.empty():
-                try:
-                    self._user_input_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+            self._user_input_queue.clear()
+            self._user_input_ready.clear()
             self._queue_count = 0
             try:
                 self.query_one(ConversationWidget).update_queue_count(0)
@@ -375,6 +384,11 @@ class ClouApp(App[None]):
             breath_widget.breath_phase = breath_value
         except Exception:
             _log.debug("Breath widget not available", exc_info=True)
+        try:
+            task_graph = self.query_one(TaskGraphWidget)
+            task_graph.breath_phase = breath_value
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Input handling
@@ -383,7 +397,7 @@ class ClouApp(App[None]):
     def on_click(self) -> None:
         """Clicking anywhere in the app refocuses the input."""
         try:
-            self.query_one("#user-input Input").focus()
+            self.query_one("#user-input ChatInput").focus()
         except LookupError:
             pass
 
@@ -456,12 +470,37 @@ class ClouApp(App[None]):
             if not palette.back():
                 palette.hide()
                 try:
-                    self.query_one("#user-input Input").clear()
+                    self.query_one("#user-input ChatInput").clear()
                 except LookupError:
                     pass
             event.stop()
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_chat_input_recall_requested(self, event: ChatInput.RecallRequested) -> None:
+        """Up-arrow with empty input — recall the last queued message for editing."""
+        if not self._user_input_queue:
+            return
+        # Pop the most recent queued message.
+        text = self._user_input_queue.pop()
+        if not self._user_input_queue:
+            self._user_input_ready.clear()
+        self._queue_count = max(0, self._queue_count - 1)
+
+        # Remove the corresponding UserMessage from the conversation.
+        conversation = self.query_one(ConversationWidget)
+        conversation.recall_last_queued()
+        conversation.update_queue_count(self._queue_count)
+
+        # Restore text to the input.
+        try:
+            chat_input = self.query_one("#user-input ChatInput")
+            chat_input.text = text
+            # Move cursor to end of restored text.
+            lines = text.split("\n")
+            chat_input.move_cursor((len(lines) - 1, len(lines[-1])))
+        except LookupError:
+            pass
+
+    def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         """Handle user input — transition from BREATH to DIALOGUE if needed."""
         text = event.value.strip()
 
@@ -504,14 +543,15 @@ class ClouApp(App[None]):
         if self.mode in (Mode.BREATH, Mode.HANDOFF):
             self.transition_mode(Mode.DIALOGUE)
 
-        # Show user message immediately — don't wait for model pickup.
-        # Only badge as "queued" when there are already messages ahead.
+        # Show user message as queued — it transitions to active when the
+        # supervisor picks it up (ClouProcessingStarted).
         conversation = self.query_one(ConversationWidget)
-        conversation.add_user_message(text, queued=self._queue_count > 0)
+        self._queue_count += 1
+        conversation.add_user_message(text, queued=True)
 
         # Queue for model processing.
-        self._user_input_queue.put_nowait(text)
-        self._queue_count += 1
+        self._user_input_queue.append(text)
+        self._user_input_ready.set()
         conversation.update_queue_count(self._queue_count)
 
     @work(exclusive=False)
@@ -521,7 +561,7 @@ class ClouApp(App[None]):
 
         await dispatch(self, text)
 
-    def on_input_changed(self, event: Input.Changed) -> None:
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
         """Show/hide command palette as the user types."""
         from clou.ui.widgets.command_palette import CommandPalette
 
@@ -530,7 +570,7 @@ class ClouApp(App[None]):
         except LookupError:
             return
 
-        text = event.value.strip()
+        text = event.text_area.text.strip()
         if text.startswith("/") and len(text) > 0:
             prefix = text[1:].split(None, 1)[0].lower() if len(text) > 1 else ""
             palette.update_filter(prefix)
@@ -598,12 +638,12 @@ class ClouApp(App[None]):
         self._escalation_queue.clear()
         self._dag_tasks = []
         self._dag_deps = {}
+        self._task_graph_model = None
+        self._synthetic_dag = False
+        self._agent_task_map = {}
         # Drain stale input from the previous session's queue.
-        while not self._user_input_queue.empty():
-            try:
-                self._user_input_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        self._user_input_queue.clear()
+        self._user_input_ready.clear()
         self._queue_count = 0
 
         # Return to dialogue mode.
@@ -709,12 +749,157 @@ class ClouApp(App[None]):
         bar.milestone = msg.milestone
         self._dag_tasks = []
         self._dag_deps = {}
+        self._task_graph_model = None
+        self._synthetic_dag = False
+        self._agent_task_map = {}
+        try:
+            self.query_one(TaskGraphWidget).reset()
+        except LookupError:
+            pass
         self.transition_mode(Mode.BREATH)
 
     def on_clou_dag_update(self, msg: ClouDagUpdate) -> None:
-        """Store updated DAG data."""
+        """Store updated DAG data and push to live task graph."""
         self._dag_tasks = msg.tasks
         self._dag_deps = msg.deps
+        if msg.tasks:
+            was_synthetic = self._synthetic_dag
+            self._task_graph_model = TaskGraphModel(msg.tasks, msg.deps)
+            self._synthetic_dag = False
+            try:
+                widget = self.query_one(TaskGraphWidget)
+                if was_synthetic:
+                    # Synthetic-phase agents are done — stale spawns.
+                    widget._pending_spawns.clear()
+                else:
+                    # Spawns buffered without a synthetic model — replay.
+                    for task_id, description in widget._pending_spawns:
+                        self._activate_agent(task_id, description)
+                    widget._pending_spawns.clear()
+                widget.update_model(self._task_graph_model)
+            except LookupError:
+                pass
+
+    def _activate_agent(self, task_id: str, description: str) -> None:
+        """Match an agent to a task and activate it, or track as unmapped."""
+        model = self._task_graph_model
+        if model is None:
+            return
+        task_name = model.match_agent(description)
+        if task_name:
+            self._agent_task_map[task_id] = task_name
+            model.activate_task(task_name, task_id)
+        else:
+            # Use description as display name; store in agent map for
+            # progress/completion lookup.
+            desc = description.strip()[:60] or "agent"
+            self._agent_task_map[task_id] = desc
+            model.unmapped_agents[desc] = TaskState(
+                status="active", agent_id=task_id,
+            )
+
+    def on_clou_agent_spawned(self, msg: ClouAgentSpawned) -> None:
+        """Agent dispatched — match to task graph and activate."""
+        if self._task_graph_model is None or self._synthetic_dag:
+            # DAG hasn't arrived yet — buffer for later replay and build
+            # a synthetic flat model so the task graph is visible now.
+            try:
+                widget = self.query_one(TaskGraphWidget)
+                widget._pending_spawns.append((msg.task_id, msg.description))
+            except LookupError:
+                pass
+            self._grow_synthetic_model(msg.task_id, msg.description)
+            return
+        self._activate_agent(msg.task_id, msg.description)
+        try:
+            self.query_one(TaskGraphWidget).update_model(
+                self._task_graph_model
+            )
+        except LookupError:
+            pass
+
+    def _grow_synthetic_model(self, task_id: str, description: str) -> None:
+        """Create or grow a flat task-graph model from pre-DAG agent spawns.
+
+        Gives the task graph widget visible, breathing content even before
+        compose.py exists (e.g. during PLAN #1).
+        """
+        desc = description.strip()[:60] or "agent"
+        if self._task_graph_model is None:
+            self._task_graph_model = TaskGraphModel(
+                tasks=[{"name": desc}], deps={},
+            )
+            self._synthetic_dag = True
+        elif desc not in self._task_graph_model.task_states:
+            # Rebuild with the new task, preserving existing states.
+            existing = list(self._task_graph_model.task_states.keys())
+            existing.append(desc)
+            old_states = dict(self._task_graph_model.task_states)
+            self._task_graph_model = TaskGraphModel(
+                tasks=[{"name": n} for n in existing], deps={},
+            )
+            for name, state in old_states.items():
+                if name in self._task_graph_model.task_states:
+                    self._task_graph_model.task_states[name] = state
+
+        self._agent_task_map[task_id] = desc
+        self._task_graph_model.activate_task(desc, task_id)
+        try:
+            self.query_one(TaskGraphWidget).update_model(
+                self._task_graph_model
+            )
+        except LookupError:
+            pass
+
+    def on_clou_agent_progress(self, msg: ClouAgentProgress) -> None:
+        """Agent mid-flight — update tool progress in task graph."""
+        model = self._task_graph_model
+        if model is None:
+            return
+        task_name = self._agent_task_map.get(msg.task_id)
+        if not task_name:
+            return
+        # Look up in mapped tasks first, then unmapped agents.
+        state = model.task_states.get(task_name)
+        if state is None:
+            state = model.unmapped_agents.get(task_name)
+        if state is None:
+            return
+        if msg.tool_uses > state.tool_count and msg.last_tool:
+            state.tool_calls.append((msg.last_tool, ""))
+        state.tool_count = msg.tool_uses
+        state.last_tool = msg.last_tool
+        try:
+            widget = self.query_one(TaskGraphWidget)
+            has_active = any(
+                ts.status == "active"
+                for ts in list(model.task_states.values())
+                + list(model.unmapped_agents.values())
+            )
+            widget.shimmer_active = has_active
+            widget.refresh()
+        except LookupError:
+            pass
+
+    def on_clou_agent_complete(self, msg: ClouAgentComplete) -> None:
+        """Agent finished — mark task complete/failed in graph."""
+        model = self._task_graph_model
+        if model is None:
+            return
+        task_name = self._agent_task_map.pop(msg.task_id, None)
+        if not task_name:
+            return
+        summary = msg.summary or ""
+        if task_name in model.task_states:
+            model.complete_task(task_name, msg.status, summary)
+        elif task_name in model.unmapped_agents:
+            state = model.unmapped_agents[task_name]
+            state.status = msg.status
+            state.summary = summary
+        try:
+            self.query_one(TaskGraphWidget).update_model(model)
+        except LookupError:
+            pass
 
     def on_clou_escalation_arrived(self, msg: ClouEscalationArrived) -> None:
         """Escalation arrived — queue and enter decision mode."""
@@ -764,6 +949,9 @@ class ClouApp(App[None]):
         bar.phase = ""
         self._dag_tasks = []
         self._dag_deps = {}
+        self._task_graph_model = None
+        self._synthetic_dag = False
+        self._agent_task_map = {}
 
     def on_clou_handoff(self, msg: ClouHandoff) -> None:
         """Handoff ready — load content into the handoff widget."""

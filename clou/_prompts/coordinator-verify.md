@@ -11,13 +11,13 @@ handoff.
 1. Read verification/execution.md — summary first, then perception stages.
 2. Read verification/artifacts/ — key raw captures (accessibility
    snapshots, screenshots, response bodies).
-3. Compare perceptual record against requirements.md acceptance criteria.
+3. Compare perceptual record against intents.md observable outcomes.
 4. Invoke quality gate verify tools on:
    - Verifier's experience narrative from execution.md
    - Key raw artifacts (snapshots, screenshots, response bodies)
-   - Acceptance criteria from requirements.md
+   - Observable outcomes from intents.md
    Quality gate experience assessment is structural — it always runs.
-5. Evaluate quality gate findings against requirements.md scope.
+5. Evaluate quality gate findings against intents.md scope.
 6. For each finding, decide and log in decisions.md:
    - Accept (code issue): create rework EXECUTE task. Log finding,
      action, reasoning.
@@ -60,7 +60,7 @@ decisions.md entries for VERIFY (newest cycle first):
 - Environment materializes cleanly?
 - Golden paths pass end-to-end?
 - Exploratory testing findings addressed or documented?
-- Quality gate experience findings valid against requirements.md scope?
+- Quality gate experience findings valid against intents.md scope?
 - Security and accessibility issues require action regardless of scope.
 - Performance/polish suggestions outside milestone scope: override
   with reasoning, note for future milestones.

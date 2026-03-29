@@ -28,8 +28,8 @@ The per-cycle read set (DB-03, DB-04) is Clou's primary mechanism against contex
 |---|---|---|
 | PLAN | Yes | No |
 | EXECUTE | No | Yes |
-| ASSESS | No (criteria in requirements.md) | Yes |
-| VERIFY | No (criteria in requirements.md) | Yes |
+| ASSESS | No (constraints in requirements.md) | Yes |
+| VERIFY | No (outcomes in intents.md) | Yes |
 | EXIT | No | Yes |
 
 In 4 of 5 cycle types, the coordinator needs status but not the spec. With a combined file, every EXECUTE, ASSESS, VERIFY, and EXIT cycle loads the entire specification as a distractor. With split files, the orchestrator loads only `status.md` for those cycles, eliminating the distractor entirely.
@@ -51,7 +51,8 @@ DB-01 hooks operate on file paths. DB-05 structural validation checks file exist
 ```
 milestones/<name>/
 ├── milestone.md        # [supervisor writes, immutable after handoff]
-├── requirements.md     # [supervisor writes]
+├── intents.md          # [supervisor writes] — observable outcomes (DB-14)
+├── requirements.md     # [supervisor writes] — implementation constraints
 ├── status.md           # [coordinator writes]
 ├── compose.py          # [coordinator writes]
 ├── decisions.md        # [coordinator writes]
@@ -88,10 +89,10 @@ last_updated: <ISO timestamp>
 ## Per-Cycle Read Sets (Updated)
 
 ```
-PLAN:    milestone.md, requirements.md, project.md
+PLAN:    milestone.md, intents.md, requirements.md, project.md
 EXECUTE: status.md, compose.py, phase.md, active/coordinator.md
 ASSESS:  status.md, compose.py, execution.md, requirements.md, decisions.md
-VERIFY:  status.md, requirements.md, compose.py, active/coordinator.md
+VERIFY:  status.md, intents.md, compose.py, active/coordinator.md
 EXIT:    status.md, handoff.md, decisions.md, active/coordinator.md
 ```
 

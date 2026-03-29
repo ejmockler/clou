@@ -44,11 +44,16 @@ async def clou_create_milestone(
     milestone: str,
     milestone_content: str,
     requirements_content: str,
+    intents_content: str = "",
 ) -> str:
-    """Create a new milestone directory with milestone.md and requirements.md.
+    """Create a new milestone directory with milestone.md, intents.md, and requirements.md.
 
     The supervisor calls this after converging with the user — the milestone
     name and content come from the convergence dialogue.
+
+    ``intents_content`` holds observable outcomes (DB-14).  When empty the
+    file is still created as a placeholder so downstream read sets don't
+    encounter a missing file.
 
     Raises ValueError if the milestone directory already exists.
     """
@@ -58,10 +63,12 @@ async def clou_create_milestone(
         raise ValueError(msg)
     ms_dir.mkdir(parents=True)
     (ms_dir / "milestone.md").write_text(milestone_content)
+    (ms_dir / "intents.md").write_text(intents_content)
     (ms_dir / "requirements.md").write_text(requirements_content)
     return (
         f"Created milestone '{milestone}' with "
-        f"{ms_dir / 'milestone.md'} and {ms_dir / 'requirements.md'}"
+        f"{ms_dir / 'milestone.md'}, {ms_dir / 'intents.md'}, "
+        f"and {ms_dir / 'requirements.md'}"
     )
 
 

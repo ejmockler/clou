@@ -28,8 +28,8 @@ doubles for your own APIs.
 
 ## Stage 2: Golden Path Walking
 
-1. Read requirements.md — acceptance criteria.
-2. Translate criteria into concrete user journeys.
+1. Read intents.md — observable outcomes.
+2. Translate outcomes into concrete user journeys.
 3. Execute each journey against the live environment using the
    selected verification modalities.
 4. At every state transition, capture raw perception artifacts:
@@ -78,7 +78,7 @@ for simple milestones.
 If dispatched for handoff preparation:
 1. Read verification/execution.md — the perceptual record.
 2. Read verification/artifacts/ — raw captures.
-3. Read requirements.md — acceptance criteria.
+3. Read intents.md — observable outcomes.
 4. Write handoff.md following the schema in coordinator-exit.md.
 5. Leave the environment running.
 

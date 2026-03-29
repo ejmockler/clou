@@ -128,19 +128,19 @@ class TestInputInterception:
     async def test_slash_does_not_enqueue_to_supervisor(self) -> None:
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
-            inp = app.query_one("#user-input Input")
+            inp = app.query_one("#user-input ChatInput")
             inp.value = "/help"
             await inp.action_submit()
             await pilot.pause()
             # Queue should be empty — command was intercepted.
-            assert app._user_input_queue.empty()
+            assert len(app._user_input_queue) == 0
 
     @pytest.mark.asyncio
     async def test_slash_does_not_add_user_message(self) -> None:
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
             conv = app.query_one(ConversationWidget)
-            inp = app.query_one("#user-input Input")
+            inp = app.query_one("#user-input ChatInput")
             inp.value = "/help"
             await inp.action_submit()
             await pilot.pause()
@@ -152,11 +152,11 @@ class TestInputInterception:
     async def test_non_slash_still_enqueues(self) -> None:
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
-            inp = app.query_one("#user-input Input")
+            inp = app.query_one("#user-input ChatInput")
             inp.value = "hello"
             await inp.action_submit()
             await pilot.pause()
-            assert not app._user_input_queue.empty()
+            assert len(app._user_input_queue) > 0
 
 
 # ---------------------------------------------------------------------------

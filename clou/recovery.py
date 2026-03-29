@@ -184,13 +184,13 @@ def determine_next_cycle(
     cycle advances to VERIFY.
     """
     if not checkpoint_path.exists():
-        return "PLAN", ["milestone.md", "requirements.md", "project.md"]
+        return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
 
     checkpoint = parse_checkpoint(checkpoint_path.read_text())
 
     match checkpoint.next_step:
         case "PLAN":
-            return "PLAN", ["milestone.md", "requirements.md", "project.md"]
+            return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
         case "EXECUTE" | "EXECUTE (rework)" | "EXECUTE (additional verification)":
             # Defense-in-depth: reject path traversal in current_phase.
             if ".." in checkpoint.current_phase or "/" in checkpoint.current_phase:
@@ -198,7 +198,7 @@ def determine_next_cycle(
                     "Invalid current_phase %r — defaulting to PLAN",
                     checkpoint.current_phase,
                 )
-                return "PLAN", ["milestone.md", "requirements.md", "project.md"]
+                return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
             # Convergence override: if the coordinator requested rework
             # but ASSESS has converged (zero accepted findings for N
             # consecutive rounds), skip rework and advance to VERIFY.
@@ -216,7 +216,7 @@ def determine_next_cycle(
                     )
                     return "VERIFY", [
                         "status.md",
-                        "requirements.md",
+                        "intents.md",
                         "compose.py",
                         "active/coordinator.md",
                     ]
@@ -233,7 +233,7 @@ def determine_next_cycle(
                     "Invalid current_phase %r — defaulting to PLAN",
                     checkpoint.current_phase,
                 )
-                return "PLAN", ["milestone.md", "requirements.md", "project.md"]
+                return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
             return "ASSESS", [
                 "status.md",
                 "compose.py",
@@ -246,7 +246,7 @@ def determine_next_cycle(
         case "VERIFY":
             return "VERIFY", [
                 "status.md",
-                "requirements.md",
+                "intents.md",
                 "compose.py",
                 "active/coordinator.md",
             ]
@@ -260,7 +260,7 @@ def determine_next_cycle(
         case "COMPLETE":
             return "COMPLETE", []
 
-    return "PLAN", ["milestone.md", "requirements.md", "project.md"]
+    return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
 
 
 def read_cycle_count(checkpoint_path: Path) -> int:
@@ -464,6 +464,49 @@ async def write_validation_escalation(
         recommendation=(
             "Revert golden context and retry with explicit format "
             "examples in the prompt."
+        ),
+    )
+
+
+async def write_staleness_escalation(
+    project_dir: Path,
+    milestone: str,
+    cycle_type: str,
+    consecutive_count: int,
+    phases_completed: int,
+    next_step: str,
+) -> None:
+    """Write escalation when the same cycle type repeats without phase advancement."""
+    _validate_milestone(milestone)
+    _write_escalation(
+        project_dir=project_dir,
+        milestone=milestone,
+        slug="staleness",
+        title="Staleness Detected",
+        classification="blocking",
+        context=(
+            f"The coordinator has repeated the same cycle type '{cycle_type}' "
+            f"for {consecutive_count} consecutive cycles with no phase advancement."
+        ),
+        issue=(
+            f"Cycle type '{cycle_type}' has repeated {consecutive_count} times "
+            f"with phases_completed stuck at {phases_completed}. "
+            f"The orchestrator may be stuck in a loop."
+        ),
+        evidence=(
+            f"cycle_type: {cycle_type}\n"
+            f"consecutive_count: {consecutive_count}\n"
+            f"phases_completed: {phases_completed}\n"
+            f"next_step: {next_step}"
+        ),
+        options=[
+            "Review checkpoint write permissions — the coordinator may not be able to update its state",
+            "Verify golden context consistency — status.md and checkpoint may have diverged",
+            "Increase staleness threshold if the phase naturally requires many cycles",
+        ],
+        recommendation=(
+            "Check checkpoint write permissions and verify that "
+            "status.md/checkpoint next_step values are aligned."
         ),
     )
 
@@ -736,17 +779,77 @@ def log_self_heal_attempt(
 # ---------------------------------------------------------------------------
 
 
-async def git_commit_phase(project_dir: Path, milestone: str, phase: str) -> None:
-    """Commit all changes after a phase completes.
+#: Patterns excluded from selective staging (DB-15 D4).
+_STAGING_EXCLUDE_PATTERNS: tuple[str, ...] = (
+    ".clou/telemetry/*",
+    ".clou/sessions/*",
+    "node_modules/*",
+    "__pycache__/*",
+    "*.pyc",
+    ".env",
+    ".env.*",
+    "*.egg-info/*",
+    ".mypy_cache/*",
+    ".pytest_cache/*",
+    "dist/*",
+    "build/*",
+)
 
-    Uses ``git add -A`` to stage everything, then ``git diff --cached --quiet``
-    to detect changes, then ``git commit``.  No-op if nothing is staged.
+
+async def git_commit_phase(project_dir: Path, milestone: str, phase: str) -> None:
+    """Commit changes after a phase completes.
+
+    Uses selective staging (DB-15 D4): stages files from ``git diff``
+    filtered by exclude patterns, instead of ``git add -A``.  Golden
+    context files under ``.clou/`` are included (they're part of the
+    milestone record).
     """
     _validate_milestone(milestone)
 
-    # Stage all changes
+    # Get list of changed files (unstaged + untracked).
     proc = await asyncio.create_subprocess_exec(
-        "git", "add", "-A",
+        "git", "diff", "--name-only",
+        cwd=project_dir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise RuntimeError("git diff --name-only timed out after 30s") from None
+
+    # Also get untracked files.
+    proc2 = await asyncio.create_subprocess_exec(
+        "git", "ls-files", "--others", "--exclude-standard",
+        cwd=project_dir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout2_bytes, _ = await asyncio.wait_for(proc2.communicate(), timeout=30)
+    except TimeoutError:
+        proc2.kill()
+        await proc2.communicate()
+        raise RuntimeError("git ls-files timed out after 30s") from None
+
+    changed = set(stdout_bytes.decode(errors="replace").splitlines())
+    changed |= set(stdout2_bytes.decode(errors="replace").splitlines())
+    changed.discard("")
+
+    # Filter out excluded patterns.
+    to_stage = [
+        f for f in changed
+        if not any(fnmatch.fnmatch(f, pat) for pat in _STAGING_EXCLUDE_PATTERNS)
+    ]
+
+    if not to_stage:
+        return  # Nothing to commit.
+
+    # Stage selected files.
+    proc = await asyncio.create_subprocess_exec(
+        "git", "add", "--", *to_stage,
         cwd=project_dir,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -827,3 +930,71 @@ async def git_revert_golden_context(project_dir: Path, milestone: str) -> None:
         stderr_text = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
         msg = f"git revert failed (exit {proc.returncode}): {stderr_text.strip()}"
         raise RuntimeError(msg)
+
+
+# ---------------------------------------------------------------------------
+# Decisions compaction (DB-15 Tension 3)
+# ---------------------------------------------------------------------------
+
+_CYCLE_GROUP_RE = re.compile(r"(?m)^## Cycle \d+")
+
+
+def compact_decisions(
+    path: Path,
+    *,
+    keep_recent: int = 3,
+    token_threshold: int = 4000,
+) -> bool:
+    """Compact old cycle groups in decisions.md.
+
+    Keeps the most recent *keep_recent* cycle groups in full detail.
+    Older groups are reduced to one-line summaries preserving finding
+    counts and titles.  Full text is preserved in git history.
+
+    Returns True if compaction was performed.
+    """
+    if not path.exists():
+        return False
+
+    content = path.read_text(encoding="utf-8")
+
+    # Rough token estimate: ~4 chars/token.
+    if len(content) < token_threshold * 4:
+        return False
+
+    # Split into cycle groups.  Each group starts with "## Cycle N".
+    splits = list(_CYCLE_GROUP_RE.finditer(content))
+    if len(splits) <= keep_recent:
+        return False  # Not enough groups to compact.
+
+    # Everything before the first cycle group (preamble/heading).
+    preamble = content[: splits[0].start()]
+
+    # Collect groups newest-first (decisions.md is newest-first).
+    groups: list[str] = []
+    for i, match in enumerate(splits):
+        end = splits[i + 1].start() if i + 1 < len(splits) else len(content)
+        groups.append(content[match.start() : end])
+
+    # Keep recent groups verbatim, compact older ones.
+    recent = groups[:keep_recent]
+    old = groups[keep_recent:]
+
+    compacted_lines: list[str] = []
+    for group in old:
+        # Extract the heading line.
+        heading_end = group.index("\n") if "\n" in group else len(group)
+        heading = group[:heading_end].strip()
+
+        # Count accepted/overridden findings.
+        accepted = len(re.findall(r"(?m)^### Accepted:", group))
+        overridden = len(re.findall(r"(?m)^### Overridden:", group))
+
+        compacted_lines.append(
+            f"{heading} (compacted)\n"
+            f"Accepted: {accepted} | Overridden: {overridden}\n"
+        )
+
+    result = preamble + "".join(recent) + "\n".join(compacted_lines)
+    path.write_text(result, encoding="utf-8")
+    return True

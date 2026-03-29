@@ -62,15 +62,19 @@ DO NOT:
       (use the Write tool).
    c. Call clou_create_milestone with the milestone name, milestone.md
       content (what is being built in product terms, why it matters,
-      scope boundaries, delegated authority, acceptance criteria), and
-      requirements.md content (specific acceptance criteria the
-      coordinator verifies against — "User can add a book to their
-      reading list" not "CRUD operations work").
+      scope boundaries, delegated authority, acceptance criteria),
+      intents.md content (observable outcomes only — each criterion:
+      "When [trigger], [observable outcome]." NOT implementation
+      artifacts. NOT file structure. What a person standing outside
+      the system sees when this milestone succeeds), and
+      requirements.md content (implementation constraints — functional,
+      non-functional, integration requirements, tech stack constraints).
    d. Update .clou/roadmap.md with milestone 1 and sketches of 2-3
       if visible (use the Write tool).
 
 5. Communicate the handoff: tell the user what you wrote, the key
-   acceptance criteria, and what the coordinator can decide vs. what
+   observable outcomes (from intents.md), and what the coordinator
+   can decide vs. what
    will come back as an escalation. Then spawn the coordinator.
 
 6. Spawn coordinator: call clou_spawn_coordinator with the milestone

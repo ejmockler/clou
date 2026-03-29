@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 from pathlib import Path
 
 from clou.hooks import (
     AGENT_TIER_MAP,
+    WRITE_PERMISSIONS,
     HookConfig,
     _scoped_permissions,
     build_hooks,
@@ -54,11 +56,12 @@ def test_build_hooks_coordinator_has_both_phases() -> None:
     assert len(hooks["PostToolUse"]) == 1
 
 
-def test_build_hooks_non_coordinator_has_pre_only() -> None:
-    """Only coordinators get PostToolUse compose.py validation."""
-    hooks = build_hooks("worker", Path("/tmp/project"))
-    assert "PreToolUse" in hooks
-    assert "PostToolUse" not in hooks
+def test_build_hooks_all_tiers_get_post_hook() -> None:
+    """All tiers get PostToolUse for artifact form validation (DB-14)."""
+    for tier in ("worker", "supervisor", "coordinator", "verifier"):
+        hooks = build_hooks(tier, Path("/tmp/project"))
+        assert "PreToolUse" in hooks
+        assert "PostToolUse" in hooks
 
 
 def test_build_hooks_returns_hook_configs() -> None:
@@ -531,7 +534,9 @@ def test_active_supervisor_md() -> None:
     assert _is_allowed(result)
 
 
-def test_active_coordinator_md() -> None:
+def test_active_coordinator_md_root_denied() -> None:
+    """Root-level active/coordinator.md is denied -- coordinator writes to
+    milestones/{ms}/active/coordinator.md instead (checkpoint-integrity fix)."""
     hook = _get_pre_hook("coordinator")
     result = _run(
         hook(
@@ -543,7 +548,7 @@ def test_active_coordinator_md() -> None:
             {},
         )
     )
-    assert _is_allowed(result)
+    assert _is_denied(result)
 
 
 # ---------------------------------------------------------------------------
@@ -798,9 +803,18 @@ def test_scoped_permissions_with_milestone() -> None:
 
 
 def test_scoped_permissions_non_milestone_patterns_unchanged() -> None:
-    """Patterns not starting with milestones/* are unaffected."""
-    patterns = _scoped_permissions("coordinator", "auth")
-    assert "active/coordinator.md" in patterns
+    """Patterns not starting with milestones/* are unaffected by scoping.
+
+    After the checkpoint-integrity fix, coordinator's active/coordinator.md
+    pattern IS milestone-scoped (milestones/*/active/coordinator.md), so it
+    IS narrowed. Verify supervisor's non-milestone patterns remain unchanged.
+    """
+    patterns = _scoped_permissions("supervisor", "auth")
+    # Supervisor has patterns like "project.md" and "active/supervisor.md"
+    # that do not start with "milestones/*/" -- these must pass through
+    # unscoped.
+    assert "project.md" in patterns
+    assert "active/supervisor.md" in patterns
 
 
 def test_scoped_permissions_unknown_tier() -> None:
@@ -857,8 +871,14 @@ def test_scoped_coordinator_blocked_other_milestone() -> None:
     assert _is_denied(result)
 
 
-def test_scoped_coordinator_active_still_allowed() -> None:
-    """Milestone scoping doesn't affect non-milestone paths like active/."""
+def test_scoped_coordinator_active_root_denied() -> None:
+    """Root-level active/coordinator.md is denied when milestone-scoped.
+
+    After the checkpoint-integrity fix, the coordinator pattern is
+    milestones/*/active/coordinator.md, which gets scoped to
+    milestones/auth/active/coordinator.md. Root-level active/coordinator.md
+    is no longer permitted.
+    """
     hook = _get_scoped_pre_hook("coordinator", "auth")
     result = _run(
         hook(
@@ -870,7 +890,7 @@ def test_scoped_coordinator_active_still_allowed() -> None:
             {},
         )
     )
-    assert _is_allowed(result)
+    assert _is_denied(result)
 
 
 def test_scoped_worker_allowed_own_milestone() -> None:
@@ -911,6 +931,169 @@ def test_scoped_worker_blocked_other_milestone() -> None:
         )
     )
     assert _is_denied(result)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint-integrity: coordinator write permission pattern fix
+# ---------------------------------------------------------------------------
+
+
+def test_coordinator_pattern_matches_milestone_scoped_checkpoint() -> None:
+    """fnmatch confirms milestones/*/active/coordinator.md matches
+    milestone-scoped checkpoint paths."""
+    pattern = "milestones/*/active/coordinator.md"
+    assert fnmatch.fnmatch(
+        "milestones/proxy-removal/active/coordinator.md", pattern
+    )
+    assert fnmatch.fnmatch(
+        "milestones/auth/active/coordinator.md", pattern
+    )
+    # Root-level active/coordinator.md must NOT match.
+    assert not fnmatch.fnmatch("active/coordinator.md", pattern)
+
+
+def test_scoped_permissions_contains_milestone_coordinator_checkpoint() -> None:
+    """_scoped_permissions for coordinator with a milestone returns a list
+    containing milestones/{ms}/active/coordinator.md."""
+    patterns = _scoped_permissions("coordinator", "proxy-removal")
+    assert "milestones/proxy-removal/active/coordinator.md" in patterns
+
+
+def test_scoped_permissions_coordinator_no_root_active() -> None:
+    """After the fix, coordinator has no root-level active/coordinator.md
+    pattern -- all coordinator patterns are milestone-scoped."""
+    patterns = _scoped_permissions("coordinator", "some-milestone")
+    assert "active/coordinator.md" not in patterns
+
+
+def test_coordinator_allowed_milestone_scoped_checkpoint() -> None:
+    """Coordinator can write to milestones/{ms}/active/coordinator.md
+    without a template (module-level WRITE_PERMISSIONS)."""
+    hook = _get_pre_hook("coordinator")
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {
+                    "file_path": "/tmp/project/.clou/milestones"
+                    "/proxy-removal/active/coordinator.md"
+                },
+            },
+            "tool-1",
+            {},
+        )
+    )
+    assert _is_allowed(result)
+
+
+def test_coordinator_allowed_milestone_checkpoint_with_template(
+    tmp_path: Path,
+) -> None:
+    """Coordinator can write to milestones/{ms}/active/coordinator.md
+    when built with the software-construction template."""
+    from clou.harnesses.software_construction import (
+        template as sc_template,
+    )
+
+    hooks = build_hooks(
+        "coordinator",
+        tmp_path,
+        milestone="proxy-removal",
+        template=sc_template,
+    )
+    hook = hooks["PreToolUse"][0].hooks[0]
+    checkpoint_path = (
+        tmp_path
+        / ".clou"
+        / "milestones"
+        / "proxy-removal"
+        / "active"
+        / "coordinator.md"
+    )
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(checkpoint_path)},
+            },
+            "tool-1",
+            {},
+        )
+    )
+    assert _is_allowed(result)
+
+
+def test_coordinator_blocked_other_milestone_checkpoint_with_template(
+    tmp_path: Path,
+) -> None:
+    """Coordinator scoped to 'proxy-removal' cannot write to another
+    milestone's checkpoint when using a template."""
+    from clou.harnesses.software_construction import (
+        template as sc_template,
+    )
+
+    hooks = build_hooks(
+        "coordinator",
+        tmp_path,
+        milestone="proxy-removal",
+        template=sc_template,
+    )
+    hook = hooks["PreToolUse"][0].hooks[0]
+    other_checkpoint = (
+        tmp_path
+        / ".clou"
+        / "milestones"
+        / "other-ms"
+        / "active"
+        / "coordinator.md"
+    )
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(other_checkpoint)},
+            },
+            "tool-1",
+            {},
+        )
+    )
+    assert _is_denied(result)
+
+
+def test_supervisor_and_worker_permissions_unaffected() -> None:
+    """Supervisor and worker permissions are unchanged by the fix."""
+    # Supervisor still has active/supervisor.md (root-level).
+    sup_patterns = _scoped_permissions("supervisor", "m1")
+    assert "active/supervisor.md" in sup_patterns
+
+    # Worker still has only execution.md -- no coordinator checkpoint.
+    wrk_patterns = _scoped_permissions("worker", "m1")
+    assert all("active/coordinator.md" not in p for p in wrk_patterns)
+    assert "milestones/m1/phases/*/execution.md" in wrk_patterns
+
+
+def test_all_three_permission_dicts_consistent() -> None:
+    """All three permission sources have milestones/*/active/coordinator.md
+    and none have the old root-level active/coordinator.md for coordinator."""
+    from clou.harness import _INLINE_FALLBACK
+    from clou.harnesses.software_construction import (
+        template as sc_template,
+    )
+
+    sources = {
+        "WRITE_PERMISSIONS (hooks.py)": WRITE_PERMISSIONS,
+        "software_construction template": sc_template.write_permissions,
+        "_INLINE_FALLBACK (harness.py)": _INLINE_FALLBACK.write_permissions,
+    }
+
+    for name, perms in sources.items():
+        coord_perms = perms["coordinator"]
+        assert "milestones/*/active/coordinator.md" in coord_perms, (
+            f"{name} missing 'milestones/*/active/coordinator.md'"
+        )
+        assert "active/coordinator.md" not in coord_perms, (
+            f"{name} still has old root-level 'active/coordinator.md'"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1311,3 +1494,98 @@ def test_agent_tier_map_covers_all_agent_definitions() -> None:
         f"AgentDefinition keys {missing} have no entry in AGENT_TIER_MAP. "
         f"Add them to prevent fail-closed blocking of all .clou/ writes."
     )
+
+
+# ---------------------------------------------------------------------------
+# PostToolUse ArtifactForm validation (DB-14)
+# ---------------------------------------------------------------------------
+
+
+def _run_post_hook_with_template(project_dir: Path, file_path: str, content: str):
+    """Write a file and run the PostToolUse hook with a template."""
+    from clou.harness import ArtifactForm, HarnessTemplate
+
+    template = HarnessTemplate(
+        name="test",
+        description="test",
+        agents={},
+        quality_gates=[],
+        verification_modalities=[],
+        mcp_servers={},
+        write_permissions={},
+        artifact_forms={
+            "intents": ArtifactForm(
+                criterion_template="When {trigger}, {observable_outcome}",
+                anti_patterns=(
+                    "file paths or module names",
+                    "implementation verbs",
+                ),
+            ),
+        },
+    )
+    hooks = build_hooks("supervisor", project_dir, template=template)
+    post_hooks = hooks["PostToolUse"]
+    assert len(post_hooks) == 1
+    hook_fn = post_hooks[0].hooks[0]
+
+    # Write the file.
+    abs_path = Path(file_path)
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_text(content)
+
+    input_data = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": file_path},
+    }
+    return asyncio.run(hook_fn(input_data, None, {}))
+
+
+def test_post_hook_form_validation_passes_good_intents(tmp_path: Path) -> None:
+    """Good intents.md content passes PostToolUse without warnings."""
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    intents = clou_dir / "intents.md"
+    result = _run_post_hook_with_template(
+        tmp_path,
+        str(intents),
+        "- When the user opens the app, they see a dashboard\n",
+    )
+    assert "additionalContext" not in result.get("hookSpecificOutput", {})
+
+
+def test_post_hook_form_validation_warns_bad_intents(tmp_path: Path) -> None:
+    """Bad intents.md triggers additionalContext with form warnings."""
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    intents = clou_dir / "intents.md"
+    result = _run_post_hook_with_template(
+        tmp_path,
+        str(intents),
+        "- TaskGraphWidget with keyboard nav and drill-down\n",
+    )
+    ctx = result.get("hookSpecificOutput", {}).get("additionalContext", "")
+    assert "Artifact form warnings" in ctx
+    assert "does not match" in ctx
+
+
+def test_post_hook_form_validation_catches_file_paths(tmp_path: Path) -> None:
+    """File paths in intents trigger anti-pattern warnings."""
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    intents = clou_dir / "intents.md"
+    result = _run_post_hook_with_template(
+        tmp_path,
+        str(intents),
+        "- When user edits clou/ui/app.py, changes are reflected\n",
+    )
+    ctx = result.get("hookSpecificOutput", {}).get("additionalContext", "")
+    assert "file path" in ctx
+
+
+def test_post_hook_ignores_non_formed_artifacts(tmp_path: Path) -> None:
+    """Files without an ArtifactForm pass through without validation."""
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    status = clou_dir / "status.md"
+    result = _run_post_hook_with_template(
+        tmp_path,
+        str(status),
+        "totally invalid content\n",
+    )
+    assert "additionalContext" not in result.get("hookSpecificOutput", {})

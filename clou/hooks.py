@@ -3,13 +3,16 @@
 Two enforcement mechanisms:
 1. Write boundary enforcement (PreToolUse) — each tier can only write
    to specific .clou/ paths.
-2. Compose.py validation (PostToolUse) — after a coordinator writes to
-   compose.py, validate the call graph.
+2. Artifact validation (PostToolUse) — after any tier writes to a
+   golden context artifact, validate its form.  compose.py gets AST
+   validation (structural tier); formed artifacts (e.g. intents.md)
+   get ArtifactForm validation (narrative tier, DB-14).
 """
 
 from __future__ import annotations
 
 import fnmatch
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +20,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from clou.harness import HarnessTemplate
+
+_log = logging.getLogger(__name__)
 
 from clou.graph import validate
 
@@ -29,6 +34,7 @@ WRITE_PERMISSIONS: dict[str, list[str]] = {
         "requests.md",
         "understanding.md",
         "milestones/*/milestone.md",
+        "milestones/*/intents.md",
         "milestones/*/requirements.md",
         "milestones/*/escalations/*.md",
         "active/supervisor.md",
@@ -39,7 +45,7 @@ WRITE_PERMISSIONS: dict[str, list[str]] = {
         "milestones/*/decisions.md",
         "milestones/*/escalations/*.md",
         "milestones/*/phases/*/phase.md",
-        "active/coordinator.md",
+        "milestones/*/active/coordinator.md",
     ],
     "worker": [
         "milestones/*/phases/*/execution.md",
@@ -181,8 +187,26 @@ def _make_pre_hook(
 
 def _make_post_hook(
     project_dir: Path,
+    template: HarnessTemplate | None = None,
 ) -> HookCallback:
-    """Create a PostToolUse hook callback for compose.py validation."""
+    """Create a PostToolUse hook for golden context artifact validation.
+
+    Two enforcement mechanisms in one hook:
+    1. **compose.py** — AST validation via ``graph.validate`` (structural tier).
+    2. **Formed artifacts** — ``validate_artifact_form`` against the
+       ``ArtifactForm`` from the template (narrative tier, DB-14).
+
+    Returns ``additionalContext`` with specific errors so the agent
+    gets immediate feedback and can fix the artifact in-session.
+    This is LLM-Modulo applied to golden context writes.
+    """
+    from clou.validation import validate_artifact_form
+
+    # Pre-compute artifact forms lookup: filename → ArtifactForm.
+    _artifact_forms: dict[str, object] = {}
+    if template is not None:
+        for name, form in template.artifact_forms.items():
+            _artifact_forms[f"{name}.md"] = form
 
     _PASS: dict[str, Any] = {
         "hookSpecificOutput": {"hookEventName": "PostToolUse"},
@@ -206,33 +230,60 @@ def _make_post_hook(
             return _PASS
 
         resolved = Path(file_path).resolve()
-        if resolved.name != "compose.py":
-            return _PASS
-
         clou_dir = project_dir / ".clou"
         try:
-            resolved.relative_to(clou_dir.resolve())
+            relative = resolved.relative_to(clou_dir.resolve())
         except ValueError:
             return _PASS
 
-        # Read the file and validate.
+        # --- compose.py: AST validation (structural tier) ---
+        if resolved.name == "compose.py":
+            try:
+                source = resolved.read_text()
+            except OSError:
+                _log.warning("PostToolUse: cannot read %s for validation", resolved)
+                return _PASS
+            errors = validate(source)
+            if errors:
+                error_list = "\n".join(errors)
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse",
+                        "additionalContext": (
+                            "Composition errors:\n"
+                            + error_list
+                            + "\nFix the call graph."
+                        ),
+                    }
+                }
+            return _PASS
+
+        # --- Formed artifacts: ArtifactForm validation (narrative tier) ---
+        filename = resolved.name
+        form = _artifact_forms.get(filename)
+        if form is None:
+            return _PASS
+
         try:
-            source = resolved.read_text()
+            content = resolved.read_text()
         except OSError:
+            _log.warning("PostToolUse: cannot read %s for form validation", resolved)
             return _PASS
 
-        errors = validate(source)
-        if not errors:
+        findings = validate_artifact_form(content, form, str(relative))
+        if not findings:
             return _PASS
 
-        error_list = "\n".join(errors)
+        warning_list = "\n".join(f"- {f.message}" for f in findings)
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
                 "additionalContext": (
-                    "Composition errors:\n"
-                    + error_list
-                    + "\nFix the call graph."
+                    f"Artifact form warnings for {filename}:\n"
+                    + warning_list
+                    + f"\n\nExpected form: each criterion follows "
+                    + f"'{form.criterion_template or 'no template'}'. "
+                    + "Rewrite criteria as observable outcomes."
                 ),
             }
         }
@@ -328,12 +379,15 @@ def build_hooks(
                 ],
             ),
         ],
+        # Artifact validation for every tier that writes to .clou/.
+        # compose.py → AST (structural); formed artifacts → ArtifactForm
+        # (narrative, DB-14).  Immediate feedback in the agent's session.
+        "PostToolUse": [
+            HookConfig(
+                matcher=matcher,
+                hooks=[_make_post_hook(project_dir, template=template)],
+            ),
+        ],
     }
-
-    # Only add composition validation for coordinators.
-    if tier == "coordinator":
-        hooks["PostToolUse"] = [
-            HookConfig(matcher=matcher, hooks=[_make_post_hook(project_dir)]),
-        ]
 
     return hooks

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -64,6 +65,24 @@ requires_claude_auth = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 # Supervisor isolation for UI tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolate_sessions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect session writes to a temp directory.
+
+    Without this, every ``ClouApp().run_test()`` that omits
+    ``project_dir=tmp_path`` writes a real JSONL file into the repo's
+    ``.clou/sessions/`` — polluting ``/resume`` with thousands of
+    ghost sessions.
+    """
+    sessions_tmp = tmp_path / "sessions"
+    sessions_tmp.mkdir()
+
+    def _temp_sessions_dir(project_dir: Path) -> Path:  # noqa: ARG001
+        return sessions_tmp
+
+    monkeypatch.setattr("clou.session.sessions_dir", _temp_sessions_dir)
 
 
 @pytest.fixture(autouse=True)

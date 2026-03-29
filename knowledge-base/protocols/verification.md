@@ -54,7 +54,7 @@ Before anything can be tested, the system needs to be running. The verification 
 
 ### Stage 2: Golden Path Walking
 
-The verification agent reads acceptance criteria from `milestone.md` and `requirements.md`, translates them into concrete user journeys, and executes those journeys against the live environment using the selected verification modalities.
+The verification agent reads observable outcomes from `intents.md` and scope from `milestone.md`, translates them into concrete user journeys, and executes those journeys against the live environment using the selected verification modalities.
 
 **Browser modality:**
 - Playwright MCP driving a real browser
@@ -120,7 +120,7 @@ After the verification agent completes its perception stages, the coordinator ev
 ### The Pattern
 
 1. **Read the perceptual record** — verification/execution.md + artifacts/
-2. **Invoke quality gate verify tools** — pass the verifier's experience narrative, key raw artifacts (accessibility snapshots, screenshots, response bodies), and acceptance criteria from requirements.md. For software-construction: Brutalist `roast_product`.
+2. **Invoke quality gate verify tools** — pass the verifier's experience narrative, key raw artifacts (accessibility snapshots, screenshots, response bodies), and observable outcomes from intents.md. For software-construction: Brutalist `roast_product`.
 3. **Evaluate** — verifier findings + quality gate experience assessment against acceptance criteria
 4. **Decide next step:**
    - Code issue → rework EXECUTE targeting the problem, then re-VERIFY
@@ -245,7 +245,7 @@ If verification fails — environment won't start, a golden path is broken, the 
 
 ```
 phases/verification/
-├── phase.md        # Acceptance criteria from requirements.md,
+├── phase.md        # Observable outcomes from intents.md,
 │                   # translated into verifiable test plan.
 │                   # Includes selected verification modalities
 │                   # and exploratory testing scope.

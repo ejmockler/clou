@@ -824,16 +824,16 @@ class TestQueueIndicator:
             assert "2" in rendered
 
     @pytest.mark.asyncio
-    async def test_queue_count_one_shows_indicator(self) -> None:
-        """Queue count 1 should show indicator."""
+    async def test_queue_count_one_hides_indicator(self) -> None:
+        """Queue count 1 should NOT show indicator — single in-flight
+        message is already visible in the conversation."""
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
             widget.update_queue_count(1)
             await pilot.pause()
             indicator = widget.query_one("#queue-indicator", Static)
             rendered = str(indicator.render())
-            assert "1" in rendered
-            assert "queued" in rendered
+            assert "queued" not in rendered
 
     @pytest.mark.asyncio
     async def test_queue_count_zero_clears_indicator(self) -> None:
@@ -946,19 +946,18 @@ class TestStartupLifecycle:
     @pytest.mark.asyncio
     async def test_prompt_input_ready_after_greeting(self) -> None:
         """PromptInput gets placeholder when greeting arrives."""
-        from clou.ui.widgets.prompt_input import PromptInput
-        from textual.widgets import Input
+        from clou.ui.widgets.prompt_input import ChatInput, PromptInput
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
             prompt = widget.query_one(PromptInput)
             # Starts with no placeholder.
-            assert prompt.query_one(Input).placeholder == ""
+            assert prompt.query_one(ChatInput).placeholder == ""
             # Greeting arrives.
             widget.post_message(ClouSupervisorText(text="Hi!", model="opus"))
             await pilot.pause()
             # Now ready — full invitation.
-            assert prompt.query_one(Input).placeholder == "Talk to clou..."
+            assert prompt.query_one(ChatInput).placeholder == "Talk to clou..."
 
     @pytest.mark.asyncio
     async def test_wake_indicator_stopped_after_greeting(self) -> None:

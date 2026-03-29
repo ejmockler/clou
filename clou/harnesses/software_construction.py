@@ -10,6 +10,7 @@ Any divergence means the template extraction introduced a regression.
 
 from clou.harness import (
     AgentSpec,
+    ArtifactForm,
     ComposeConventions,
     HarnessTemplate,
     MCPServerSpec,
@@ -119,6 +120,7 @@ template = HarnessTemplate(
             "requests.md",
             "understanding.md",
             "milestones/*/milestone.md",
+            "milestones/*/intents.md",
             "milestones/*/requirements.md",
             "milestones/*/escalations/*.md",
             "active/supervisor.md",
@@ -129,7 +131,7 @@ template = HarnessTemplate(
             "milestones/*/decisions.md",
             "milestones/*/escalations/*.md",
             "milestones/*/phases/*/phase.md",
-            "active/coordinator.md",
+            "milestones/*/active/coordinator.md",
         ],
         "worker": [
             "milestones/*/phases/*/execution.md",
@@ -148,4 +150,14 @@ template = HarnessTemplate(
         phase_comments=True,
         validators=["graph.validate"],
     ),
+    artifact_forms={
+        "intents": ArtifactForm(
+            criterion_template="When {trigger}, {observable_outcome}",
+            anti_patterns=(
+                "file paths or module names as criterion subject",
+                "implementation verbs (extract, refactor, build) as criterion",
+                "criteria verifiable by file inspection alone",
+            ),
+        ),
+    },
 )

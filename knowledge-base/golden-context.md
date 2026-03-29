@@ -33,8 +33,9 @@ The `.clou/` directory is the system of record for all Clou planning state. It i
 ├── milestones/
 │   └── <milestone-name>/
 │       ├── milestone.md                # [supervisor writes, immutable after handoff]
+│       ├── intents.md                  # [supervisor writes] — observable outcomes (DB-14)
 │       ├── status.md                   # [coordinator writes]
-│       ├── requirements.md             # [supervisor writes]
+│       ├── requirements.md             # [supervisor writes] — implementation constraints
 │       ├── compose.py                  # [coordinator writes] — typed-function call graph
 │       ├── decisions.md                # [coordinator writes]
 │       ├── handoff.md                  # [verification agent writes]
@@ -165,15 +166,23 @@ The coordinator's progress journal. Contains:
 
 **Distinct from `active/coordinator.md`:** The checkpoint is a machine-oriented pointer (what cycle to run next). `status.md` is a human-readable progress journal (what happened). The checkpoint is deleted when the milestone completes; `status.md` persists as part of the milestone record. See [DB-07](./decision-boundaries/07-milestone-ownership.md).
 
+#### `milestones/<name>/intents.md`
+Observable outcomes — what a person standing outside the system sees when the milestone succeeds. Each criterion follows the form: "When [trigger], [observable outcome]." If a criterion can be verified by file inspection rather than system observation, it belongs in requirements.md or compose.py, not here.
+
+**Written by:** Supervisor
+**Read by:** Coordinator (during PLAN — orients decomposition), Verification agent (during VERIFY — walks golden paths against these)
+**Anti-patterns:** File paths as criterion subjects, implementation verbs (extract, refactor, build), criteria verifiable by file inspection alone.
+**See:** [DB-14](./decision-boundaries/14-intent-specification-separation.md)
+
 #### `milestones/<name>/requirements.md`
-The scoped contract between supervisor and coordinator:
-- Functional requirements
+Implementation constraints — the specification the coordinator plans against:
+- Functional requirements (what the system must do, in product terms)
 - Non-functional requirements (performance, accessibility)
 - Integration requirements (services, APIs)
 - Constraints (tech stack, patterns)
 
 **Written by:** Supervisor
-**Read by:** Coordinator, Verification agent
+**Read by:** Coordinator (during PLAN and ASSESS)
 
 #### `milestones/<name>/decisions.md`
 The coordinator's judgment log. Every time the coordinator:

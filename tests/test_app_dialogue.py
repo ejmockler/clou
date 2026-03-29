@@ -53,7 +53,7 @@ class TestInputSubmission:
     @pytest.mark.asyncio
     async def test_input_clears_on_submit(self) -> None:
         async with ClouApp().run_test() as pilot:
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             inp.value = "hello"
             await inp.action_submit()
             await pilot.pause()
@@ -61,14 +61,14 @@ class TestInputSubmission:
 
     @pytest.mark.asyncio
     async def test_input_queues_message(self) -> None:
-        """First message is active (not queued). Second message shows as queued.
+        """All messages start as queued.
         ClouProcessingStarted transitions queued messages to active."""
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             conv = pilot.app.query_one(ConversationWidget)
 
-            # First message: _queue_count is 0, so queued=False (active).
+            # First message: starts queued.
             inp.value = "first message"
             await inp.action_submit()
             await pilot.pause()
@@ -76,10 +76,10 @@ class TestInputSubmission:
             assert len(msgs) >= 1
             first_rendered = str(msgs.last().render())
             assert "first message" in first_rendered
-            assert "queued" not in first_rendered
+            assert "queued" in first_rendered
             assert app._queue_count == 1
 
-            # Second message: _queue_count is 1, so queued=True.
+            # Second message: also queued.
             inp.value = "second message"
             await inp.action_submit()
             await pilot.pause()
@@ -94,13 +94,16 @@ class TestInputSubmission:
             conv.post_message(ClouProcessingStarted(text="first message"))
             await pilot.pause()
             assert app._queue_count == 1
+            # First message should now be active (no "queued" badge).
+            first_rendered = str(msgs.first().render())
+            assert "queued" not in first_rendered
 
     @pytest.mark.asyncio
     async def test_empty_input_ignored(self) -> None:
         async with ClouApp().run_test() as pilot:
             conv = pilot.app.query_one(ConversationWidget)
             initial_count = len(conv.query(".msg"))
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             inp.value = "   "
             await inp.action_submit()
             await pilot.pause()
@@ -135,7 +138,7 @@ class TestInputSubmission:
             assert app.mode == Mode.DECISION
 
             # Submit input while in DECISION.
-            inp = pilot.app.query_one("#user-input Input")
+            inp = pilot.app.query_one("#user-input ChatInput")
             inp.value = "message during decision"
             await inp.action_submit()
             await pilot.pause()

@@ -217,11 +217,15 @@ class BreathWidget(Widget):
         self.shimmer_active = False
 
     def on_clou_agent_spawned(self, message: ClouAgentSpawned) -> None:
-        """Handle an agent dispatch — one curated line per spawn."""
+        """Handle an agent dispatch — update shimmer, no visible line.
+
+        The visible "dispatching …" line is already emitted via
+        ``ClouBreathEvent`` from ``extract_coordinator_status`` (which
+        carries the correct cycle_type).  Adding a second line here
+        would duplicate every dispatch.
+        """
         self._active_agent_count += 1
         self.shimmer_active = True
-        desc = message.description.strip()[:60] or "agent"
-        self._add_event(text=f"dispatching  {desc}", cycle_type="EXECUTE")
 
     def on_clou_agent_progress(self, message: ClouAgentProgress) -> None:
         """Agent mid-flight progress — ambient only, no visible line.

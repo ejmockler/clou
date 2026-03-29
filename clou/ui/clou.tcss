@@ -53,6 +53,16 @@ Screen {
     scrollbar-size-vertical: 0;
 }
 
+/* === Task graph — hidden by default, visible in breath/decision === */
+#task-graph {
+    display: none;
+    height: auto;
+    max-height: 40%;
+    background: $surface-deep;
+    border-bottom: hkey $border-subtle;
+    padding: 0 0 1 0;
+}
+
 /* === Breath widget — hidden by default, visible in breath/decision === */
 #breath-widget {
     display: none;
@@ -109,12 +119,18 @@ ConversationWidget.initializing #user-input {
     display: none;
 }
 
-#user-input Input {
+#user-input ChatInput {
     background: transparent;
     border: none;
+    scrollbar-size-vertical: 0;
+    scrollbar-size-horizontal: 0;
 }
 
-#user-input Input.-placeholder {
+#user-input ChatInput .text-area--cursor-line {
+    background: transparent;
+}
+
+#user-input ChatInput .text-area--placeholder {
     color: $text-muted;
 }
 
@@ -188,6 +204,10 @@ ClouApp.breath #user-input {
     opacity: 1.0;
 }
 
+ClouApp.breath #task-graph {
+    display: block;
+}
+
 ClouApp.breath #breath-widget {
     display: block;
     background: $surface-deep;
@@ -195,6 +215,11 @@ ClouApp.breath #breath-widget {
 }
 
 /* === Decision mode — breath pauses, card surfaces === */
+ClouApp.decision #task-graph {
+    display: block;
+    opacity: 0.3;
+}
+
 ClouApp.decision #breath-widget {
     display: block;
     opacity: 0.3;
