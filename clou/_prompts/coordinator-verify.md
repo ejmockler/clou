@@ -28,6 +28,14 @@ handoff.
    - Override: no changes. Log finding, reasoning for override.
    - Escalate: issue beyond coordinator authority.
 7. Write checkpoint (path in cycle prompt):
+     cycle: {current cycle number}
+     step: VERIFY
+     next_step: {see routing below}
+     current_phase: {current phase name}
+     phases_completed: {count of completed phases}
+     phases_total: {total phase count}
+
+   next_step routing:
    - If code/experience rework needed: regress to implementation phase,
      next_step: EXECUTE (rework)
    - If perception gap: next_step: EXECUTE (additional verification)

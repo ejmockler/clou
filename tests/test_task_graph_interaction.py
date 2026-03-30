@@ -394,8 +394,8 @@ class TestFocusedRowLuminanceBoost:
 class TestDrillDownShowsToolCalls:
     """Expanded task has tool call lines."""
 
-    def test_tool_call_rows_appear(self) -> None:
-        """Expanding a task adds tool_call rows to the row map."""
+    def test_tool_groups_row_appears(self) -> None:
+        """Expanding a task adds a tool_groups row to the row map."""
         w = _make_sized_widget()
         model = _make_model()
         model.add_tool_call("build_model", "Read", "main.py")
@@ -405,32 +405,34 @@ class TestDrillDownShowsToolCalls:
 
         w.on_key(_make_key_event("enter"))
 
-        # Check that tool_call rows are in the row map.
-        tc_rows = [
-            (rt, data) for rt, data in w._row_map if rt == "tool_call"
+        # Check that a tool_groups row is in the row map.
+        tg_rows = [
+            (rt, data) for rt, data in w._row_map if rt == "tool_groups"
         ]
-        assert len(tc_rows) == 2
+        assert len(tg_rows) == 1
 
-    def test_tool_call_text_content(self) -> None:
-        """Tool call rows render with arrow prefix and tool name."""
+    def test_tool_groups_text_content(self) -> None:
+        """Tool groups row renders grouped tool counts."""
         w = _make_sized_widget()
         model = _make_model()
         model.add_tool_call("build_model", "Read", "main.py")
+        model.add_tool_call("build_model", "Read", "other.py")
+        model.add_tool_call("build_model", "Grep", "pattern")
         w.update_model(model)
         w._focused_index = 0
         w.on_key(_make_key_event("enter"))
 
-        # Find the tool_call row.
+        # Find the tool_groups row.
         for y in range(len(w._row_map)):
             rt, _data = w._row_map[y]
-            if rt == "tool_call":
+            if rt == "tool_groups":
                 strip = w.render_line(y)
                 text = _strip_text(strip)
-                assert "\u2192" in text  # arrow
                 assert "Read" in text
-                assert "main.py" in text
+                assert "Grep" in text
+                assert "2\u00d7" in text  # 2× Read
                 return
-        raise AssertionError("No tool_call row found")
+        raise AssertionError("No tool_groups row found")
 
     def test_summary_row_appears(self) -> None:
         """Expanding a task with a summary shows the summary row."""
@@ -468,7 +470,7 @@ class TestDrillDownShowsToolCalls:
         assert len(summary_rows) == 0
 
     def test_collapse_removes_drill_down(self) -> None:
-        """Collapsing removes tool_call and summary rows."""
+        """Collapsing removes tool_groups and summary rows."""
         w = _make_sized_widget()
         model = _make_model()
         model.add_tool_call("build_model", "Read", "main.py")
@@ -477,10 +479,10 @@ class TestDrillDownShowsToolCalls:
         w._focused_index = 0
 
         w.on_key(_make_key_event("enter"))
-        assert any(rt == "tool_call" for rt, _ in w._row_map)
+        assert any(rt == "tool_groups" for rt, _ in w._row_map)
 
         w.on_key(_make_key_event("enter"))
-        assert not any(rt == "tool_call" for rt, _ in w._row_map)
+        assert not any(rt == "tool_groups" for rt, _ in w._row_map)
         assert not any(rt == "summary" for rt, _ in w._row_map)
 
     def test_drill_down_indentation(self) -> None:
@@ -494,13 +496,13 @@ class TestDrillDownShowsToolCalls:
 
         for y in range(len(w._row_map)):
             rt, _data = w._row_map[y]
-            if rt == "tool_call":
+            if rt == "tool_groups":
                 strip = w.render_line(y)
                 text = _strip_text(strip)
-                # Starts with 4 spaces before the arrow.
-                assert text.startswith("    \u2192")
+                # Starts with 4-space indent.
+                assert text.startswith("    ")
                 return
-        raise AssertionError("No tool_call row found")
+        raise AssertionError("No tool_groups row found")
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +541,7 @@ class TestDrillDownAnimation:
         assert l_val == _STAGE_LUMINANCE["resting"]
 
     def test_drill_down_line_uses_expansion_luminance(self) -> None:
-        """Rendered tool_call line luminance matches expansion lifecycle."""
+        """Rendered tool_groups line luminance matches expansion lifecycle."""
         w = _make_sized_widget()
         model = _make_model()
         model.add_tool_call("build_model", "Read", "main.py")
@@ -550,10 +552,10 @@ class TestDrillDownAnimation:
         w.on_key(_make_key_event("enter"))
 
         # Since we just expanded, the luminance should be arrival (0.88).
-        # Find the tool_call row and check its luminance.
+        # Find the tool_groups row and check its luminance.
         for y in range(len(w._row_map)):
             rt, _data = w._row_map[y]
-            if rt == "tool_call":
+            if rt == "tool_groups":
                 strip = w.render_line(y)
                 seg = strip._segments[5]  # a content char
                 # Arrival luminance -> RGB.
@@ -568,7 +570,7 @@ class TestDrillDownAnimation:
                     f"in {actual_style}"
                 )
                 return
-        raise AssertionError("No tool_call row found")
+        raise AssertionError("No tool_groups row found")
 
     def test_aged_expansion_uses_lower_luminance(self) -> None:
         """Backdating the expansion timestamp produces lower luminance."""
@@ -584,7 +586,7 @@ class TestDrillDownAnimation:
 
         for y in range(len(w._row_map)):
             rt, _data = w._row_map[y]
-            if rt == "tool_call":
+            if rt == "tool_groups":
                 strip = w.render_line(y)
                 seg = strip._segments[5]
                 expected_rgb = luminance_to_rgb(
@@ -598,7 +600,7 @@ class TestDrillDownAnimation:
                     f"in {actual_style}"
                 )
                 return
-        raise AssertionError("No tool_call row found")
+        raise AssertionError("No tool_groups row found")
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +649,7 @@ class TestRowMapWithExpansion:
     """Row map correctly includes drill-down rows."""
 
     def test_expanded_task_adds_rows(self) -> None:
-        """Expanding a task with 2 tool calls + summary adds 3 rows."""
+        """Expanding a task with tool calls + summary adds 2 rows."""
         w = _make_sized_widget()
         model = _make_model()
         model.add_tool_call("build_model", "Read", "main.py")
@@ -661,8 +663,8 @@ class TestRowMapWithExpansion:
         w.on_key(_make_key_event("enter"))
 
         after_count = len(w._row_map)
-        # 2 tool_call + 1 summary = 3 extra rows.
-        assert after_count == before_count + 3
+        # 1 tool_groups + 1 summary = 2 extra rows.
+        assert after_count == before_count + 2
 
     def test_multiple_tasks_expanded(self) -> None:
         """Multiple tasks can be expanded simultaneously."""
@@ -683,11 +685,11 @@ class TestRowMapWithExpansion:
         assert "build_widget" in w._expanded
         assert "build_model" in w._expanded
 
-        # Both should have tool_call rows.
-        tc_rows = [
-            (rt, data) for rt, data in w._row_map if rt == "tool_call"
+        # Both should have tool_groups rows.
+        tg_rows = [
+            (rt, data) for rt, data in w._row_map if rt == "tool_groups"
         ]
-        assert len(tc_rows) == 2
+        assert len(tg_rows) == 2
 
 
 class TestFocusOnWidgetFocus:

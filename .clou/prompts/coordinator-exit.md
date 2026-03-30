@@ -39,9 +39,13 @@ quality gate assessments resolved.
    - Milestone status: completed
 
 6. Write final checkpoint (path in cycle prompt):
-   - cycle_type: COMPLETE
-   - next_step: none
-   - The orchestrator reads this to exit the coordinator loop.
+     cycle: {current cycle number}
+     step: EXIT
+     next_step: COMPLETE
+     current_phase: completed
+     phases_completed: {total phase count}
+     phases_total: {total phase count}
+   The orchestrator reads next_step: COMPLETE to exit the coordinator loop.
 
 7. The environment must be left running for the user.
 </procedure>

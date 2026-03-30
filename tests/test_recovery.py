@@ -8,6 +8,7 @@ escalation writer coroutines.
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import pytest
@@ -1340,6 +1341,94 @@ def test_escalation_with_legacy_strings(tmp_path: Path) -> None:
     content = next(esc_dir.iterdir()).read_text()
     assert "**Classification:** blocking" in content
     assert "missing '## Cycle'" in content
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint normalisation (self-heal)
+# ---------------------------------------------------------------------------
+
+
+def test_self_heal_normalises_checkpoint_alias(tmp_path: Path) -> None:
+    """Self-heal renames 'phase' to 'current_phase' in coordinator.md."""
+    checkpoint = "cycle: 3\nnext_step: VERIFY\nphase: impl\n"
+    cp_path = tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md"
+    _write(cp_path, checkpoint)
+    errors = [
+        ValidationFinding(
+            severity=Severity.WARNING,
+            message="optional key 'current_phase' missing",
+            path="milestones/m1/active/coordinator.md",
+        ),
+    ]
+    fixes = attempt_self_heal(tmp_path, "m1", errors)
+    assert any("renamed" in f and "phase" in f for f in fixes)
+
+    content = cp_path.read_text()
+    assert "current_phase:" in content
+    # The alias should no longer exist as a standalone key.
+    assert not re.search(r"(?m)^phase:", content)
+
+
+def test_self_heal_adds_missing_checkpoint_fields(tmp_path: Path) -> None:
+    """Self-heal injects missing optional fields with defaults."""
+    checkpoint = "cycle: 2\nnext_step: ASSESS\n"
+    cp_path = tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md"
+    _write(cp_path, checkpoint)
+    errors = [
+        ValidationFinding(
+            severity=Severity.WARNING,
+            message="optional key 'step' missing",
+            path="milestones/m1/active/coordinator.md",
+        ),
+    ]
+    fixes = attempt_self_heal(tmp_path, "m1", errors)
+    assert len(fixes) >= 1
+
+    content = cp_path.read_text()
+    assert "step: PLAN" in content
+    assert "current_phase:" in content
+    assert "phases_completed: 0" in content
+    assert "phases_total: 0" in content
+
+
+def test_self_heal_checkpoint_idempotent(tmp_path: Path) -> None:
+    """Running checkpoint self-heal twice produces no additional changes."""
+    checkpoint = "cycle: 2\nnext_step: ASSESS\nphase: impl\n"
+    cp_path = tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md"
+    _write(cp_path, checkpoint)
+    errors = [
+        ValidationFinding(
+            severity=Severity.WARNING,
+            message="optional key 'step' missing",
+            path="milestones/m1/active/coordinator.md",
+        ),
+    ]
+    fixes1 = attempt_self_heal(tmp_path, "m1", errors)
+    content_after_first = cp_path.read_text()
+
+    fixes2 = attempt_self_heal(tmp_path, "m1", errors)
+    content_after_second = cp_path.read_text()
+
+    assert len(fixes1) >= 1
+    assert len(fixes2) == 0
+    assert content_after_first == content_after_second
+
+
+def test_self_heal_checkpoint_skips_without_required_keys(tmp_path: Path) -> None:
+    """Self-heal does nothing if required keys (cycle, next_step) are missing."""
+    checkpoint = "# Coordinator\nJust some text.\n"
+    cp_path = tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md"
+    _write(cp_path, checkpoint)
+    errors = [
+        ValidationFinding(
+            severity=Severity.ERROR,
+            message="missing required key 'cycle'",
+            path="milestones/m1/active/coordinator.md",
+        ),
+    ]
+    fixes = attempt_self_heal(tmp_path, "m1", errors)
+    assert fixes == []
+    assert cp_path.read_text() == checkpoint
 
 
 # ---------------------------------------------------------------------------

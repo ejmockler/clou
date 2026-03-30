@@ -30,17 +30,25 @@ Golden context artifacts fall into three tiers based on what consumes them and w
 | **Checkpoint** | `active/coordinator.md`, `status.md` | Orchestrator (`determine_next_cycle`), coordinator (cycle entry) | Wrong cycle type, lost phase position, repeated/skipped work | Key-value parsing: required keys present, values from allowed sets, phase references resolve to existing directories |
 | **Narrative** | `execution.md`, `decisions.md`, `assessment.md`, `handoff.md`, `phase.md`, `metrics.md` | Agents (read during cycles), quality gates (assess content), humans (legibility surface) | Agent reads malformed input → degraded but recoverable (agent adapts or ASSESS catches) | Form: required section headers present, status values from valid set |
 
-### D2: Checkpoint Validation Strengthened
+### D2: Checkpoint Validation — Required vs Optional Keys
 
-`active/coordinator.md` and `status.md` currently parsed by regex `key: value` extraction (recovery.py:99). This is the same vulnerability the research foundations criticize in other systems — regex-parsed markdown driving control flow.
+`active/coordinator.md` parsed by regex `key: value` extraction (recovery.py). Validation is strict for control-flow keys, tolerant for fields the parser can safely default.
 
-**Strengthen to structured parsing:**
-- Required keys validated (cycle, step, next_step, current_phase, phases_completed, phases_total for coordinator.md)
-- Values validated against allowed enums (cycle types, step names)
-- Phase references validated against existing phase directories
-- Parse failure triggers the existing DB-05 recovery path (revert golden context, retry cycle, escalate after 3 failures)
+**Required keys** (ERROR — orchestrator cannot route without them):
+- `cycle` — non-negative integer
+- `next_step` — value from allowed enum (PLAN, EXECUTE, EXECUTE (rework), EXECUTE (additional verification), ASSESS, VERIFY, EXIT, COMPLETE)
 
-This does NOT require changing the file format. The markdown `key: value` format is preserved for human legibility. The parser becomes stricter about what it accepts.
+**Optional keys** (WARNING — `parse_checkpoint()` defaults them safely):
+- `step` — defaults to PLAN
+- `current_phase` — defaults to "". Alias accepted: `phase`.
+- `phases_completed` — defaults to 0
+- `phases_total` — defaults to 0
+
+**Self-heal normalisation:** The self-heal pipeline resolves aliases (`phase` → `current_phase`, `current_cycle` → `cycle`) and injects missing optional fields before validation retry. This prevents escalation from cosmetic format variation.
+
+**Rationale:** The original D2 required all 6 keys as ERROR. In practice, agents write checkpoints from fresh sessions where only the PLAN cycle prompt showed the full format. Non-PLAN prompts mentioned only `next_step`. This caused repeated blocking escalations for missing optional fields that the parser handled gracefully. The required set was reduced to the two keys that actually drive `determine_next_cycle()` control flow. All cycle prompts now include the full 6-field format.
+
+Values validated against allowed enums (cycle types, step names). Parse failure triggers the existing DB-05 recovery path (revert golden context, retry cycle, escalate after 3 failures).
 
 ### D3: Narrative Validation Stays Form-Only
 

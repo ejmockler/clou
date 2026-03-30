@@ -2,9 +2,10 @@
 
 Two-part widget: scrollable activity text above, animated wave below.
 Activity lines are mounted as Static widgets that wrap naturally.
-The wave uses render_line for multi-row per-cell animated teal light
-with dual-wave interference, emergence from stillness, depth-graded
-chromatic color, surface glow, and block-character vertical resolution.
+The wave renders as per-cell background-color modulation — wave height
+maps to luminance, not geometry.  No block characters; just spaces
+whose background color varies per-column (wave function) and per-row
+(exponential vertical falloff for an upward glow).
 
 Shown during initialization while the supervisor orients itself.
 Replaced by the gold › prompt when the greeting arrives.
@@ -32,15 +33,15 @@ TWO_PI: float = 2.0 * math.pi
 # ── OKLCH wave palette ──────────────────────────────────────────
 _CREST_HUE: float = 178.0       # warm cyan-green at surface
 _BASE_HUE: float = 184.0        # cool blue-teal at depth (narrower range)
-_CREST_CHROMA: float = 0.08     # restrained — avoids neon
-_BASE_CHROMA: float = 0.04      # stays recognizably teal in the deep
-_CREST_L: float = 0.48          # subdued crest — closer to background
-_BASE_L: float = 0.18           # barely above background
+_CREST_CHROMA: float = 0.09     # restrained — avoids neon
+_BASE_CHROMA: float = 0.03      # stays recognizably teal in the deep
+_CREST_L: float = 0.56          # bright enough to read, not neon
+_BASE_L: float = 0.16           # deep floor
 _BG_L: float = 0.13             # surface-deep
 _BG_HEX: str = PALETTE["surface-deep"].to_hex()
-
-# ── Depth attenuation (Beer-Lambert) ───────────────────────────
-_DEPTH_COEFF: float = 2.6       # steeper falloff — bottom rows dissolve into bg
+_BG_RGB: tuple[int, int, int] = (
+    int(_BG_HEX[1:3], 16), int(_BG_HEX[3:5], 16), int(_BG_HEX[5:7], 16),
+)
 
 # ── Dual-wave parameters ────────────────────────────────────────
 _PRIMARY_SPEED: float = 0.11     # rightward traversals per second
@@ -63,18 +64,14 @@ _SHIMMER_AMP: float = 0.010
 _SHIMMER_WAVELENGTH: float = 13.0
 _SHIMMER_SPEED: float = 1.2
 
-# ── Surface glow (achromatic — matches background hue) ─────────
-_GLOW_REACH: float = 1.5        # rows of glow above surface
-_GLOW_PEAK_L: float = 0.025     # max luminance offset above BG_L
-
 # ── Deep floor ──────────────────────────────────────────────────
 _FLOOR_HEIGHT: float = 0.025     # ever-present faint base glow
 
+# ── Vertical glow falloff ──────────────────────────────────────
+_VERT_FALLOFF: float = 2.5      # exp decay: bottom=1.0, mid≈0.29, top≈0.08
+
 # ── Animation ───────────────────────────────────────────────────
 _FPS: int = 24
-
-# ── Block characters (by fill fraction, bottom-up) ─────────────
-_BLOCKS = (" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█")
 
 # ── exp(sin) normalization ──────────────────────────────────────
 _EXP_NEG1: float = math.exp(-1.0)
@@ -87,8 +84,6 @@ _TEAL_HUE: float = 180.0
 
 # ── Pre-computed LUTs ───────────────────────────────────────────
 _BODY_LUT: list[tuple[int, int, int]] | None = None
-_GLOW_LUT: list[str] | None = None
-_GLOW_STEPS: int = 16
 _TEXT_HEX: str | None = None
 
 
@@ -113,19 +108,6 @@ def _ensure_body_lut() -> list[tuple[int, int, int]]:
     return _BODY_LUT
 
 
-def _ensure_glow_lut() -> list[str]:
-    """Glow LUT: achromatic brightness on background. No hue shift."""
-    global _GLOW_LUT
-    if _GLOW_LUT is None:
-        bg = PALETTE["surface-deep"]
-        _GLOW_LUT = []
-        for i in range(_GLOW_STEPS):
-            proximity = i / max(_GLOW_STEPS - 1, 1)
-            intensity = proximity * proximity  # quadratic falloff
-            L = bg.l + _GLOW_PEAK_L * intensity
-            _GLOW_LUT.append(OklchColor(L, bg.c, bg.h).to_hex())
-    return _GLOW_LUT
-
 
 def _text_hex() -> str:
     """Teal-tinted dim text — computed once."""
@@ -136,17 +118,17 @@ def _text_hex() -> str:
 
 
 class WakeWave(Widget):
-    """Multi-row traveling teal wave with interference and emergence.
+    """Traveling teal luminance wave with interference and emergence.
 
     Dual exp(sin) waves at golden-ratio frequencies produce non-repeating
-    interference.  Block characters give sub-row vertical resolution.
-    Depth-graded chromatic color runs from bright cyan-green crests to
-    deep blue-teal base, with a luminous glow above the surface.
+    interference.  Rendered as background-color modulation on spaces —
+    wave height maps to luminance, vertical glow fades via exponential
+    row falloff.  No block characters.
     """
 
     DEFAULT_CSS = """
     WakeWave {
-        height: 4;
+        height: 3;
     }
     """
 
@@ -256,87 +238,37 @@ class WakeWave(Widget):
             return Strip.blank(w)
 
         body_lut = _ensure_body_lut()
-        glow_lut = _ensure_glow_lut()
 
-        # Absolute vertical position for this row.
-        # bottom_idx: 0 at widget bottom, H-1 at top.
-        bottom_idx = H - 1 - y
-        vert = bottom_idx / max(H - 1, 1)  # 0.0=bottom, 1.0=top
-
-        # Beer-Lambert attenuation: light decays exponentially with depth.
-        # vert=1 (top) → atten=1.0; vert=0 (bottom) → atten≈0.17
-        row_atten = math.exp(-_DEPTH_COEFF * (1.0 - vert))
+        # Row intensity: exponential falloff from bottom (bright) to top (glow).
+        # No block characters — just spaces with per-cell background color.
+        row_from_bottom = H - 1 - y
+        norm = row_from_bottom / max(H - 1, 1)  # 0=bottom, 1=top
+        row_intensity = math.exp(-_VERT_FALLOFF * norm)
 
         segments: list[Segment] = []
-        bg_style = Style(bgcolor=_BG_HEX)
+        bg_r, bg_g, bg_b = _BG_RGB
 
         for i in range(w):
             h = heights[i]
+            boost = crest_boost[i] if i < len(crest_boost) else 0.0
 
-            # How many rows filled from the bottom.
-            filled_rows = h * H
+            # Per-column brightness from wave height + crest boost.
+            brightness = 0.70 + 0.30 * h + boost * 0.08
+            brightness = max(0.0, min(1.0, brightness))
 
-            if filled_rows >= bottom_idx + 1:
-                # ── Fully inside wave body ──
-                # Brightness: absolute row attenuation * wave energy.
-                energy = 0.78 + 0.22 * h
-                boost = crest_boost[i] if i < len(crest_boost) else 0.0
-                brightness = row_atten * energy + boost * 0.10
-                brightness = max(0.0, min(1.0, brightness))
+            # Wave color from LUT.
+            lut_idx = max(0, min(255, round((1.0 - brightness) * 255)))
+            wr, wg, wb = body_lut[lut_idx]
 
-                lut_idx = max(0, min(255, round((1.0 - brightness) * 255)))
-                r, g, b = body_lut[lut_idx]
-                segments.append(Segment(
-                    "\u2588",
-                    Style(color=f"#{r:02x}{g:02x}{b:02x}", bgcolor=_BG_HEX),
-                ))
+            # Blend: wave height × row intensity.
+            blend = max(0.0, min(1.0, h * row_intensity))
 
-            elif filled_rows > bottom_idx:
-                # ── Surface transition row ──
-                fill = filled_rows - bottom_idx
-                fill = max(0.0, min(1.0, fill))
+            # Lerp background → wave color.
+            r = round(bg_r + (wr - bg_r) * blend)
+            g = round(bg_g + (wg - bg_g) * blend)
+            b = round(bg_b + (wb - bg_b) * blend)
 
-                block_idx = max(0, min(8, round(fill * 8)))
-                if block_idx == 0:
-                    segments.append(Segment(" ", bg_style))
-                    continue
-
-                # Same absolute-position model, with a surface emphasis.
-                energy = 0.78 + 0.22 * h
-                boost = crest_boost[i] if i < len(crest_boost) else 0.0
-                brightness = row_atten * energy + 0.06 + boost * 0.08
-                brightness = max(0.0, min(1.0, brightness))
-
-                lut_idx = max(0, min(255, round((1.0 - brightness) * 255)))
-                r, g, b = body_lut[lut_idx]
-
-                # Background: glow tint for the empty fraction above.
-                if fill < 0.75:
-                    glow_idx = max(0, min(
-                        _GLOW_STEPS - 1,
-                        round(fill * (_GLOW_STEPS - 1)),
-                    ))
-                    bg_hex = glow_lut[glow_idx]
-                else:
-                    bg_hex = _BG_HEX
-
-                segments.append(Segment(
-                    _BLOCKS[block_idx],
-                    Style(color=f"#{r:02x}{g:02x}{b:02x}", bgcolor=bg_hex),
-                ))
-
-            else:
-                # ── Above the wave — check for glow ──
-                dist_above = bottom_idx - filled_rows
-                if dist_above < _GLOW_REACH:
-                    proximity = 1.0 - dist_above / _GLOW_REACH
-                    glow_idx = max(0, min(
-                        _GLOW_STEPS - 1,
-                        round(proximity * (_GLOW_STEPS - 1)),
-                    ))
-                    segments.append(Segment(" ", Style(bgcolor=glow_lut[glow_idx])))
-                else:
-                    segments.append(Segment(" ", bg_style))
+            segments.append(Segment(" ", Style(bgcolor=f"#{r:02x}{g:02x}{b:02x}")))
 
         return Strip(segments, w)
 

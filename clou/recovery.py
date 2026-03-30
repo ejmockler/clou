@@ -532,6 +532,67 @@ def _is_coordinator_writable(rel_path: str, milestone: str) -> bool:
     return any(fnmatch.fnmatch(rel_path, p) for p in patterns)
 
 
+#: Field aliases agents commonly write instead of canonical names.
+_CHECKPOINT_FIELD_ALIASES: dict[str, str] = {
+    "phase": "current_phase",
+    "current_cycle": "cycle",
+    "current_step": "step",
+    "cycle_type": "step",
+}
+
+#: Canonical checkpoint fields with default values when absent.
+_CHECKPOINT_DEFAULTS: dict[str, str] = {
+    "step": "PLAN",
+    "current_phase": "",
+    "phases_completed": "0",
+    "phases_total": "0",
+}
+
+
+def _normalise_checkpoint(content: str) -> tuple[str, list[str]]:
+    """Normalise a coordinator checkpoint, resolving aliases and adding defaults.
+
+    Returns ``(new_content, list_of_descriptions)``.  Idempotent.
+    Only operates when ``cycle:`` and ``next_step:`` are present (the two
+    required keys).  Never overwrites existing fields.
+    """
+    fixes: list[str] = []
+
+    # Parse existing fields.
+    fields: dict[str, str] = {}
+    for match in re.finditer(r"(?m)^(\w[\w_]*):\s*(.+)$", content):
+        fields[match.group(1)] = match.group(2).strip()
+
+    # Bail if required keys are missing — nothing safe to normalise.
+    if "cycle" not in fields and "current_cycle" not in fields:
+        return content, fixes
+    if "next_step" not in fields:
+        return content, fixes
+
+    # Resolve aliases: rename alias keys to canonical names in-place.
+    for alias, canonical in _CHECKPOINT_FIELD_ALIASES.items():
+        if alias in fields and canonical not in fields:
+            # Replace the alias line with the canonical key.
+            content = re.sub(
+                rf"(?m)^{re.escape(alias)}:(\s*)",
+                f"{canonical}:\\1",
+                content,
+                count=1,
+            )
+            fields[canonical] = fields.pop(alias)
+            fixes.append(f"renamed '{alias}' -> '{canonical}'")
+
+    # Inject missing optional fields with defaults.
+    for key, default in _CHECKPOINT_DEFAULTS.items():
+        if key not in fields:
+            # Append after the last key-value line.
+            content = content.rstrip("\n") + f"\n{key}: {default}\n"
+            fields[key] = default
+            fixes.append(f"added missing '{key}: {default}'")
+
+    return content, fixes
+
+
 #: Common status value misspellings and their canonical forms.
 _STATUS_NORMALISATION: dict[str, str] = {
     "in progress": "in_progress",
@@ -708,6 +769,10 @@ def attempt_self_heal(
         fixes: list[str] = []
 
         # Apply fixers based on the file type.
+        if rel_path.endswith("active/coordinator.md"):
+            content, cp_fixes = _normalise_checkpoint(content)
+            fixes.extend(cp_fixes)
+
         if rel_path.endswith("status.md"):
             content, table_fixes = _normalise_status_in_table(content)
             fixes.extend(table_fixes)

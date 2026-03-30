@@ -279,15 +279,23 @@ Supervisor's checkpoint state:
 **Read by:** Orchestrator (to construct supervisor resume prompt), Supervisor (to reconstruct state)
 
 #### `milestones/<name>/active/coordinator.md`
-Coordinator's checkpoint state — milestone-scoped, a pointer, not a summary:
-- Cycle count and current step (PLAN, EXECUTE, ASSESS, VERIFY, EXIT)
-- Next step (what the next cycle should do)
-- Phase status (which are complete, in-progress, pending, blocked)
-- Partial progress (only if mid-cycle checkpoint due to context exhaustion)
+Coordinator's checkpoint state — milestone-scoped, a pointer, not a summary. Canonical fields:
+
+```
+cycle: 3
+step: ASSESS
+next_step: VERIFY
+current_phase: api-layer
+phases_completed: 2
+phases_total: 5
+```
+
+**Required** (ERROR if missing): `cycle`, `next_step` — these drive `determine_next_cycle()`.
+**Optional** (WARNING if missing): `step`, `current_phase` (alias: `phase`), `phases_completed`, `phases_total` — `parse_checkpoint()` defaults them.
 
 The checkpoint tells the orchestrator *what cycle to run next*. The reasoning is in `decisions.md`. The results are in `execution.md`. The plan is in `compose.py`. The checkpoint is NOT in the agent's read set — the orchestrator reads it and injects cycle context into the prompt.
 
-Cross-file consistency between checkpoint and status.md is validated at cycle boundary — divergence in `next_step`, `cycle`, `current_phase`, or `phases_completed` is an ERROR. See [DB-15](./decision-boundaries/15-architectural-tensions.md).
+Cross-file consistency between checkpoint and status.md is validated at cycle boundary — divergence in `next_step`, `cycle`, or `current_phase` is an ERROR. See [DB-15](./decision-boundaries/15-architectural-tensions.md). The self-heal pipeline normalises aliases and injects missing optional fields before validation retry.
 
 **Written by:** Coordinator (at every cycle boundary, before session exit)
 **Read by:** Orchestrator only (to determine next cycle type and construct prompt)

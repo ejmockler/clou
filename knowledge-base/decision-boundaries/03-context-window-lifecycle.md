@@ -208,37 +208,27 @@ last_action_at: 2026-03-19T04:30:00Z
 ```markdown
 # Coordinator Checkpoint
 
-## Milestone
-name: user-authentication
-started_at: 2026-03-19T04:00:00Z
-
-## Cycle
-current_cycle: 3
-current_step: ASSESS
+cycle: 3
+step: ASSESS
 next_step: EXECUTE (rework) | VERIFY | EXIT
-
-## Phase Status
-- phase-1-schema: completed (cycle 1)
-- phase-2-core-logic: completed (cycle 2)
-- phase-3-api-layer: in_progress (current)
-- phase-4-frontend: pending
-- verification: pending
-
-## Blocked
-- phase-4-frontend/task-stripe-integration: blocked on credential_request
-
-## Brutalist Assessment
-last_run: cycle 3
-findings: 2 accepted, 1 overridden (see decisions.md)
-rework_needed: false
-
-## Partial Progress
-(only present if mid-cycle checkpoint)
-assessed_tasks: [T1, T2, T3]
-remaining_tasks: [T4, T5]
+current_phase: api-layer
+phases_completed: 2
+phases_total: 5
 ```
 
+**Required keys** (ERROR if missing — drive orchestrator control flow):
+- `cycle` — current cycle number (non-negative integer)
+- `next_step` — routing key for `determine_next_cycle()` (one of: PLAN, EXECUTE, EXECUTE (rework), EXECUTE (additional verification), ASSESS, VERIFY, EXIT, COMPLETE)
+
+**Optional keys** (WARNING if missing — `parse_checkpoint()` defaults them):
+- `step` — cycle type just completed (defaults to PLAN)
+- `current_phase` — active phase name (defaults to ""). Alias: `phase` is accepted.
+- `phases_completed` — count of completed phases (defaults to 0)
+- `phases_total` — total phase count (defaults to 0)
+
 The checkpoint is a pointer, not a summary. It tells the next session *where* to look in the golden context, not *what* the golden context says. The reasoning is in `decisions.md`. The results are in `execution.md`. The plan is in `compose.py`. The checkpoint just says which cycle, which step, which phase.
+
+Agents may include additional narrative sections (## Assessment Result, ## Implementation Summary, etc.) — these are ignored by the parser but preserved for human legibility. The self-heal pipeline normalises aliases and injects missing optional fields.
 
 ## Resolved Questions
 

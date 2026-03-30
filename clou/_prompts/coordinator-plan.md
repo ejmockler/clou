@@ -14,11 +14,26 @@ phase specifications and initial status.
 4. Read project.md for coding conventions, tech stack, existing code.
 
 5. Decompose into phases. Each phase is a coherent unit of work:
-   - Independent phases can use gather() for parallel execution.
-   - Dependent phases are sequential — typed inputs from prior phases.
    - Keep phases small enough to complete in one EXECUTE cycle.
+   - Dependent phases are sequential — typed inputs from prior phases.
 
-6. Write compose.py — typed-function call graph:
+   Determine graph width — how many phases run in parallel:
+   a. Identify independent workstreams: changes to different files or
+      modules that don't read each other's outputs. Each is a candidate
+      for parallel execution via gather().
+   b. Reason about critical path: which sequential chain determines
+      wall-clock time? Pull work out of that chain when possible.
+   c. Balance gather() groups: tasks in a group should be roughly
+      equal effort — one dominant task makes the others wait.
+   d. When NOT to parallelize — a narrow graph is correct when:
+      - The scope is single-dimensional (one file, one concern).
+      - All changes depend on each other serially.
+      - The milestone is simple enough that multi-agent overhead
+        outweighs the parallelism benefit.
+      A narrow graph for a simple milestone is a feature, not a failure.
+
+6. Write compose.py — typed-function call graph.
+   Narrow graph (serial dependencies):
    ```python
    async def implement_auth(user_model: UserModel) -> AuthService:
        """Implement authentication service.
@@ -33,9 +48,20 @@ phase specifications and initial status.
        auth = await implement_auth(user_model)
        api = await implement_api(auth)
    ```
+   Wide graph (independent workstreams):
+   ```python
+   async def execute():
+       schema = await setup_schema()
+       api, frontend = await gather(
+           implement_api(schema),
+           scaffold_frontend(),
+       )
+       app = await integrate(api, frontend)
+   ```
    - Every async function is a task dispatched to an agent.
    - Docstrings contain success criteria (agent reads these).
    - Type annotations express dependencies between tasks.
+   - gather() expresses independence — tasks in a group run in parallel.
    - Only awaited calls in execute() are dispatched — helpers are structural.
 
 7. Write phase specs: .clou/milestones/{milestone}/phases/{phase}/phase.md

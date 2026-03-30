@@ -24,14 +24,14 @@ quality — that is ASSESS's job.
       - Monitor TaskNotificationMessages.
       - CIRCUIT BREAKER: if any member fails, abort remaining
         members. Preserve all execution.md entries. Write checkpoint
-        (path in cycle prompt) with next_step: ASSESS. Exit.
+        (see step 6) with next_step: ASSESS. Exit.
       - Collect all completion states.
 
    b. Sequential task (single-task layer):
       - Spawn one agent.
       - On completion: read execution.md summary status line.
       - CIRCUIT BREAKER: if failures or blockers detected, write
-        checkpoint (path in cycle prompt) with next_step: ASSESS. Exit.
+        checkpoint (see step 6) with next_step: ASSESS. Exit.
       - If clean: proceed to next layer.
 
 5. Agent briefing template for each spawned worker:
@@ -55,7 +55,13 @@ quality — that is ASSESS's job.
 
 6. After all tasks complete:
    - Update status.md phase progress.
-   - Write checkpoint (path in cycle prompt): next_step: ASSESS.
+   - Write checkpoint (path in cycle prompt):
+     cycle: {current cycle number}
+     step: EXECUTE
+     next_step: ASSESS
+     current_phase: {current phase name}
+     phases_completed: {count of completed phases}
+     phases_total: {total phase count}
    - Exit.
 </procedure>
 

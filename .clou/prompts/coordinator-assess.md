@@ -42,9 +42,17 @@ Determine: rework needed, phase complete, or escalation required.
    deserve more scrutiny.
 
 7. Write checkpoint (path in cycle prompt):
+     cycle: {current cycle number}
+     step: ASSESS
+     next_step: {see routing below}
+     current_phase: {current or next phase name}
+     phases_completed: {updated count}
+     phases_total: {total phase count}
+
+   next_step routing:
    - If rework needed: next_step: EXECUTE (rework)
-   - If phase complete and more phases remain: advance phase,
-     next_step: EXECUTE
+   - If phase complete and more phases remain: advance current_phase,
+     increment phases_completed, next_step: EXECUTE
    - If all phases complete: next_step: VERIFY
    - If blocked: write escalation, next_step depends on severity.
 

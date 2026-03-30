@@ -362,12 +362,12 @@ class TaskGraphWidget(Widget):
                 rows.append(("edge", layer_idx))
             for task_name in layer:
                 rows.append(("task", task_name))
-                # If expanded, add drill-down rows.
+                # If expanded, add grouped summary + optional completion.
                 if task_name in self._expanded and self._model is not None:
                     state = self._model.task_states.get(task_name)
                     if state is not None:
-                        for tc_idx in range(len(state.tool_calls)):
-                            rows.append(("tool_call", (task_name, tc_idx)))
+                        if state.tool_calls:
+                            rows.append(("tool_groups", task_name))
                         if state.summary:
                             rows.append(("summary", task_name))
 
@@ -409,6 +409,9 @@ class TaskGraphWidget(Widget):
             task_name = str(data)
             is_focused = self._is_task_focused(task_name)
             return self._render_task(width, task_name, focus_boost=is_focused)
+
+        if row_type == "tool_groups":
+            return self._render_tool_groups(width, str(data))
 
         if row_type == "tool_call":
             task_name, tc_idx = data  # type: ignore[misc]
@@ -609,6 +612,41 @@ class TaskGraphWidget(Widget):
 
         tool_name, brief = state.tool_calls[tc_idx]
         text = f"    \u2192 {tool_name}: {brief}"
+        if len(text) < width:
+            text = text + " " * (width - len(text))
+        elif len(text) > width:
+            text = text[:width]
+
+        # Compute luminance from expansion animation.
+        now = time.monotonic()
+        expanded_at = self._expansion_states.get(task_name, now)
+        l_val = _expansion_luminance(expanded_at, now)
+
+        r, g, b = luminance_to_rgb(l_val)
+        style = Style(color=Color.from_rgb(r, g, b))
+        segments = [Segment(ch, style) for ch in text]
+        return Strip(segments, width)
+
+    def _render_tool_groups(self, width: int, task_name: str) -> Strip:
+        """Render a grouped tool call summary (e.g. '3× Glob · 8× Read')."""
+        if self._model is None:
+            return Strip([Segment(" " * width, Style())], width)
+
+        state = self._model.task_states.get(task_name)
+        if state is None:
+            state = self._model.unmapped_agents.get(task_name)
+        if state is None or not state.tool_calls:
+            return Strip([Segment(" " * width, Style())], width)
+
+        # Count occurrences preserving first-seen order.
+        counts: dict[str, int] = {}
+        for name, _ in state.tool_calls:
+            counts[name] = counts.get(name, 0) + 1
+        parts = [
+            f"{count}\u00d7 {name}" if count > 1 else name
+            for name, count in counts.items()
+        ]
+        text = f"    {' \u00b7 '.join(parts)}"
         if len(text) < width:
             text = text + " " * (width - len(text))
         elif len(text) > width:

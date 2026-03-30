@@ -23,10 +23,12 @@ The coordinator is NOT a dispatcher. It does not simply assign work and collect 
       - Write services/<name>/.env.example
       - File credential_request escalation (degraded severity)
    e. Map requirements to code areas
-   f. Identify dependency structure of the work
+   f. Identify dependency structure and independent workstreams
    g. Write compose.py — the typed-function call graph for the milestone
       - Each task is an async function with typed params and return type
-      - execute() composes all tasks with gather() for concurrency
+      - Determine graph width: independent workstreams use gather(),
+        serial dependencies use sequential await
+      - Reason about critical path — minimize the longest sequential chain
       - Phase boundaries are marked with comments
       - The orchestrator validates via AST (cycles, types, completeness)
    h. For each phase, write phase.md (narrative scope for agent teams)
@@ -109,8 +111,8 @@ Before dispatching any work, the coordinator:
 
 1. **Surveys the codebase** — reads files and explores the existing code structure, patterns, and conventions
 2. **Reads requirements** — maps each requirement to specific code areas that need changes
-3. **Identifies dependencies** — determines which pieces of work depend on which others
-4. **Writes the composition** — `compose.py` expresses the full milestone as a typed-function call graph. Tasks are functions. Dependencies are arguments. Concurrency is `gather()`. The orchestrator validates the call graph automatically (cycle detection, type compatibility, completeness).
+3. **Identifies dependencies and independence** — determines which pieces of work depend on which others AND which are independent (different files/modules, no shared outputs). Independence determines graph width.
+4. **Writes the composition** — `compose.py` expresses the full milestone as a typed-function call graph. Tasks are functions. Dependencies are arguments. Independent workstreams use `gather()` for parallel execution. The coordinator reasons about critical path — which sequential chain determines wall-clock time — and structures phases to minimize it. The orchestrator validates the call graph automatically (cycle detection, type compatibility, completeness).
 5. **Writes phase narratives** — `phase.md` for each phase provides narrative scope and context for agent teams
 
 This planning phase is distinct from execution. The coordinator does not start writing code until it has a validated composition. The composition is a written artifact (`compose.py`) that can be reviewed, validated by the orchestrator, and that survives session restarts.

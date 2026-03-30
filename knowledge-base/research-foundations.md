@@ -815,6 +815,77 @@ The discovery-curation tension maps directly to DB-11's capability axes: high to
 
 ---
 
+## 15. Decomposition Topology
+
+How task graphs are shaped — their width (parallelism) versus depth (sequential chaining) — determines both wall-clock execution time and the failure surface of multi-agent systems. Recent work on LLM-based planning reveals a systematic bias toward narrow topologies and identifies principled interventions.
+
+### The Width-Defaulting Problem
+
+Shi, Zheng, and Lou (UCF, 2025) introduced LAMaS (LLM-Augmented Multi-Agent Scheduling), demonstrating that without explicit critical-path supervision, LLM planners consistently default to narrow, deep topologies even when the problem structure admits significant parallelism. The mechanism is straightforward: training data overwhelmingly contains sequential plans (step-by-step instructions, linear narratives, serialized procedures). The model's pattern completion faithfully reproduces this distribution bias.
+
+When LAMaS introduced explicit width guidance — prompting the planner to identify independent workstreams and express them as parallel branches — critical path length decreased by **38-46%** across benchmark scheduling problems. The improvement came not from better individual task decomposition but from restructuring the same tasks into wider graphs. The tasks were identical; only the topology changed.
+
+This finding has a direct analog in Clou's observed behavior: task graphs consistently contain 2 nodes (implement, verify) regardless of milestone complexity. A milestone touching three independent modules still produces a serial chain, not because the work is inherently sequential but because the planner defaults to depth.
+
+### Parallel DAG Construction and Pipelined Execution
+
+Kim et al. (ICML 2024) presented LLMCompiler, which constructs DAGs from natural language task descriptions and dispatches parallel function calls automatically. Key results:
+
+- **3.7x speedup** over sequential ReAct-style execution on multi-tool benchmarks
+- **~9% accuracy improvement** over ReAct baseline — parallelism was not just faster but more accurate, because it reduced cascading error propagation through sequential chains (cf. §9 compositionality failures at 2+ hops)
+- Planning and execution can be **pipelined**: the planner emits partial DAGs while earlier nodes execute, rather than planning the full graph before execution begins
+
+The pipelining insight is architecturally significant. A planner need not produce the complete task graph upfront — it can emit independent branches as they become identifiable, allowing execution to begin on ready nodes while planning continues. This reduces the latency cost of planning without sacrificing parallelism.
+
+### Granularity Sweet Spots
+
+Li et al. (2024) developed HiPlan, a hierarchical planning framework that empirically identified the decomposition granularity that maximizes plan quality. Their central finding: **milestone-level granularity is the sweet spot** for LLM-based decomposition.
+
+- **Action-level** decomposition (individual tool calls, single file edits) produces too many nodes. The planner's DAG reasoning degrades with node count — NLGraph (NeurIPS 2023) found frontier models handle 5-20 node DAGs at >95% accuracy, but accuracy drops as graphs grow. Action-level plans routinely exceed this range.
+- **Task-level** decomposition (entire feature implementations, full subsystem builds) is too coarse. Dependencies between subtasks are hidden inside opaque nodes, preventing the planner from identifying parallelism.
+- **Milestone-level** decomposition — chunks of work that produce a verifiable intermediate artifact — preserves enough structure for dependency reasoning while keeping node counts within the model's reliable DAG capacity.
+
+This maps directly to Clou's phase-level decomposition. Each phase in compose.py is a milestone-level unit: small enough to complete in one EXECUTE cycle, large enough to produce a verifiable artifact (execution.md). The phase granularity was chosen for operational reasons (session-per-cycle, quality gate boundaries); HiPlan provides independent empirical validation that this granularity also optimizes plan quality.
+
+### Principled Stopping Criteria for Decomposition
+
+Zhou et al. (Columbia, 2025) proposed ACONIC, which uses **treewidth** — a graph-theoretic measure of structural complexity — as a principled stopping criterion for hierarchical decomposition. The question ACONIC addresses: when should a planner stop decomposing and start executing?
+
+Key results:
+
+- **9-40% improvement** in task completion when decomposition depth was matched to problem complexity via treewidth analysis
+- Over-decomposition (too many fine-grained subtasks) degraded performance as severely as under-decomposition (too few coarse tasks)
+- Treewidth provides a measurable signal: problems with high treewidth (many interacting constraints) benefit from deeper decomposition; problems with low treewidth (mostly independent subproblems) should be decomposed shallowly and executed in parallel
+
+The practical implication: decomposition should not follow a fixed rule ("always decompose to N levels") but should adapt to the structural complexity of the specific problem. A milestone that touches one file with one concern needs minimal decomposition. A milestone that touches five independent modules needs wider decomposition, not deeper.
+
+### Clou Implication
+
+These four findings converge on a concrete design response: the coordinator's PLAN cycle (coordinator-plan.md) now includes explicit width-aware decomposition guidance.
+
+**From LAMaS — explicit width guidance in the planning prompt.** Without it, the planner defaults to serial chains regardless of problem structure. The coordinator-plan.md guidance tells the planner to identify independent workstreams (changes to different files or modules that don't depend on each other's outputs) and express that independence via `gather()` in compose.py. This directly addresses the width-defaulting bias that LAMaS documented.
+
+**From LLMCompiler — gather() as the parallel dispatch primitive.** Clou's `gather()` in compose.py is architecturally equivalent to LLMCompiler's parallel function dispatch. Independent phases placed in a `gather()` group execute concurrently, reducing wall-clock time proportional to the parallelism. The 3.7x speedup LLMCompiler achieved represents an upper bound — Clou's improvement depends on how much independence exists in a given milestone.
+
+**From HiPlan — phase-level decomposition is the right granularity.** Clou's existing phase structure already operates at the granularity HiPlan identified as optimal. Each phase produces a verifiable artifact, keeps DAG node counts within the 5-20 node range where frontier models reason reliably (NLGraph, NeurIPS 2023), and avoids the extremes of action-level noise and task-level opacity. The width-aware guidance does not change the granularity — it changes the *topology* at that granularity, from serial chains to width-proportional graphs.
+
+**From ACONIC — decomposition depth should match problem complexity.** The coordinator guidance includes a "when NOT to parallelize" clause: when the scope is genuinely single-dimensional (one file, one concern), a narrow graph is correct. This operationalizes ACONIC's treewidth insight without requiring formal treewidth computation — the planner reasons about whether the milestone's scope involves independent or interdependent workstreams.
+
+**Connections to existing research foundations:**
+- §9 (compositionality breaks at 2+ hops): Width reduces chain length. A gather() group with three parallel branches has critical path length 1, not 3. Shorter chains mean fewer opportunities for cascading composition failures.
+- §10 (CoThinker / cognitive load theory): Multi-agent overhead hurts on simple tasks. The "when NOT to parallelize" clause preserves this — a narrow graph for a simple milestone is a feature, not a failure.
+- §11 (satisficing): One decomposition, verify, proceed. The planner produces one topology (with appropriate width), validates it via AST parsing, and executes. It does not compare alternative topologies.
+- NLGraph capacity (DB-02): Frontier models handle 5-20 node DAGs at 95%+ accuracy. Phase-level decomposition with gather() produces graphs well within this capacity.
+
+**Sources:**
+- Shi, Zheng, Lou, "LAMaS: LLM-Augmented Multi-Agent Scheduling," UCF, 2025: [arXiv:2601.10560](https://arxiv.org/abs/2601.10560)
+- Kim et al., "LLMCompiler: An LLM Compiler for Parallel Function Calling," ICML 2024: [arXiv:2312.04511](https://arxiv.org/abs/2312.04511)
+- Li et al., "HiPlan: Hierarchical Planning for LLM-Based Agents," 2024: [arXiv:2508.19076](https://arxiv.org/abs/2508.19076)
+- Zhou et al., "ACONIC: Adaptive Complexity-Guided Decomposition," Columbia, 2025: [arXiv:2510.07772](https://arxiv.org/abs/2510.07772)
+- Wang et al., "NLGraph: Natural Language Is All You Need for Graph Reasoning," NeurIPS 2023: [arXiv:2305.10037](https://arxiv.org/abs/2305.10037)
+
+---
+
 ## Summary: Research-Grounded Design Principles
 
 | Research Finding | Clou Design Response |
@@ -848,3 +919,7 @@ The discovery-curation tension maps directly to DB-11's capability axes: high to
 | Situated cognition: plans as resources | Session-per-cycle + EXECUTE→ASSESS→rework loops; plans adapt to execution reality |
 | RPD prototype matching ≈ transformer pattern retrieval | Quality of decomposition tracks training data density (DB-11 capability axis) |
 | Supervisor-user dialogue is the sensemaking mechanism | No separate exploration phase at the domain-agnostic level; domain-specific exploration is a template concern |
+| LLM planners default to narrow/deep topologies (LAMaS) | Explicit width guidance in coordinator-plan.md planning prompt |
+| Parallel DAG construction yields 3.7x speedup (LLMCompiler) | gather() in compose.py for independent workstreams |
+| Milestone-level granularity is the decomposition sweet spot (HiPlan) | Phase-level decomposition: verifiable artifacts within DAG capacity |
+| Treewidth as decomposition stopping criterion (ACONIC) | "When NOT to parallelize" clause; depth matches problem complexity |

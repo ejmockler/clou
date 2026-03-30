@@ -66,7 +66,8 @@ Screen {
 /* === Breath widget — hidden by default, visible in breath/decision === */
 #breath-widget {
     display: none;
-    height: 1fr;
+    height: auto;
+    max-height: 20%;
     background: $surface-deep;
 }
 
@@ -206,6 +207,8 @@ ClouApp.breath #user-input {
 
 ClouApp.breath #task-graph {
     display: block;
+    height: 1fr;
+    max-height: 60%;
 }
 
 ClouApp.breath #breath-widget {
