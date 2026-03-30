@@ -137,12 +137,12 @@ New cycle groups are prepended at the top of the file — most recent judgments 
 
 Each coordinator cycle (PLAN, EXECUTE, ASSESS, VERIFY, EXIT) runs as a **fresh session**. The golden context is the sole state transfer mechanism between cycles — no reliance on SDK context compression or conversational continuity. The orchestrator reads `active/coordinator.md` between cycles, determines the next cycle type, and constructs a targeted prompt pointing to the specific golden context files needed.
 
-**What the coordinator reads per cycle** (only what's needed for that cycle type):
+**What the coordinator reads per cycle** (only what's needed for that cycle type — the orchestrator reads the checkpoint separately and injects cycle context into the prompt):
 - PLAN: milestone.md, intents.md, requirements.md, project.md
-- EXECUTE: status.md, compose.py, current phase's phase.md, active/coordinator.md
+- EXECUTE: status.md, compose.py, current phase's phase.md
 - ASSESS: status.md, compose.py, current phase's execution.md, requirements.md, decisions.md
-- VERIFY: status.md, intents.md, compose.py, active/coordinator.md
-- EXIT: status.md, handoff.md, decisions.md, active/coordinator.md
+- VERIFY: status.md, intents.md, compose.py
+- EXIT: status.md, handoff.md, decisions.md
 
 **What the coordinator does NOT read:**
 - Completed phases' full execution.md (prior cycles' results are in decisions.md)

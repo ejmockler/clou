@@ -172,12 +172,14 @@ def _make_pre_hook(
         if any(fnmatch.fnmatch(relative, p) for p in scoped):
             return _ALLOW
 
+        permitted = "\n".join(f"  - .clou/{p}" for p in scoped[:8])
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
                 "permissionDecisionReason": (
-                    f"{effective_tier} tier cannot write to .clou/{relative}"
+                    f"{effective_tier} tier cannot write to .clou/{relative}\n"
+                    f"Permitted paths:\n{permitted}"
                 ),
             },
         }

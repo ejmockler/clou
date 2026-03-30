@@ -46,7 +46,7 @@ phase specifications and initial status.
 
 9. Write decisions.md entry for PLAN cycle with decomposition reasoning.
 
-10. Write checkpoint to active/coordinator.md:
+10. Write checkpoint (path in cycle prompt above):
    - cycle: 1
    - step: PLAN
    - next_step: EXECUTE

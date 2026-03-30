@@ -27,7 +27,7 @@ handoff.
      action, reasoning.
    - Override: no changes. Log finding, reasoning for override.
    - Escalate: issue beyond coordinator authority.
-7. Write assessment to active/coordinator.md:
+7. Write checkpoint (path in cycle prompt):
    - If code/experience rework needed: regress to implementation phase,
      next_step: EXECUTE (rework)
    - If perception gap: next_step: EXECUTE (additional verification)

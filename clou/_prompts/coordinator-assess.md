@@ -41,7 +41,7 @@ Determine: rework needed, phase complete, or escalation required.
    Cross-model agreement strengthens the case. Single-model findings
    deserve more scrutiny.
 
-7. Write assessment to active/coordinator.md:
+7. Write checkpoint (path in cycle prompt):
    - If rework needed: next_step: EXECUTE (rework)
    - If phase complete and more phases remain: advance phase,
      next_step: EXECUTE

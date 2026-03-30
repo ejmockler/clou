@@ -11,7 +11,7 @@ quality — that is ASSESS's job.
    dependencies, and parallel groupings extracted from compose.py. Then
    read compose.py for function signatures and docstrings.
 2. Read phase.md — narrative context for agent briefings.
-3. Read active/coordinator.md — current phase position.
+3. Note the current phase from the cycle prompt context.
 
 4. Dispatch loop — use DAG layers for ordering:
 
@@ -24,14 +24,14 @@ quality — that is ASSESS's job.
       - Monitor TaskNotificationMessages.
       - CIRCUIT BREAKER: if any member fails, abort remaining
         members. Preserve all execution.md entries. Write checkpoint
-        with next_step: ASSESS. Exit.
+        (path in cycle prompt) with next_step: ASSESS. Exit.
       - Collect all completion states.
 
    b. Sequential task (single-task layer):
       - Spawn one agent.
       - On completion: read execution.md summary status line.
       - CIRCUIT BREAKER: if failures or blockers detected, write
-        checkpoint with next_step: ASSESS. Exit.
+        checkpoint (path in cycle prompt) with next_step: ASSESS. Exit.
       - If clean: proceed to next layer.
 
 5. Agent briefing template for each spawned worker:
@@ -55,7 +55,7 @@ quality — that is ASSESS's job.
 
 6. After all tasks complete:
    - Update status.md phase progress.
-   - Write checkpoint: next_step: ASSESS.
+   - Write checkpoint (path in cycle prompt): next_step: ASSESS.
    - Exit.
 </procedure>
 

@@ -112,16 +112,19 @@ This makes the harness template a complete cognitive architecture specification 
 ### D4: Updated Per-Cycle Read Sets
 
 ```
-PLAN:    milestone.md, requirements.md, intents.md, project.md
-EXECUTE: status.md, compose.py, phase.md, active/coordinator.md
-ASSESS:  status.md, compose.py, execution.md, requirements.md, decisions.md, assessment.md, active/coordinator.md
-VERIFY:  status.md, intents.md, compose.py, active/coordinator.md
-EXIT:    status.md, handoff.md, decisions.md, active/coordinator.md
+PLAN:    milestone.md, intents.md, requirements.md, project.md
+EXECUTE: status.md, compose.py, phases/{phase}/phase.md
+ASSESS:  status.md, compose.py, phases/{phase}/execution.md, requirements.md, decisions.md, assessment.md
+VERIFY:  status.md, intents.md, compose.py
+EXIT:    status.md, handoff.md, decisions.md
 ```
 
-Key changes:
+Note: the coordinator checkpoint (`milestones/<name>/active/coordinator.md`) is read by the orchestrator, not by the coordinator agent. The orchestrator injects cycle context into the prompt. See [golden-context.md](../golden-context.md#per-cycle-read-sets-canonical) for the canonical table.
+
+Key changes from pre-DB-14:
 - **PLAN** gains `intents.md` — decomposition oriented by observable outcomes
 - **VERIFY** reads `intents.md` instead of `requirements.md` — verification grounded in observable outcomes, not implementation constraints
+- **Checkpoint removed** from agent read sets — orchestrator reads it separately (DB-15 path unification)
 - **ASSESS** retains `requirements.md` (implementation constraints relevant to assessment) but drops the intent concern
 
 ### D5: intents.md Validation (Narrative Tier)

@@ -15,28 +15,34 @@ Supervisor writes:
   .clou/project.md
   .clou/roadmap.md
   .clou/requests.md                           (processing annotations)
+  .clou/understanding.md                       (durable conceptual memory, DB-13)
   .clou/milestones/<name>/milestone.md         (creation only)
-  .clou/milestones/<name>/requirements.md
+  .clou/milestones/<name>/intents.md           (observable outcomes, DB-14)
+  .clou/milestones/<name>/requirements.md      (implementation constraints)
   .clou/milestones/<name>/escalations/*.md     (disposition section only)
   .clou/active/supervisor.md
 
 Coordinator writes:
   .clou/milestones/<name>/compose.py           (typed-function call graph)
   .clou/milestones/<name>/status.md
-  .clou/milestones/<name>/decisions.md
+  .clou/milestones/<name>/decisions.md         (compacted at cycle boundary, DB-15)
   .clou/milestones/<name>/escalations/*.md     (creation)
   .clou/milestones/<name>/phases/*/phase.md
-  .clou/active/coordinator.md
+  .clou/milestones/<name>/active/coordinator.md  (milestone-scoped checkpoint)
 
 Agent Teams write:
   .clou/milestones/<name>/phases/*/execution.md
   (plus actual codebase files)
 
+Assessor writes:
+  .clou/milestones/<name>/assessment.md        (quality gate findings, DB-11)
+
 Verification Agent writes:
   .clou/milestones/<name>/phases/verification/execution.md
+  .clou/milestones/<name>/phases/verification/artifacts/*
   .clou/milestones/<name>/handoff.md
 
-Service Discovery Agent writes:
+Service Discovery Agent writes:                (planned — not yet implemented)
   .clou/services/<name>/setup.md
   .clou/services/<name>/.env.example
   .clou/services/<name>/status.md              (initial creation)
@@ -60,16 +66,19 @@ Updates happen at **loop boundaries**, not continuously. Each loop iteration pro
 - **Agent Teams:** Update `execution.md` when they complete their assigned work.
 
 ### Checkpoint Files at Cycle Boundaries
-Each coordinator cycle is a fresh session. `active/coordinator.md` is written at the end of every cycle — it is the sole state transfer mechanism between sessions. `active/supervisor.md` is written at supervisor loop boundaries. These checkpoint files are pointers, not summaries — they tell the next session where to look in the golden context.
+Each coordinator cycle is a fresh session. The coordinator checkpoint (`milestones/<name>/active/coordinator.md`) is written at the end of every cycle — it is the sole state transfer mechanism between sessions. `active/supervisor.md` is written at supervisor loop boundaries. These checkpoint files are pointers, not summaries — they tell the next session where to look in the golden context. The cycle prompt provides resolved write paths so agents emit correct file paths without inferring them from patterns.
 
 ### Coordinator-Only Commits at Phase Completion
 
 Agent teams write code but do NOT commit. The coordinator is the sole committer. At phase completion, the coordinator reviews `execution.md` and code changes, then commits a tractable delta — logically coherent changes focused on the implementation. No conversation artifacts, debug output, or intermediate states.
 
+Staging is selective (DB-15): only files appearing in `git diff` are staged, filtered by exclude patterns (telemetry, sessions, node_modules, __pycache__, .env). Not `git add -A`.
+
 This provides:
 - **Rollback granularity** — per-phase without per-cycle overhead
 - **Clean history** — only reviewed, coherent changes enter git
 - **Conflict prevention** — coordinator resolves conflicts before committing, not after
+- **No accidental staging** — build artifacts, secrets, and operational exhaust never enter git
 
 ## Split Ownership: `escalations/*.md`
 

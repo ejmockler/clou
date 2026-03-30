@@ -7,8 +7,8 @@ quality gate assessments resolved.
 </objective>
 
 <procedure>
-1. Read active/coordinator.md — confirm prior step was VERIFY with
-   all criteria satisfied.
+1. Confirm prior step was VERIFY with all criteria satisfied
+   (cycle prompt provides the context).
 2. Read verification/execution.md — the verified perceptual record.
 
 3. Dispatch handoff preparation agent:
@@ -38,7 +38,7 @@ quality gate assessments resolved.
    - All phases: completed
    - Milestone status: completed
 
-6. Write final active/coordinator.md:
+6. Write final checkpoint (path in cycle prompt):
    - cycle_type: COMPLETE
    - next_step: none
    - The orchestrator reads this to exit the coordinator loop.

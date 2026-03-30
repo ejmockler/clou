@@ -85,6 +85,8 @@ def build_cycle_prompt(
     validation_errors: Sequence[object] | None = None,
     template: HarnessTemplate | None = None,
     dag_data: tuple[list[dict[str, str]], dict[str, list[str]]] | None = None,
+    working_tree_state: str | None = None,
+    current_phase: str | None = None,
 ) -> str:
     """Construct targeted prompt for a single cycle.
 
@@ -94,19 +96,49 @@ def build_cycle_prompt(
     as its first action, then the golden context files.
     """
     milestone_prefix = f".clou/milestones/{milestone}"
-    root_prefixes = ("project.md", "active/")
     file_list = "\n".join(
-        f"- .clou/{f}" if f.startswith(root_prefixes) else f"- {milestone_prefix}/{f}"
+        f"- .clou/{f}" if f == "project.md" else f"- {milestone_prefix}/{f}"
         for f in read_set
     )
     protocol_file = str(_BUNDLED_PROMPTS / f"coordinator-{cycle_type.lower()}.md")
+
+    # Resolved write paths — the exact paths the agent must use.
+    # Protocol files say WHAT to write; the cycle prompt says WHERE.
+    write_paths = [
+        f"- {milestone_prefix}/active/coordinator.md  (checkpoint)",
+        f"- {milestone_prefix}/status.md  (progress journal)",
+    ]
+    phase_name = current_phase or "{phase}"
+    if cycle_type == "PLAN":
+        write_paths += [
+            f"- {milestone_prefix}/compose.py  (task graph)",
+            f"- {milestone_prefix}/decisions.md  (judgment log)",
+            f"- {milestone_prefix}/phases/{{phase}}/phase.md  (phase specs — one per phase you create)",
+        ]
+    elif cycle_type == "EXECUTE":
+        write_paths += [
+            f"- {milestone_prefix}/phases/{phase_name}/execution.md  (agent results)",
+        ]
+    elif cycle_type in ("ASSESS", "VERIFY"):
+        write_paths += [
+            f"- {milestone_prefix}/decisions.md  (judgment log)",
+        ]
+        if cycle_type == "VERIFY":
+            write_paths += [
+                f"- {milestone_prefix}/phases/verification/execution.md  (perceptual record)",
+            ]
+    elif cycle_type == "EXIT":
+        write_paths += [
+            f"- {milestone_prefix}/handoff.md  (prepared handoff)",
+        ]
+    write_list = "\n".join(write_paths)
 
     prompt = (
         f"This cycle: {cycle_type}.\n\n"
         f"Read your protocol file first:\n- {protocol_file}\n\n"
         f"Then read these golden context files:\n{file_list}\n\n"
-        f"Execute the {cycle_type} protocol. "
-        f"Write all state to golden context before exiting."
+        f"Write your state to these exact paths:\n{write_list}\n\n"
+        f"Execute the {cycle_type} protocol."
     )
 
     if dag_data is not None and cycle_type == "EXECUTE":
@@ -134,5 +166,20 @@ def build_cycle_prompt(
             f"Specific errors:\n{error_list}\n"
             f"Ensure all golden context writes conform to schema."
         )
+
+    if working_tree_state:
+        if validation_errors:
+            # Recovery context — failed cycle left code behind.
+            prompt += (
+                f"\n\nENVIRONMENT: The working tree has uncommitted changes "
+                f"from the previous failed cycle:\n{working_tree_state}\n"
+                f"These code changes may be valid work. "
+                f"Verify before proceeding — incorporate, fix, or discard."
+            )
+        else:
+            # Proactive context — agent should see the codebase state.
+            prompt += (
+                f"\n\nENVIRONMENT: Working tree state:\n{working_tree_state}"
+            )
 
     return prompt

@@ -44,11 +44,13 @@ The coordinator evaluates the evaluator (the quality gate), makes calls within i
 
 **Implication:** The coordinator's exit condition is conjunctive (ALL criteria must be met). The coordinator has a defined authority boundary (from `milestone.md`) and logs every exercise of judgment in `decisions.md`. It is accountable for its decisions.
 
-## 8. The golden context is the sole compaction mechanism
+## 8. Memory is retrieval, not storage
 
-Each coordinator cycle is a fresh session. The golden context is the only way state transfers between cycles — no reliance on SDK context compression, session persistence, or conversational continuity. The task DAG is expressed as a typed-function call graph in `compose.py`, validated by the orchestrator via AST parsing. `active/coordinator.md` is a pointer that tells the next session where to pick up. `decisions.md`, `execution.md`, and `compose.py` hold the reasoning, results, and plan.
+Each coordinator cycle is a fresh session. The golden context is the only way state transfers between cycles — no reliance on SDK context compression, session persistence, or conversational continuity. But the golden context is not a database. It's a retrieval surface: the orchestrator decides which files at which resolution for each specific cycle.
 
-**Implication:** The golden context unifies four roles: human-legibility surface, crash recovery, inter-cycle state transfer, and compaction. Same files, same format, four purposes. This means every piece of state that matters across cycles MUST be externalized to golden context before the session exits. If it's not in golden context, it doesn't survive.
+The transformer doesn't need categories of memory. It needs the right 7-9 files for this specific moment. Research supports this: quality peaks at 7-9 chunks filling 40-70% of the context window; every unnecessary token is actively harmful, not neutral (Research Foundations §1). Session-per-cycle IS working memory management. Per-cycle read sets ARE observation masking. Structural compaction of decisions.md IS anchored iterative summarization (Factory.ai, 3.70/5.0 on 36K real sessions). The orchestrator is the retrieval system.
+
+**Implication:** The golden context unifies four roles: human-legibility surface, crash recovery, inter-cycle state transfer, and compaction. Same files, same format, four purposes. Every piece of state that matters across cycles MUST be externalized to golden context before the session exits. If it's not in golden context, it doesn't survive. Growing files are structurally compacted at cycle boundary (DB-15 D3). The cycle prompt injects resolved write paths so agents emit correct file paths without inference (DB-15 D1).
 
 ## 9. Minimum viable human involvement, maximum clarity at each touchpoint
 

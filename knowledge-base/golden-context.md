@@ -24,7 +24,7 @@ The `.clou/` directory is the system of record for all Clou planning state. It i
 │   ├── verifier-system.xml             # Verifier system prompt template ({{milestone}})
 │   └── verifier.md                     # Verifier protocol (agent reads)
 │
-├── services/                           # [project-level, reusable across milestones]
+├── services/                           # [planned — not yet implemented]
 │   └── <service-name>/
 │       ├── setup.md                    # [agent writes]
 │       ├── status.md                   # [agent writes, user confirms]
@@ -34,14 +34,18 @@ The `.clou/` directory is the system of record for all Clou planning state. It i
 │   └── <milestone-name>/
 │       ├── milestone.md                # [supervisor writes, immutable after handoff]
 │       ├── intents.md                  # [supervisor writes] — observable outcomes (DB-14)
-│       ├── status.md                   # [coordinator writes]
 │       ├── requirements.md             # [supervisor writes] — implementation constraints
+│       ├── status.md                   # [coordinator writes]
 │       ├── compose.py                  # [coordinator writes] — typed-function call graph
-│       ├── decisions.md                # [coordinator writes]
+│       ├── decisions.md                # [coordinator writes] — compacted at cycle boundary (DB-15)
+│       ├── assessment.md               # [assessor writes] — quality gate findings (DB-11)
 │       ├── handoff.md                  # [verification agent writes]
 │       ├── metrics.md                  # [orchestrator writes — telemetry summary]
 │       ├── escalations/
 │       │   └── <timestamp>-<slug>.md   # [coordinator writes, supervisor resolves]
+│       │
+│       ├── active/
+│       │   └── coordinator.md          # [coordinator checkpoint — milestone-scoped]
 │       │
 │       └── phases/
 │           ├── <implementation-phase>/
@@ -54,9 +58,10 @@ The `.clou/` directory is the system of record for all Clou planning state. It i
 │               └── artifacts/          # [verification agent writes]
 │                   └── *.png, *.json   # Raw perception captures (DB-09)
 │
+├── understanding.md                    # [supervisor writes] — durable conceptual memory (DB-13)
+│
 └── active/
-    ├── supervisor.md                   # [supervisor checkpoint]
-    └── coordinator.md                  # [coordinator checkpoint]
+    └── supervisor.md                   # [supervisor checkpoint]
 ```
 
 ## File Purposes
@@ -164,7 +169,7 @@ The coordinator's progress journal. Contains:
 **Written by:** Coordinator (updated at every cycle boundary)
 **Read by:** Coordinator (during EXECUTE, ASSESS, VERIFY, EXIT cycles), Supervisor (for progress visibility)
 
-**Distinct from `active/coordinator.md`:** The checkpoint is a machine-oriented pointer (what cycle to run next). `status.md` is a human-readable progress journal (what happened). The checkpoint is deleted when the milestone completes; `status.md` persists as part of the milestone record. See [DB-07](./decision-boundaries/07-milestone-ownership.md).
+**Distinct from the coordinator checkpoint** (`milestones/<name>/active/coordinator.md`): The checkpoint is a machine-oriented pointer (what cycle to run next). `status.md` is a human-readable progress journal (what happened). Cross-file consistency between checkpoint and status.md is validated at cycle boundary — divergence is an ERROR. See [DB-07](./decision-boundaries/07-milestone-ownership.md).
 
 #### `milestones/<name>/intents.md`
 Observable outcomes — what a person standing outside the system sees when the milestone succeeds. Each criterion follows the form: "When [trigger], [observable outcome]." If a criterion can be verified by file inspection rather than system observation, it belongs in requirements.md or compose.py, not here.
@@ -194,6 +199,14 @@ Entries are grouped by cycle (`## Cycle N`) and ordered newest-first — most re
 
 **Written by:** Coordinator (prepends new cycle groups at top)
 **Read by:** Coordinator (ASSESS for continuity, EXIT for audit completeness), Supervisor (for milestone evaluation)
+**Compaction:** At cycle boundary, old cycle groups (beyond the 3 most recent) are structurally compacted to one-line summaries. Full text preserved in git history. See [DB-15](./decision-boundaries/15-architectural-tensions.md).
+
+#### `milestones/<name>/assessment.md`
+Structured findings from quality gate invocation. The assessor agent runs quality gate tools (e.g., Brutalist roast) on changed code and structures raw findings into this file. The coordinator evaluates these findings during ASSESS — accepting, overriding, or escalating each one.
+
+**Written by:** Assessor agent (quality gate capture only — does not evaluate findings)
+**Read by:** Coordinator (during ASSESS for finding evaluation)
+**Validation tier:** Narrative (DB-12) — required sections, status values checked; content quality is the coordinator's responsibility.
 
 #### `milestones/<name>/handoff.md`
 The prepared handoff from agent to human. Written by the verification agent after successfully walking golden paths. Includes:
@@ -265,28 +278,51 @@ Supervisor's checkpoint state:
 **Written by:** Supervisor (at each loop boundary)
 **Read by:** Orchestrator (to construct supervisor resume prompt), Supervisor (to reconstruct state)
 
-#### `active/coordinator.md`
-Coordinator's checkpoint state — a pointer, not a summary:
+#### `milestones/<name>/active/coordinator.md`
+Coordinator's checkpoint state — milestone-scoped, a pointer, not a summary:
 - Cycle count and current step (PLAN, EXECUTE, ASSESS, VERIFY, EXIT)
 - Next step (what the next cycle should do)
 - Phase status (which are complete, in-progress, pending, blocked)
 - Partial progress (only if mid-cycle checkpoint due to context exhaustion)
 
-The checkpoint tells the orchestrator *what cycle to run next* and tells the new session *where to look* in the golden context. The reasoning is in `decisions.md`. The results are in `execution.md`. The plan is in `compose.py`.
+The checkpoint tells the orchestrator *what cycle to run next*. The reasoning is in `decisions.md`. The results are in `execution.md`. The plan is in `compose.py`. The checkpoint is NOT in the agent's read set — the orchestrator reads it and injects cycle context into the prompt.
+
+Cross-file consistency between checkpoint and status.md is validated at cycle boundary — divergence in `next_step`, `cycle`, `current_phase`, or `phases_completed` is an ERROR. See [DB-15](./decision-boundaries/15-architectural-tensions.md).
 
 **Written by:** Coordinator (at every cycle boundary, before session exit)
-**Read by:** Orchestrator (to determine next cycle type and construct prompt), Coordinator (to reconstruct state)
+**Read by:** Orchestrator only (to determine next cycle type and construct prompt)
 
 ## Ownership Rules
+
+<!-- DERIVED FROM CODE: clou/hooks.py:WRITE_PERMISSIONS, clou/harnesses/software_construction.py:write_permissions -->
 
 | Tier | Writes | Reads |
 |---|---|---|
 | User | `requests.md`, credential confirmations in `services/*/status.md` | Anything (via supervisor conversation) |
-| Supervisor | `project.md`, `roadmap.md`, `requests.md` (processing), milestone creation (`milestone.md`, `requirements.md`), escalation dispositions, `active/supervisor.md` | Everything |
-| Orchestrator | `metrics.md` (automated telemetry summary at milestone completion) | Span log, golden context structure |
-| Coordinator | `compose.py`, `status.md`, `decisions.md`, `escalations/`, phase directories (`phase.md`), `active/coordinator.md` | Everything in its milestone directory + top-level project files |
-| Agent Teams | `execution.md` within assigned phase | Phase spec + codebase |
-| Verification Agent | `execution.md` in verification phase, `handoff.md` | Milestone spec + requirements + running environment |
+| Supervisor | `project.md`, `roadmap.md`, `requests.md` (processing), `understanding.md` (DB-13), milestone creation (`milestone.md`, `intents.md` (DB-14), `requirements.md`), escalation dispositions, `active/supervisor.md` | Everything |
+| Orchestrator | `metrics.md` (automated telemetry summary) | Span log, golden context structure |
+| Coordinator | `compose.py`, `status.md`, `decisions.md`, `escalations/`, phase directories (`phase.md`), `milestones/<name>/active/coordinator.md` | Everything in its milestone directory + `project.md` |
+| Agent Teams | `phases/*/execution.md` within assigned phase | Phase spec + codebase |
+| Assessor | `assessment.md` (quality gate findings, DB-11) | Phase execution + compose.py + project context |
+| Verification Agent | `phases/verification/execution.md`, `phases/verification/artifacts/*`, `handoff.md` | Milestone spec + intents + running environment |
+
+## Per-Cycle Read Sets (Canonical)
+
+<!-- DERIVED FROM CODE: clou/recovery.py:determine_next_cycle() -->
+
+The orchestrator reads the coordinator checkpoint (`milestones/<name>/active/coordinator.md`) separately and injects cycle context into the prompt. The checkpoint is not in any agent read set — it is orchestrator infrastructure.
+
+```
+PLAN:    milestone.md, intents.md, requirements.md, project.md
+EXECUTE: status.md, compose.py, phases/{phase}/phase.md
+ASSESS:  status.md, compose.py, phases/{phase}/execution.md, requirements.md, decisions.md, assessment.md
+VERIFY:  status.md, intents.md, compose.py
+EXIT:    status.md, handoff.md, decisions.md
+```
+
+The cycle prompt also injects resolved write paths — exact file paths the coordinator must use for each cycle type. See [DB-15](./decision-boundaries/15-architectural-tensions.md) D1.
+
+All read set entries except `project.md` resolve under `.clou/milestones/<name>/`. Quality peaks at 7-9 chunks filling 40-70% of the context window (chunking research) — the read sets are sized to this range.
 
 ## Structural Validation
 

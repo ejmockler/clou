@@ -90,11 +90,13 @@ last_updated: <ISO timestamp>
 
 ```
 PLAN:    milestone.md, intents.md, requirements.md, project.md
-EXECUTE: status.md, compose.py, phase.md, active/coordinator.md
-ASSESS:  status.md, compose.py, execution.md, requirements.md, decisions.md
-VERIFY:  status.md, intents.md, compose.py, active/coordinator.md
-EXIT:    status.md, handoff.md, decisions.md, active/coordinator.md
+EXECUTE: status.md, compose.py, phase.md
+ASSESS:  status.md, compose.py, execution.md, requirements.md, decisions.md, assessment.md
+VERIFY:  status.md, intents.md, compose.py
+EXIT:    status.md, handoff.md, decisions.md
 ```
+
+Note: the coordinator checkpoint (`milestones/<name>/active/coordinator.md`) is read by the orchestrator, not by the coordinator agent. The orchestrator extracts cycle context and injects it into the cycle prompt. The checkpoint is not in any agent read set.
 
 ## Why Not Divider Convention
 

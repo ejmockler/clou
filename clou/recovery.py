@@ -125,7 +125,7 @@ def parse_checkpoint(content: str) -> Checkpoint:
         cycle=_safe_int(fields.get("cycle", "0")),
         step=fields.get("step", "PLAN"),
         next_step=next_step,
-        current_phase=fields.get("current_phase", ""),
+        current_phase=fields.get("current_phase", fields.get("phase", "")),
         phases_completed=_safe_int(fields.get("phases_completed", "0")),
         phases_total=_safe_int(fields.get("phases_total", "0")),
     )
@@ -218,13 +218,11 @@ def determine_next_cycle(
                         "status.md",
                         "intents.md",
                         "compose.py",
-                        "active/coordinator.md",
                     ]
             return "EXECUTE", [
                 "status.md",
                 "compose.py",
                 f"phases/{checkpoint.current_phase}/phase.md",
-                "active/coordinator.md",
             ]
         case "ASSESS":
             # Defense-in-depth: reject path traversal in current_phase.
@@ -241,21 +239,18 @@ def determine_next_cycle(
                 "requirements.md",
                 "decisions.md",
                 "assessment.md",
-                "active/coordinator.md",
             ]
         case "VERIFY":
             return "VERIFY", [
                 "status.md",
                 "intents.md",
                 "compose.py",
-                "active/coordinator.md",
             ]
         case "EXIT":
             return "EXIT", [
                 "status.md",
                 "handoff.md",
                 "decisions.md",
-                "active/coordinator.md",
             ]
         case "COMPLETE":
             return "COMPLETE", []
@@ -273,13 +268,22 @@ def read_cycle_count(checkpoint_path: Path) -> int:
     return parse_checkpoint(checkpoint_path.read_text()).cycle
 
 
-def read_cycle_outcome(project_dir: Path) -> str:
+def read_cycle_outcome(project_dir: Path, milestone: str = "") -> str:
     """Read the outcome of the last completed cycle from the checkpoint.
 
     Returns the ``next_step`` field which indicates what should happen next.
     Returns ``"PLAN"`` if no checkpoint exists.
+
+    When *milestone* is provided, reads the milestone-scoped checkpoint
+    (``milestones/{milestone}/active/coordinator.md``).
     """
-    checkpoint_path = project_dir / ".clou" / "active" / "coordinator.md"
+    if milestone:
+        checkpoint_path = (
+            project_dir / ".clou" / "milestones" / milestone / "active" / "coordinator.md"
+        )
+    else:
+        # Legacy fallback — root-scoped path.
+        checkpoint_path = project_dir / ".clou" / "active" / "coordinator.md"
     if not checkpoint_path.exists():
         return "PLAN"
     return parse_checkpoint(checkpoint_path.read_text()).next_step
@@ -627,8 +631,8 @@ def _add_missing_current_state_fields(
     section_end = section_start + next_header.start() if next_header else len(content)
     section_text = content[section_start:section_end]
 
-    # Read checkpoint defaults.
-    checkpoint_path = project_dir / ".clou" / "active" / "coordinator.md"
+    # Read checkpoint defaults (milestone-scoped path).
+    checkpoint_path = project_dir / ".clou" / "milestones" / milestone / "active" / "coordinator.md"
     default_phase = "unknown"
     default_cycle = "1"
     if checkpoint_path.exists():
@@ -904,18 +908,30 @@ async def git_commit_phase(project_dir: Path, milestone: str, phase: str) -> Non
 
 
 async def git_revert_golden_context(project_dir: Path, milestone: str) -> None:
-    """Revert golden context files to pre-cycle state.
+    """Revert coordinator-owned golden context files to pre-cycle state.
 
-    Uses ``git checkout HEAD --`` to restore active context and milestone files.
+    Only reverts files the coordinator owns (DB-07 ownership).
+    Supervisor-authored files (milestone.md, intents.md, requirements.md)
+    are NOT reverted — they are immutable after handoff.
     """
     _validate_milestone(milestone)
+    ms = f".clou/milestones/{milestone}"
+    # Coordinator-owned files only — NOT milestone.md, intents.md, requirements.md.
+    coordinator_paths = [
+        f"{ms}/active/",
+        f"{ms}/status.md",
+        f"{ms}/compose.py",
+        f"{ms}/decisions.md",
+        f"{ms}/assessment.md",
+        f"{ms}/escalations/",
+        f"{ms}/phases/",
+    ]
     proc = await asyncio.create_subprocess_exec(
         "git",
         "checkout",
         "HEAD",
         "--",
-        ".clou/active/",
-        f".clou/milestones/{milestone}/",
+        *coordinator_paths,
         cwd=project_dir,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

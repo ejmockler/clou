@@ -133,32 +133,78 @@ def test_build_cycle_prompt_empty_validation_errors(tmp_path: Path) -> None:
     assert "WARNING" not in result
 
 
-def test_build_cycle_prompt_project_md_prefix_only(tmp_path: Path) -> None:
-    """Only files starting with 'project.md' get the .clou/ prefix."""
+def test_build_cycle_prompt_only_project_md_is_root_scoped(tmp_path: Path) -> None:
+    """Only exact 'project.md' gets the .clou/ prefix; variants go to milestone."""
     result = build_cycle_prompt(
         project_dir=tmp_path,
         milestone="m01",
         cycle_type="Build",
-        read_set=["project.md.bak", "my-project.md"],
+        read_set=["project.md", "project.md.bak", "my-project.md"],
     )
-    # project.md.bak starts with "project.md" -> .clou/ prefix
-    assert "- .clou/project.md.bak" in result
-    # my-project.md does NOT start with "project.md" -> milestone prefix
+    # Exact project.md → .clou/ root prefix
+    assert "- .clou/project.md" in result
+    # project.md.bak is NOT project.md → milestone prefix
+    assert "- .clou/milestones/m01/project.md.bak" in result
+    # my-project.md → milestone prefix
     assert "- .clou/milestones/m01/my-project.md" in result
 
 
-def test_build_cycle_prompt_active_coordinator_routing(tmp_path: Path) -> None:
-    """active/coordinator.md routes to .clou/active/, not milestone prefix."""
+def test_build_cycle_prompt_all_non_project_go_to_milestone(tmp_path: Path) -> None:
+    """All read set entries except project.md resolve under the milestone."""
     result = build_cycle_prompt(
         project_dir=tmp_path,
         milestone="m01",
         cycle_type="EXECUTE",
-        read_set=["status.md", "active/coordinator.md"],
+        read_set=["status.md", "compose.py"],
     )
-    assert "- .clou/active/coordinator.md" in result
     assert "- .clou/milestones/m01/status.md" in result
-    # Must NOT produce the wrong path
-    assert ".clou/milestones/m01/active/coordinator.md" not in result
+    assert "- .clou/milestones/m01/compose.py" in result
+
+
+# ---------------------------------------------------------------------------
+# Working tree state injection (DB-15 D6)
+# ---------------------------------------------------------------------------
+
+
+def test_working_tree_state_in_retry_prompt(tmp_path: Path) -> None:
+    """Failed cycle's working tree state appears in retry prompt."""
+    result = build_cycle_prompt(
+        project_dir=tmp_path,
+        milestone="m01",
+        cycle_type="EXECUTE",
+        read_set=["status.md"],
+        validation_errors=["missing '## Summary'"],
+        working_tree_state="src/main.py | 10 +++++\n 1 file changed",
+    )
+    assert "ENVIRONMENT" in result
+    assert "src/main.py" in result
+    assert "previous failed cycle" in result
+
+
+def test_working_tree_state_proactive(tmp_path: Path) -> None:
+    """Proactive environment state for EXECUTE without validation errors."""
+    result = build_cycle_prompt(
+        project_dir=tmp_path,
+        milestone="m01",
+        cycle_type="EXECUTE",
+        read_set=["status.md"],
+        working_tree_state="src/utils.py | 3 +++\n 1 file changed",
+    )
+    assert "ENVIRONMENT" in result
+    assert "src/utils.py" in result
+    # Should NOT mention "failed cycle" when no validation errors
+    assert "failed cycle" not in result
+
+
+def test_no_working_tree_state_when_clean(tmp_path: Path) -> None:
+    """No environment section when working tree is clean."""
+    result = build_cycle_prompt(
+        project_dir=tmp_path,
+        milestone="m01",
+        cycle_type="EXECUTE",
+        read_set=["status.md"],
+    )
+    assert "ENVIRONMENT" not in result
 
 
 # ---------------------------------------------------------------------------

@@ -141,7 +141,7 @@ def test_determine_next_cycle_execute(tmp_path: Path) -> None:
     cycle_type, read_set = determine_next_cycle(cp_path, "m1")
     assert cycle_type == "EXECUTE"
     assert "phases/design/phase.md" in read_set
-    assert "active/coordinator.md" in read_set
+    assert "active/coordinator.md" not in read_set  # DB-15: removed from read sets
 
 
 def test_determine_next_cycle_execute_rework(tmp_path: Path) -> None:

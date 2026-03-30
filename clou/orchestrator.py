@@ -179,6 +179,37 @@ def _context_exhausted(msg: object) -> bool:
     return False
 
 
+_ENV_PROBE_MAX_LINES: int = 20
+
+
+async def _capture_working_tree_state(project_dir: Path) -> str | None:
+    """Capture git diff --stat for the working tree (truncated).
+
+    Returns the diff stat output (max ``_ENV_PROBE_MAX_LINES`` lines),
+    or None if clean or error.  Used to make partial work from failed
+    cycles visible to the next cycle's coordinator (DB-15 D6:
+    describe the environment, don't try to control it).
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff", "--stat",
+            cwd=project_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        output = stdout.decode(errors="replace").strip()
+        if not output:
+            return None
+        lines = output.splitlines()
+        if len(lines) > _ENV_PROBE_MAX_LINES:
+            shown = "\n".join(lines[:_ENV_PROBE_MAX_LINES])
+            return f"{shown}\n... and {len(lines) - _ENV_PROBE_MAX_LINES} more files"
+        return output
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Agent team definitions
 # ---------------------------------------------------------------------------
@@ -650,13 +681,16 @@ async def run_coordinator(
     # Outside .clou/active/ so git_revert_golden_context doesn't touch it.
     milestone_marker = clou_dir / ".coordinator-milestone"
     validation_retries = 0
+    readiness_retries = 0
     crash_retries = 0
     pending_validation_errors: list[ValidationFinding] | None = None
+    _pending_working_tree: str | None = None
 
     # Staleness detection state (F3).
     _prev_cycle_type: str | None = None
     _prev_phases_completed: int = -1
     _staleness_count: int = 0
+    _saw_type_change: bool = False  # True if cycle type changed since last reset
 
     decisions_path = clou_dir / "milestones" / milestone / "decisions.md"
     seen_path = clou_dir / "active" / "seen-escalations.txt"
@@ -664,25 +698,31 @@ async def run_coordinator(
     if seen_path.exists():
         seen_escalations = set(seen_path.read_text().splitlines())
 
-    # DB-15 D5: Reset cycle count if latest escalation was resolved.
+    # DB-15 D5: Reset cycle count if the LATEST escalation was resolved.
+    # Check only the most recent escalation (sorted by timestamp filename).
     esc_dir = clou_dir / "milestones" / milestone / "escalations"
     if esc_dir.is_dir() and checkpoint_path.exists():
-        resolved = any(
-            "disposition:" in f.read_text(encoding="utf-8")
-            for f in sorted(esc_dir.glob("*.md"))
+        esc_files = sorted(esc_dir.glob("*.md"))
+        latest = esc_files[-1] if esc_files else None
+        resolved = bool(
+            latest
+            and re.search(
+                r"(?m)^status:\s*(resolved|overridden)",
+                latest.read_text(encoding="utf-8"),
+            )
         )
         if resolved:
-            # Write a fresh checkpoint with cycle count 0 but preserve
-            # the current phase/step from the existing checkpoint.
+            # Only reset if not already consumed (prevent replay on re-spawn).
             cp = parse_checkpoint(checkpoint_path.read_text())
-            checkpoint_path.write_text(
-                f"cycle: 0\n"
-                f"step: {cp.step}\n"
-                f"next_step: {cp.next_step}\n"
-                f"current_phase: {cp.current_phase}\n"
-                f"phases_completed: {cp.phases_completed}\n"
-                f"phases_total: {cp.phases_total}\n"
-            )
+            if cp.cycle > 0:
+                checkpoint_path.write_text(
+                    f"cycle: 0\n"
+                    f"step: {cp.step}\n"
+                    f"next_step: {cp.next_step}\n"
+                    f"current_phase: {cp.current_phase}\n"
+                    f"phases_completed: {cp.phases_completed}\n"
+                    f"phases_total: {cp.phases_total}\n"
+                )
             log.info(
                 "Cycle count reset for %r after resolved escalation",
                 milestone,
@@ -828,15 +868,28 @@ async def run_coordinator(
                 else None
             )
             _phases_now = _cp_now.phases_completed if _cp_now else 0
-            if (
-                cycle_type == _prev_cycle_type
-                and _phases_now == _prev_phases_completed
-            ):
-                _staleness_count += 1
-            else:
+            if cycle_type != _prev_cycle_type:
+                # Cycle type changed (e.g. EXECUTE→ASSESS or ASSESS→EXECUTE).
+                # Track the change but don't count as staleness.
+                _saw_type_change = True
                 _staleness_count = 1
                 _prev_cycle_type = cycle_type
                 _prev_phases_completed = _phases_now
+            elif _phases_now != _prev_phases_completed:
+                # Phase advancement — real progress.
+                _staleness_count = 1
+                _saw_type_change = False
+                _prev_phases_completed = _phases_now
+            else:
+                # Same cycle type, same phases_completed.
+                # Only count as stale if we haven't seen a type change
+                # (i.e. an ASSESS cycle) since the last reset.
+                # EXECUTE→ASSESS→EXECUTE(rework) is progress, not staleness.
+                if _saw_type_change:
+                    _saw_type_change = False
+                    _staleness_count = 1
+                else:
+                    _staleness_count += 1
 
             if _staleness_count >= _STALENESS_THRESHOLD:
                 _cp_next = _cp_now.next_step if _cp_now else "unknown"
@@ -860,20 +913,20 @@ async def run_coordinator(
             )
             readiness_errors = errors_only(readiness)
             if readiness_errors:
-                validation_retries += 1
+                readiness_retries += 1
                 log.warning(
                     "Readiness check failed for %r %s (attempt %d/%d): %s",
                     milestone, cycle_type,
-                    validation_retries, _MAX_VALIDATION_RETRIES,
+                    readiness_retries, _MAX_VALIDATION_RETRIES,
                     [e.message for e in readiness_errors],
                 )
                 telemetry.event(
                     "readiness_failed", milestone=milestone,
                     cycle_num=cycle_count + 1, cycle_type=cycle_type,
                     error_count=len(readiness_errors),
-                    attempt=validation_retries,
+                    attempt=readiness_retries,
                 )
-                if validation_retries >= _MAX_VALIDATION_RETRIES:
+                if readiness_retries >= _MAX_VALIDATION_RETRIES:
                     await write_validation_escalation(
                         project_dir, milestone, readiness,
                     )
@@ -901,6 +954,23 @@ async def run_coordinator(
                 except Exception:
                     log.debug("Could not parse DAG from compose.py", exc_info=True)
 
+            # For EXECUTE cycles, probe environment state even without
+            # a prior failure — the agent team should see the codebase
+            # as it actually is (describe-and-adapt, DB-15).
+            env_state = _pending_working_tree
+            if env_state is None and cycle_type == "EXECUTE":
+                env_state = await _capture_working_tree_state(project_dir)
+
+            # Extract current_phase from checkpoint for path resolution.
+            _current_phase: str | None = None
+            if checkpoint_path.exists():
+                try:
+                    _current_phase = parse_checkpoint(
+                        checkpoint_path.read_text()
+                    ).current_phase or None
+                except Exception:
+                    pass
+
             prompt = build_cycle_prompt(
                 project_dir,
                 milestone,
@@ -909,8 +979,11 @@ async def run_coordinator(
                 validation_errors=pending_validation_errors,
                 template=tmpl,
                 dag_data=dag_data if cycle_type == "EXECUTE" else None,
+                working_tree_state=env_state,
+                current_phase=_current_phase,
             )
             pending_validation_errors = None  # consumed
+            _pending_working_tree = None
 
             log.info(
                 "Milestone %r: cycle %d, type %s",
@@ -1095,6 +1168,12 @@ async def run_coordinator(
                     _post_new_escalations()
                     _ms_outcome = "escalated_validation"
                     return "escalated_validation"
+                # Capture working tree state BEFORE reverting golden context.
+                # This makes partial code changes from the failed cycle
+                # visible to the retry coordinator (describe-and-adapt).
+                _pending_working_tree = await _capture_working_tree_state(
+                    project_dir
+                )
                 try:
                     await git_revert_golden_context(project_dir, milestone)
                 except RuntimeError:
@@ -1103,6 +1182,7 @@ async def run_coordinator(
                 continue
             else:
                 validation_retries = 0
+                readiness_retries = 0
                 crash_retries = 0
 
             # Compact decisions.md if it's grown too large (DB-15 D3).
@@ -1287,7 +1367,7 @@ async def _run_single_cycle(
                     )
                     return "agent_team_crash"
 
-        return read_cycle_outcome(project_dir)
+        return read_cycle_outcome(project_dir, milestone)
 
     except Exception:
         log.exception("Coordinator cycle crashed for %r", milestone)

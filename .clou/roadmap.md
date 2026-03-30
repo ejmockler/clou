@@ -2,58 +2,30 @@
 
 ## Milestones
 
-### 1. DB-12 Validation Tiers
-**Status:** completed
+### 1. DB-12 Validation Tiers — completed
+### 2. Test Hygiene & Trailing Debt — completed
+### 3. Deferred Debt Sweep — completed
+### 4. Validator Resilience — completed
+### 5. Orchestrator Loop Integrity — completed
+### 6. Live Task Graph — completed
+### 7. Supervisor Understanding — completed
+### 8. Schema Fix + TurnController — completed
+### 9. Proxy Removal (attempt 1) — completed
+### 10. Checkpoint Integrity — completed
+### 11. Proxy Removal (attempt 2) — completed
 
-### 2. Test Hygiene & Trailing Debt
-**Status:** completed
-path: test-hygiene-trailing-debt
-description: Fix F1-F3 test failures, commit G1 prompt-copy logic, get suite green.
+### 12. The Reasoning Loop — completed
+path: 12-reasoning-loop
+description: Supervisor prompt restructured into tool-mediated reasoning loop. Environment scan, ask_user targeting, understanding.md with DB-13 sections.
 
-### 3. Deferred Debt Sweep
-**Status:** completed
-path: deferred-debt-sweep
-description: Clear D8 prompt-copy, supervisor convergence rewrite, breath test timing flake.
+### 13. Convergence and Crystallization — completed
+path: 13-convergence-crystallization
+description: Convergence test, intent drafting with user confirmation, crystallization derivation from understanding.md, solution-to-outcome translation. 5 cycles, 32m, 6 agents.
 
-### 4. Validator Resilience
-**Status:** completed
-path: validator-resilience
-description: Severity tiers in validation, warning passthrough, coordinator self-heal, classified escalations.
+### 14. Arc Formation — completed
+path: 14-arc-formation
+description: Arc reasoning, presentation, sharpening, and revision. Supervisor reasons about full journey, user confirms arc before execution. 3 cycles, 24m, 6 agents.
 
-### 5. Orchestrator Loop Integrity
-**Status:** completed
-path: orchestrator-loop-integrity
-description: Completed-phase validation exemption and DAG-informed coordinator dispatch.
-
-### 6. Live Task Graph
-**Status:** completed
-path: live-task-graph
-description: Task graph as the structural backbone of breath mode — live status from agents, drill-down, keyboard navigation.
-notes: All 4 phases complete. Rework items (status vocab, unmapped rendering) fixed post-handoff.
-
-### 7. Supervisor Understanding
-**Status:** completed
-path: supervisor-understanding
-description: Supervisor gains exploring disposition and durable conceptual memory (understanding.md). Protocol rewrite from convergence-first to understanding-first. Knowledge base updated with empirical grounding (distributed cognition, exploratory talk, fixation risk, common ground). New decision boundary DB-13.
-
-### 8. Schema Fix + TurnController Extraction
-**Status:** completed
-path: schema-fix-turncontroller
-description: Add understanding.md to supervisor write permissions (all 3 sources). Extract turn-management logic from ConversationWidget into standalone TurnController module (687→496 lines, 265-line pure Python class, 39 tests).
-notes: TaskGraphWidget integration tests resolved (all 20 pass). Line count 500 vs 450 target — gap from backward-compat proxies (~75 test callsite updates needed to remove).
-
-### 9. Backward-Compat Proxy Removal
-**Status:** blocked
-path: proxy-removal
-description: Remove name aliases and _tc_proxy properties from conversation.py, update ~75 test callsites to canonical imports. Target ≤450 lines.
-notes: Coordinator looped in PLAN for 12 cycles due to checkpoint write permission bug (hooks.py pattern mismatch). Plan is complete and valid — will respawn after M10 lands.
-
-### 10. Checkpoint Integrity
-**Status:** in_progress
-path: checkpoint-integrity
-description: Fix permission pattern for coordinator checkpoint writes, add cross-validation between status.md and active/coordinator.md, add staleness detection for repeated same-type cycles. Root cause fix for M9's infinite PLAN loop.
-
-### 11. Backward-Compat Proxy Removal (respawn)
-**Status:** pending
-path: proxy-removal
-description: Respawn of M9 after checkpoint integrity fix. Same scope: remove name aliases and _tc_proxy properties from conversation.py, update ~104 test callsites to canonical imports. Target ≤450 lines. Plan already exists from M9.
+### 15. Disposition-Aware Questioning — next
+path: 15-disposition-aware-questioning
+description: Exploring vs converging question strategies from understanding.md density.

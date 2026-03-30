@@ -1,0 +1,2 @@
+{"role": "system", "content": "session_start", "timestamp": 1774830624.870535, "meta": {"session_id": "a18be3e752ad", "project_dir": "/Users/noot/clou/pytest-of-noot/pytest-193/test_append_with_meta0", "model": "opus"}}
+{"role": "tool", "content": "result", "timestamp": 1774830624.8706062, "meta": {"tool_name": "Read", "file_path": "/tmp/x"}}

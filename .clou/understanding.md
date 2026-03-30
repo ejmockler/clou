@@ -1,9 +1,12 @@
 # Understanding
 
-Durable conceptual memory for the supervisor's exploring disposition.
+Durable conceptual memory. Each entry traces to a specific
+user response via ask_user — never updated silently.
 
-## Concepts
+## What this project is becoming
 
-## Patterns
+## Active tensions
 
-## Observations
+## Continuity
+
+## Resolved

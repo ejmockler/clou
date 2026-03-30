@@ -21,7 +21,7 @@ There is no separate compaction strategy. No reliance on SDK automatic compressi
 ### Session-per-Cycle Model
 
 ```
-Orchestrator reads active/coordinator.md
+Orchestrator reads milestones/<name>/active/coordinator.md
     → determines cycle type (PLAN, EXECUTE, ASSESS, VERIFY, EXIT)
     → constructs targeted prompt with file pointers
     → spawns fresh ClaudeSDKClient session
@@ -29,7 +29,7 @@ Orchestrator reads active/coordinator.md
     → session runs one cycle
     → session writes updated state to golden context
     → session exits
-    → orchestrator reads active/coordinator.md again
+    → orchestrator reads milestones/<name>/active/coordinator.md again
     → spawns next session (or terminates if milestone complete)
 ```
 
@@ -57,7 +57,7 @@ The coordinator writes at the end of every cycle, before exit:
 
 | File | What's Written | Purpose |
 |---|---|---|
-| `active/coordinator.md` | Position, phase status, cycle count, next step | Inter-cycle pointer — tells the next session where to pick up |
+| `milestones/<name>/active/coordinator.md` | Position, phase status, cycle count, next step | Inter-cycle pointer — tells the next session where to pick up |
 | `decisions.md` | New cycle group prepended at top (newest-first) | Judgment log — accumulates across cycles, most recent at top |
 | `status.md` | Phase completion updates | Supervisor visibility into progress |
 | `compose.py` | Only if the plan was revised (rare, after rework) | Plan artifact — usually written once in PLAN cycle |
@@ -66,7 +66,7 @@ The write-back is the coordinator's last act before exiting. The orchestrator co
 
 ### Atomicity
 
-The coordinator writes all golden context updates before signaling exit. If the session crashes before completing writes, the golden context reflects the state at the *previous* cycle boundary — the orchestrator detects this (active/coordinator.md hasn't advanced) and restarts the same cycle.
+The coordinator writes all golden context updates before signaling exit. If the session crashes before completing writes, the golden context reflects the state at the *previous* cycle boundary — the orchestrator detects this (`milestones/<name>/active/coordinator.md` hasn't advanced) and restarts the same cycle.
 
 ## Read-Forward Protocol
 
@@ -76,7 +76,7 @@ How the next cycle ingests what it needs from golden context.
 
 The orchestrator is a lifecycle manager, not a context synthesizer. Between cycles:
 
-1. Reads `active/coordinator.md` to determine current state
+1. Reads `milestones/<name>/active/coordinator.md` to determine current state
 2. Determines what the next cycle should do (based on `current_step`)
 3. Constructs a targeted prompt with pointers to the specific golden context files needed
 4. Spawns a fresh session with that prompt
@@ -85,44 +85,31 @@ The orchestrator does NOT inject golden context content into the prompt. It prov
 
 ### Per-Cycle-Type Read Sets
 
+> Canonical read sets are maintained in [golden-context.md](../golden-context.md#per-cycle-read-sets-canonical).
+
 The coordinator only reads what it needs for its current cycle type:
 
 **PLAN cycle:**
 ```
-Read:
-- milestone.md, requirements.md (scope)
-- project.md (conventions, constraints)
-- active/coordinator.md (if resuming a failed PLAN)
+Read: milestone.md, intents.md, requirements.md, project.md
 Produces: compose.py, phase.md files, active/coordinator.md
 ```
 
 **EXECUTE cycle:**
 ```
-Read:
-- compose.py (plan)
-- current phase's phase.md (scope for agent teams)
-- active/coordinator.md (which phase is current)
+Read: status.md, compose.py, phases/{phase}/phase.md
 Produces: agent team output in execution.md, active/coordinator.md
 ```
 
 **ASSESS cycle:**
 ```
-Read:
-- compose.py (type contracts to check against)
-- current phase's execution.md (what was produced)
-- requirements.md (acceptance criteria)
-- decisions.md (prior judgments for continuity)
-- active/coordinator.md (cycle count, phase status)
+Read: status.md, compose.py, phases/{phase}/execution.md, requirements.md, decisions.md, assessment.md
 Produces: decisions.md entries, rework tasks or phase advancement, active/coordinator.md
 ```
 
 **VERIFY cycle:**
 ```
-Read:
-- milestone.md, requirements.md (acceptance criteria)
-- compose.py (verify() function)
-- all phases' execution.md summaries (what to verify)
-- active/coordinator.md (phase status)
+Read: status.md, intents.md, compose.py
 Mid-cycle read: verification/execution.md + artifacts/ (perceptual record, after verifier completes)
 Produces: verification/execution.md, verification/artifacts/, handoff.md,
           decisions.md entries (Brutalist experience assessment), active/coordinator.md
@@ -130,10 +117,7 @@ Produces: verification/execution.md, verification/artifacts/, handoff.md,
 
 **EXIT cycle:**
 ```
-Read:
-- handoff.md (verify it's complete)
-- active/coordinator.md (all exit conditions)
-- decisions.md (audit completeness)
+Read: status.md, handoff.md, decisions.md
 Produces: final status.md, active/coordinator.md (terminal state)
 ```
 
@@ -157,7 +141,7 @@ The orchestrator monitors `ResultMessage.usage.input_tokens` per message. If tok
 
 ### Handling
 
-The coordinator writes a mid-cycle checkpoint to `active/coordinator.md` with partial progress:
+The coordinator writes a mid-cycle checkpoint to `milestones/<name>/active/coordinator.md` with partial progress:
 
 ```markdown
 ## Cycle
@@ -167,7 +151,7 @@ assessed_tasks: [T1, T2, T3]
 remaining_tasks: [T4, T5]
 ```
 
-The orchestrator then spawns a new session for the *same* cycle type, but with the partial checkpoint indicating where to resume. The golden context read-forward protocol handles this identically to a normal cycle start — the new session reads active/coordinator.md and picks up from the partial state.
+The orchestrator then spawns a new session for the *same* cycle type, but with the partial checkpoint indicating where to resume. The golden context read-forward protocol handles this identically to a normal cycle start — the new session reads `milestones/<name>/active/coordinator.md` and picks up from the partial state.
 
 ### Design Pressure
 
@@ -219,7 +203,7 @@ last_action_at: 2026-03-19T04:30:00Z
 - requests.md has 2 unprocessed entries (added since last check)
 ```
 
-### `active/coordinator.md`
+### `milestones/<name>/active/coordinator.md`
 
 ```markdown
 # Coordinator Checkpoint
@@ -269,5 +253,5 @@ The checkpoint is a pointer, not a summary. It tells the next session *where* to
 - **DB-04 (Prompt System):** The orchestrator constructs a per-cycle-type prompt with targeted file pointers. Prompt architecture must support this parameterization.
 - **DB-05 (Error Recovery):** Coordinator crash recovery is trivial — restart the same cycle. The golden context already has the state.
 - **DB-06 (Token Economics):** Session-per-cycle has startup overhead per cycle (subprocess launch, context loading). Cost model must account for this.
-- **DB-08 (File Schemas):** `active/coordinator.md` schema is now defined. Must support partial progress for mid-cycle checkpoints.
+- **DB-08 (File Schemas):** `milestones/<name>/active/coordinator.md` schema is now defined. Must support partial progress for mid-cycle checkpoints.
 - **DB-10 (Team Communication):** Agent teams write `execution.md` during the cycle. The coordinator reads the full execution.md in the ASSESS cycle (different session). During EXECUTE, the coordinator reads only the summary status line (circuit breaker — ~15-30 tokens) before dispatching dependent tasks. DB-10 decided: mechanical dispatch, stigmergy only, one agent per function.

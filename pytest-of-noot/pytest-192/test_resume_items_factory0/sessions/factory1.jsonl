@@ -1,0 +1,2 @@
+{"role": "system", "content": "session_start", "timestamp": 1774830580.151037, "meta": {"session_id": "factory1", "project_dir": "/Users/noot/clou/pytest-of-noot/pytest-192/test_resume_items_factory0", "model": "opus"}}
+{"role": "user", "content": "test message", "timestamp": 1774830580.1512032, "meta": {}}

@@ -306,7 +306,7 @@ def route_supervisor_message(
     """
     # Subagent messages (Agent tool internals) have parent_tool_use_id set.
     # Filter them out — their result arrives as a ToolResultBlock on the
-    # supervisor's own AssistantMessage and fills the _AgentDisclosure.
+    # supervisor's own AssistantMessage and fills the AgentDisclosure.
     if getattr(msg, "parent_tool_use_id", None):
         return
 

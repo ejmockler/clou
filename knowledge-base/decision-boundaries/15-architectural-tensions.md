@@ -74,11 +74,24 @@ An ASSESS→EXECUTE rework loop that doesn't converge burns the same cost per cy
 
 Soft budget: advisory context, not hard enforcement. The 20-cycle cap remains the structural ceiling. The budget warning gives the coordinator cost-awareness as a cognitive affordance — the same principle as ArtifactForm (DB-14): structure shapes cognition.
 
-**D2b: Recurring-finding detection.**
+**D2b: Staleness detection + recurring-finding detection.**
 
-Extend `assess_convergence()` in recovery.py: if a finding was accepted (rework requested) in cycle N but the same or similar finding appears in cycle N+2, the rework didn't fix the root cause. Inject into the next cycle's prompt: "Finding X recurred after rework — consider whether the approach needs to change."
+The orchestrator tracks cycle-boundary staleness via three state variables:
+- `_prev_cycle_type` — the previous cycle's type
+- `_prev_phases_completed` — the previous cycle's completed phase count
+- `_staleness_count` — consecutive cycles of the same type with no phase advancement
 
-Detection: fuzzy match finding text across `decisions.md` cycle groups. The finding text is structured (`**Finding:** "exact text"`) — substring match on quoted finding text is sufficient.
+At each cycle boundary:
+1. If `cycle_type != _prev_cycle_type` → type changed, reset staleness to 1, set `_saw_type_change = True`
+2. Elif `phases_completed != _prev_phases_completed` → phase advanced, reset staleness to 1
+3. Else (same type, no phase advance):
+   - If `_saw_type_change` is set → clear it, reset staleness (ASSESS→EXECUTE(rework) is normal progression, not staleness)
+   - Else → increment staleness count
+4. If `_staleness_count >= 3` → escalate as staleness
+
+The `_saw_type_change` flag is critical: it prevents the ASSESS→EXECUTE(rework) loop from being counted as stale. An EXECUTE after an ASSESS changes the type, and the next EXECUTE shouldn't count as a repeat because an ASSESS happened in between.
+
+For convergence detection, `assess_convergence()` reads `decisions.md` and checks whether the most recent N consecutive ASSESS cycle groups had zero accepted findings. If converged (≥2 consecutive zero-accept rounds), the orchestrator overrides the coordinator's rework request and advances directly to VERIFY.
 
 **D2c: Quality gate scope pruning.**
 
@@ -182,6 +195,30 @@ Cycle count resets on retry after escalation resolution.
 ```
 
 **Why not automatic retry**: The escalation exists because the coordinator couldn't solve the problem in 20 cycles. Automatic retry without supervisor intervention would repeat the same failure. The supervisor must modify the golden context (adjust scope, clarify requirements, resolve external blockers) before retry is useful.
+
+## Tension 6: Environment Fragmentation (Code + Runtime)
+
+### The Problem
+
+Golden context tracks plan state (what the coordinator decided). But the environment — the codebase and runtime — has its own state that can diverge from what golden context describes. A failed EXECUTE cycle may leave code changes in the working tree that no golden context file mentions. A running dev server started by a prior cycle occupies ports the next cycle tries to bind.
+
+### Research Grounding
+
+- **Situated cognition (§11)**: Plans are resources adapted during execution. The agent should see the environment as it actually is, not as the plan says it should be.
+- **Bitter Lesson**: Environment description scales with model capability. Environment control scales with engineering effort. Description wins.
+- **Multi-agent coordination (§10)**: "Multiple state representations that diverge under stress cause coordination failures." The codebase is a state representation that diverges from golden context during failures.
+
+### Decision: D6 — Describe the Environment, Don't Try to Control It
+
+**After a failed cycle**: capture `git diff --stat` before reverting golden context. Inject the diff stat into the retry prompt: "The working tree has uncommitted changes from the previous failed cycle: [stats]. Verify before proceeding."
+
+**Before EXECUTE cycles**: capture `git status` as a proactive environment probe. Inject into the EXECUTE prompt so agent teams see uncommitted files, running state, and working tree reality.
+
+**No code revert.** No stash. The agent reads the environment and adapts. If the failed cycle's code is correct, the agent incorporates it. If it's wrong, the agent fixes it. The working tree IS the environment the agent inhabits.
+
+This preserves work (no code is discarded), maintains situated awareness (the agent sees reality), and avoids the stash lifecycle complexity that would add engineering effort without scaling benefit.
+
+**The commit boundary is the point of no return**: `git_commit_phase` only runs on successful validation. Everything before commit is working state that the agent can adapt to.
 
 ## Cascading Effects
 

@@ -30,17 +30,17 @@ from clou.ui.theme import OklchColor, PALETTE
 TWO_PI: float = 2.0 * math.pi
 
 # ── OKLCH wave palette ──────────────────────────────────────────
-_CREST_HUE: float = 176.0       # warm cyan-green at surface
-_BASE_HUE: float = 186.0        # cool blue-teal at depth
-_CREST_CHROMA: float = 0.12     # saturated at surface
-_BASE_CHROMA: float = 0.055     # stays recognizably teal in the deep
-_CREST_L: float = 0.72          # matches accent-teal luminance
-_BASE_L: float = 0.20           # visible above background
+_CREST_HUE: float = 178.0       # warm cyan-green at surface
+_BASE_HUE: float = 184.0        # cool blue-teal at depth (narrower range)
+_CREST_CHROMA: float = 0.08     # restrained — avoids neon
+_BASE_CHROMA: float = 0.04      # stays recognizably teal in the deep
+_CREST_L: float = 0.48          # subdued crest — closer to background
+_BASE_L: float = 0.18           # barely above background
 _BG_L: float = 0.13             # surface-deep
 _BG_HEX: str = PALETTE["surface-deep"].to_hex()
 
 # ── Depth attenuation (Beer-Lambert) ───────────────────────────
-_DEPTH_COEFF: float = 1.8       # exponential falloff coefficient
+_DEPTH_COEFF: float = 2.6       # steeper falloff — bottom rows dissolve into bg
 
 # ── Dual-wave parameters ────────────────────────────────────────
 _PRIMARY_SPEED: float = 0.11     # rightward traversals per second
@@ -59,13 +59,13 @@ _BREATH_FLOOR: float = 0.50      # minimum envelope at exhale
 _BREATH_CEIL: float = 1.0        # maximum at inhale
 
 # ── Shimmer ─────────────────────────────────────────────────────
-_SHIMMER_AMP: float = 0.018
+_SHIMMER_AMP: float = 0.010
 _SHIMMER_WAVELENGTH: float = 13.0
 _SHIMMER_SPEED: float = 1.2
 
 # ── Surface glow (achromatic — matches background hue) ─────────
-_GLOW_REACH: float = 3.0        # rows of glow above surface
-_GLOW_PEAK_L: float = 0.045     # max luminance offset above BG_L
+_GLOW_REACH: float = 1.5        # rows of glow above surface
+_GLOW_PEAK_L: float = 0.025     # max luminance offset above BG_L
 
 # ── Deep floor ──────────────────────────────────────────────────
 _FLOOR_HEIGHT: float = 0.025     # ever-present faint base glow
@@ -146,7 +146,7 @@ class WakeWave(Widget):
 
     DEFAULT_CSS = """
     WakeWave {
-        height: 7;
+        height: 4;
     }
     """
 

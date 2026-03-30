@@ -35,6 +35,8 @@ A harness template is a structured specification that defines what a Clou deploy
 | `verification_modalities` | list[str] | Default modality set for VERIFY | DB-09 (Browser, HTTP, Shell, Code) |
 | `mcp_servers` | dict[str, MCPServerSpec] | MCP server configurations for coordinator sessions | `orchestrator.py` (was hardcoded constants, now removed) |
 | `write_permissions` | dict[str, list[str]] | Per-tier write boundary patterns | `hooks.py:WRITE_PERMISSIONS` (preserved at module level for backward compat) |
+| `budget_usd` | float \| None = None | Per-milestone soft budget; orchestrator tracks cumulative cost and injects cost-awareness into cycle prompt at 50%/75%/100% thresholds | `orchestrator.py:_MAX_BUDGET_USD` (was deployment-level only) |
+| `artifact_forms` | dict[str, ArtifactForm] = field(default_factory=dict) | Cognitive affordances for golden context artifacts; PostToolUse hook validates writes against declared forms | N/A (new capability) |
 | `compose_conventions` | ComposeConventions | Constraints on compose.py structure | Implicit (verify() required, phase comments) |
 
 **AgentSpec fields:**
@@ -66,6 +68,18 @@ Note: Earlier designs listed `assess_tools` and `verify_tools` as separate tool 
 | `phase_comments` | Whether phase boundaries must be marked with comments |
 | `validators` | List of validation functions to run (default: `graph.py:validate`) |
 
+**ArtifactForm fields** (used in `artifact_forms` values):
+
+| Field | Purpose |
+|---|---|
+| `sections` | Tuple of required section headings the artifact must contain |
+| `criterion_template` | Optional template string for generating per-section acceptance criteria |
+| `anti_patterns` | Tuple of patterns that the PostToolUse hook flags as immediate feedback to the writing agent |
+
+`artifact_forms` maps golden context artifact names (e.g., `"milestone.md"`, `"assessment.md"`) to their cognitive affordance. When an agent writes to a file matching an artifact form key, the PostToolUse hook validates the write against the declared sections and anti-patterns, giving the agent immediate structural feedback without waiting for a full quality gate cycle. See DB-14 D3 for the full rationale and design.
+
+`budget_usd` provides a per-milestone soft budget that the orchestrator tracks cumulatively across cycles. At the 50%, 75%, and 100% thresholds, cost-awareness is injected into the cycle prompt as a cognitive affordance — the coordinator sees remaining budget and can adjust strategy (e.g., reduce verification scope, skip optional gates). This is a soft limit: exceeding it triggers a warning, not a hard stop. The hard deployment-level cap (`_MAX_BUDGET_USD` in orchestrator.py) remains the ultimate backstop. See DB-15 D2a for the full rationale.
+
 ### D2: Template Format — Python Module (Pragmatic, Not Architecturally Superior)
 
 Templates are Python modules, not YAML/TOML/JSON. This is a pragmatic choice for the single-template case, not a permanent architectural commitment.
@@ -93,6 +107,7 @@ configuration in orchestrator.py.
 
 from clou.harness import (
     AgentSpec,
+    ArtifactForm,
     ComposeConventions,
     HarnessTemplate,
     MCPServerSpec,
@@ -211,6 +226,24 @@ template = HarnessTemplate(
             "milestones/*/assessment.md",
         ],
     },
+    budget_usd=None,  # No per-milestone budget by default; deployment cap is backstop
+    artifact_forms={
+        "milestone.md": ArtifactForm(
+            sections=("Objective", "Requirements", "Acceptance Criteria"),
+            criterion_template=None,
+            anti_patterns=("TBD", "TODO", "will be determined"),
+        ),
+        "assessment.md": ArtifactForm(
+            sections=("Summary", "Findings", "Recommendation"),
+            criterion_template="Each finding must reference a specific file path or test.",
+            anti_patterns=("looks good", "no issues found", "LGTM"),
+        ),
+        "handoff.md": ArtifactForm(
+            sections=("Verification Summary", "Evidence", "Residual Risk"),
+            criterion_template=None,
+            anti_patterns=("all tests pass", "everything works"),
+        ),
+    },
     compose_conventions=ComposeConventions(
         require_verify=True,
         phase_comments=True,
@@ -324,12 +357,12 @@ template: software-construction
 
 ### D8: Template Scope Boundary
 
-The template parameterizes **agent definitions, quality gates, MCP servers, write permissions, and compose conventions**. It does not parameterize coordinator operational constants:
+The template parameterizes **agent definitions, quality gates, MCP servers, write permissions, compose conventions, per-milestone soft budget (DB-15), and artifact forms (DB-14)**. It does not parameterize coordinator operational constants:
 
 | Parameter | Where it lives | Why not in template |
 |---|---|---|
 | Cycle cap (`_MAX_CYCLES = 20`) | `orchestrator.py` | Operational limit, not a capability property |
-| Budget cap (`_MAX_BUDGET_USD`) | `orchestrator.py` | Cost control is per-deployment, not per-domain |
+| Budget cap (`_MAX_BUDGET_USD`) | `orchestrator.py` | Hard deployment-level cap remains in orchestrator. **Update (DB-15 D2a):** `budget_usd` is now a template field for per-milestone soft budgets with warning thresholds; the deployment cap is the ultimate backstop. |
 | Effort policy (max/high by cycle type) | `orchestrator.py` | Judgment-loop tuning, orthogonal to domain |
 | Crash/validation retry limits | `orchestrator.py` | Error recovery is structural (DB-05) |
 | Sandbox settings | `orchestrator.py` | Security boundary, not domain config |
@@ -369,6 +402,8 @@ The `_INLINE_FALLBACK` constant is maintained in `clou/harness.py` alongside the
 | **DB-08 (File Schemas)** | `project.md` gains `template:` field. No other schema changes. |
 | **DB-09 (Verification)** | Verification modalities are template defaults. The coordinator can still override per milestone. Verifier tool configuration reads from template. |
 | **DB-10 (Team Communication)** | Unchanged. Stigmergy, one-agent-per-function, and mechanical dispatch are structural, not template-specific. |
+| **DB-14 (Artifact Forms)** | `artifact_forms` field added to `HarnessTemplate`. PostToolUse hook validates golden context writes against declared forms. See DB-14 D3. |
+| **DB-15 (Cost Awareness)** | `budget_usd` field added to `HarnessTemplate`. Orchestrator injects cost-awareness into cycle prompt at 50%/75%/100% thresholds. See DB-15 D2a. |
 
 ### On protocols
 
@@ -389,7 +424,7 @@ The `_INLINE_FALLBACK` constant is maintained in `clou/harness.py` alongside the
 | `hooks.py:WRITE_PERMISSIONS` | Preserved at module level; `build_hooks()` accepts optional `template` kwarg (done) |
 | `prompts.py:build_cycle_prompt()` | Accepts optional `template`, adds harness name + quality gate context (done) |
 | `clou/harness.py` | Template dataclasses, loader with name validation, validator, `_INLINE_FALLBACK` (done) |
-| `clou/harnesses/software_construction.py` | First template (extraction of current behavior) (done) |
+| `clou/harnesses/software_construction.py` | First template (extraction of current behavior) (done). Updated with `budget_usd` and `artifact_forms` fields (DB-14, DB-15). |
 
 ## Prior Art
 
@@ -411,6 +446,6 @@ The `_INLINE_FALLBACK` constant is maintained in `clou/harness.py` alongside the
 - [x] **Compose.py changes:** None. Format is already general.
 - [x] **Per-project templates:** Escape hatch via path in project.md, not primary mechanism. Override/inheritance machinery deferred — zero current users.
 - [x] **Write permissions:** Template parameter (extracted from current hooks.py constant). AgentSpec includes `tier` field for enforcement mapping.
-- [x] **Template scope:** Agents + gates + permissions + compose conventions. Coordinator ops (budget, cycles, effort, sandbox) stay in orchestrator.py.
+- [x] **Template scope:** Agents + gates + permissions + compose conventions + per-milestone soft budget (DB-15) + artifact forms (DB-14). Hard coordinator ops (deployment budget cap, cycles, effort, sandbox) stay in orchestrator.py.
 - [x] **Loading fallback:** On any failure, fall back to hardcoded software-construction defaults. Never fatal.
 - [x] **Convergence detection:** Generalized from hardcoded "brutalist" to template-aware gate name matching. `recovery.py` and `validation.py` now check for "assess", "quality gate", and "brutalist" in cycle headers.

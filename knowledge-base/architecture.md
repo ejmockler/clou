@@ -144,15 +144,28 @@ The user runs `python clou/orchestrator.py` (or a simple `clou` CLI entry point)
 
 ### 10. Error recovery: fail loud, validate structure, coordinator-only commits
 
-Crashes and infrastructure failures escalate to the supervisor and user — no silent retries. The orchestrator validates golden context structure at cycle boundaries (revert and retry on failure). Agent teams write code but only the coordinator commits to git, ensuring tractable, reviewed deltas. 20-cycle milestone cap prevents runaway loops. Inter-phase smoke tests catch compositional failures at phase boundaries. See [DB-05](./decision-boundaries/05-error-recovery.md).
+Crashes and infrastructure failures escalate to the supervisor and user — no silent retries. The orchestrator validates golden context structure at cycle boundaries, including cross-file consistency between checkpoint and status.md (revert and retry on failure). Agent teams write code but only the coordinator commits to git via selective staging — only files in `git diff` filtered by exclude patterns, not `git add -A` (DB-15 D4). 20-cycle milestone cap prevents runaway loops; cycle count resets after resolved escalation (DB-15 D5). The user can interrupt at cycle boundary via `/stop` (DB-15 D1). Inter-phase smoke tests catch compositional failures at phase boundaries. See [DB-05](./decision-boundaries/05-error-recovery.md), [DB-15](./decision-boundaries/15-architectural-tensions.md).
 
-### 11. Opus everywhere, token tracking, no budget limit
+### 11. Opus everywhere, token tracking, budget-aware cycle control
 
-All tiers use Opus — maximum quality at every tier. Cost control comes from the 20-cycle cap (DB-05) and the coordinator's critical evaluation of whether each cycle is productive, not from model downgrading. Cost is tracked in tokens (stable across pricing changes). No hard budget limit per milestone. The coordinator queries all Brutalist tools relevant to the implementation domain and critically evaluates all feedback for validity. Model selection is hardcoded; configurability deferred. See [DB-06](./decision-boundaries/06-token-economics.md).
+All tiers use Opus — maximum quality at every tier. Cost control comes from the coordinator's critical evaluation of whether each cycle is productive, the 20-cycle cap (DB-05), and per-milestone soft budgets (DB-15). Cost is tracked in tokens (stable across pricing changes). The harness template defines an optional `budget_usd` — at 50%/75%/100% thresholds, the orchestrator injects cost-awareness into the cycle prompt as a cognitive affordance. decisions.md is structurally compacted at cycle boundary to prevent golden context bloat (DB-15 D3). Model selection is hardcoded; configurability deferred. See [DB-06](./decision-boundaries/06-token-economics.md), [DB-15](./decision-boundaries/15-architectural-tensions.md).
 
 ### 12. No mocks of your own infrastructure
 
 Mock at the boundary of your control, never within it. Your own services run real. Third-party services use their sandbox/test mode. The only acceptable mock is for external services that provide no testing infrastructure at all.
+
+### 13. Adaptive context injection — the memory architecture
+
+The system's memory model is not multi-tiered storage (short-term / long-term / episodic). It is **adaptive retrieval**: the orchestrator decides which files at which resolution for each specific cycle. Session-per-cycle (Decision 5) is the working memory architecture. Per-cycle read sets are observation masking. `decisions.md` compaction is structural summarization. The orchestrator is the retrieval system.
+
+This is grounded in four research threads:
+
+- **Chunking research.** Quality peaks at 7-9 chunks filling 40-70% of the context window. Current coordinator read sets are 4-7 files — inside the sweet spot. Adding files past this threshold actively degrades performance (see Research Foundations §1: context degradation — every unnecessary token is harmful, not neutral).
+- **Factory.ai anchored iterative summarization.** Structured compaction with persistent sections scored 3.70/5.0 vs 3.44 (Anthropic) and 3.35 (OpenAI) on 36K real coding sessions. This validates `decisions.md` structural compaction (DB-15 D3): keep recent 3 cycles full, summarize older to one-line entries. The persistent sections are the anchor; the summaries are lossy but structurally stable.
+- **ACON framework.** Meta-learning on compaction boundaries — observe what breaks when information is dropped, update compaction rules. 26-54% memory reduction while preserving 95%+ accuracy. This is the principle behind the coordinator's cycle-boundary validation: if golden context fails structural checks after compaction, revert and retry.
+- **Context degradation (Research Foundations §1).** The transformer attention mechanism means irrelevant tokens don't merely waste space — they actively compete for attention weight with relevant tokens. The right 7-9 files at the right resolution for this specific moment is the entire memory strategy. There is no background store the agent "checks when needed." If it's not in the read set, it doesn't exist for that cycle.
+
+The key insight: **the transformer doesn't need categories of memory. It needs the right files at the right resolution for this specific moment.** The orchestrator's per-cycle prompt construction — selecting which golden context files to include, at what level of detail — is the retrieval mechanism. No vector database, no RAG pipeline, no memory taxonomy. The orchestrator reads `active/coordinator.md`, determines the cycle type, and constructs a read set. That read set IS the agent's memory for that cycle.
 
 ## Harness Template Layer
 
@@ -160,7 +173,11 @@ Between the orchestrator and the agent definitions sits the **harness template**
 
 The orchestrator reads the active template (recorded in `project.md`) and configures agent definitions, MCP servers, and hook enforcement accordingly. The supervisor selects the template during project initialization based on user intent. The user never interacts with the harness directly.
 
-Software construction is the first (and currently only) template. The architecture supports additional templates for other domains — the three-tier hierarchy, judgment loop, golden context, and session-per-cycle are domain-agnostic infrastructure. See [DB-11](./decision-boundaries/11-harness-architecture.md) for the full template schema and decisions.
+The harness template also defines **artifact forms** (DB-14) — cognitive affordances for golden context artifacts. Each form specifies a criterion template, required sections, and anti-patterns. The PostToolUse hook validates every write against the artifact's form, giving the agent immediate feedback when it produces wrong-level content (e.g., implementation specs in intents.md). This is LLM-Modulo applied to narrative artifacts — the same external-verification pattern that makes compose.py AST validation work.
+
+The supervisor crystallizes milestones with three artifacts: `milestone.md` (scope), `intents.md` (observable outcomes — DB-14), and `requirements.md` (implementation constraints). Intent and specification are incommensurable concerns that need separate containers (DB-07 principle applied at the intent→plan boundary). The verifier walks golden paths against intents.md, not requirements.md — ensuring verification requires observing the running system.
+
+Software construction is the first (and currently only) template. The architecture supports additional templates for other domains — the three-tier hierarchy, judgment loop, golden context, and session-per-cycle are domain-agnostic infrastructure. See [DB-11](./decision-boundaries/11-harness-architecture.md), [DB-14](./decision-boundaries/14-intent-specification-separation.md).
 
 ## System Topology
 

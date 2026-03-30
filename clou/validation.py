@@ -87,12 +87,16 @@ _PHASE_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
 _TERMINAL_STATUSES = frozenset({"completed", "failed"})
 
 # --- Checkpoint-tier validation (DB-12) ---
-# These fields drive the orchestrator's control flow.  Strict parsing
-# prevents silent state corruption in determine_next_cycle().
-
-_CHECKPOINT_REQUIRED_KEYS = frozenset(
-    {"cycle", "step", "next_step", "current_phase", "phases_completed", "phases_total"}
+# Only `cycle` and `next_step` are required — these drive the
+# orchestrator's control flow via determine_next_cycle().  Other keys
+# are validated when present but have safe defaults in parse_checkpoint(),
+# so their absence is a WARNING, not an ERROR.
+_CHECKPOINT_REQUIRED_KEYS = frozenset({"cycle", "next_step"})
+_CHECKPOINT_OPTIONAL_KEYS = frozenset(
+    {"step", "current_phase", "phase", "phases_completed", "phases_total"}
 )
+#: Agents sometimes write ``phase:`` instead of ``current_phase:``.
+_CHECKPOINT_ALIASES: dict[str, str] = {"phase": "current_phase"}
 _VALID_STEPS = frozenset({"PLAN", "EXECUTE", "ASSESS", "VERIFY", "EXIT"})
 _VALID_NEXT_STEPS = frozenset(
     {
@@ -122,10 +126,9 @@ _STRUCTURAL_FILES = frozenset({
     "status.md",
 })
 
-#: Paths in the read_set that resolve under .clou/ (root-scoped)
-#: rather than under .clou/milestones/{milestone}/.  Mirrors the
-#: resolution logic in ``build_cycle_prompt`` (prompts.py).
-_ROOT_SCOPED_PREFIXES = ("project.md", "active/")
+#: Only project.md resolves under .clou/ (root-scoped).
+#: All other read_set entries resolve under .clou/milestones/{milestone}/.
+_ROOT_SCOPED_FILES = frozenset({"project.md"})
 
 
 def validate_delivery(
@@ -166,8 +169,10 @@ def validate_delivery(
             f"{ms_prefix}/status.md",
         ))
 
-    # Cross-validation: compare next_step in status.md vs checkpoint.
-    # Only check when both files exist (no false positives on missing files).
+    # Cross-validation: compare shared fields between checkpoint and
+    # status.md.  Divergence means the state transfer is broken — one
+    # file was written but the other wasn't (crash, permission failure,
+    # or validation rejection mid-write).  Each mismatch is an ERROR.
     if checkpoint_path.exists() and status_path.exists():
         from clou.recovery import parse_checkpoint
 
@@ -175,19 +180,57 @@ def validate_delivery(
         status_content = status_path.read_text()
         status_state = _section_text(status_content, "## Current State")
         if not status_state:
-            # Try case-insensitive variants.
             for variant in ("## Current state", "## current state"):
                 status_state = _section_text(status_content, variant)
                 if status_state:
                     break
-        status_next_match = re.search(r"(?m)^next_step:\s*(.+)$", status_state)
-        if status_next_match:
-            status_next = status_next_match.group(1).strip()
-            if status_next != cp.next_step:
+
+        def _status_field(field: str) -> str | None:
+            m = re.search(rf"(?m)^{field}:\s*(.+)$", status_state)
+            return m.group(1).strip() if m else None
+
+        # next_step
+        status_next = _status_field("next_step")
+        if status_next and status_next != cp.next_step:
+            findings.append(ValidationFinding(
+                Severity.ERROR,
+                f"status.md next_step '{status_next}' diverges from checkpoint "
+                f"next_step '{cp.next_step}'",
+                f"{ms_prefix}/active/coordinator.md",
+            ))
+
+        # cycle count
+        status_cycle = _status_field("cycle")
+        if status_cycle and status_cycle.isdigit():
+            if int(status_cycle) != cp.cycle:
                 findings.append(ValidationFinding(
                     Severity.ERROR,
-                    f"status.md next_step '{status_next}' diverges from checkpoint "
-                    f"next_step '{cp.next_step}' — state representations inconsistent",
+                    f"status.md cycle {status_cycle} diverges from checkpoint "
+                    f"cycle {cp.cycle}",
+                    f"{ms_prefix}/active/coordinator.md",
+                ))
+
+        # current phase
+        status_phase = _status_field("phase")
+        if status_phase and status_phase != cp.current_phase:
+            findings.append(ValidationFinding(
+                Severity.ERROR,
+                f"status.md phase '{status_phase}' diverges from checkpoint "
+                f"current_phase '{cp.current_phase}'",
+                f"{ms_prefix}/active/coordinator.md",
+            ))
+
+        # phases_completed vs completed count in status table
+        phase_table = _section_text(status_content, "## Phase Progress")
+        if phase_table:
+            completed_count = len(re.findall(
+                r"(?m)^\|[^|]+\|\s*completed\s*\|", phase_table,
+            ))
+            if completed_count != cp.phases_completed:
+                findings.append(ValidationFinding(
+                    Severity.WARNING,
+                    f"status.md shows {completed_count} completed phases but "
+                    f"checkpoint has phases_completed={cp.phases_completed}",
                     f"{ms_prefix}/active/coordinator.md",
                 ))
 
@@ -228,8 +271,8 @@ def validate_readiness(
     findings: list[ValidationFinding] = []
 
     for rel_path in read_set:
-        # Mirror prompts.py root_prefixes resolution.
-        root_scoped = rel_path.startswith(_ROOT_SCOPED_PREFIXES)
+        # Mirror prompts.py resolution: only project.md is root-scoped.
+        root_scoped = rel_path in _ROOT_SCOPED_FILES
         if root_scoped:
             full_path = clou_dir / rel_path
         else:
@@ -348,17 +391,23 @@ def _validate_coordinator(path: Path) -> list[ValidationFinding]:
 
 
 def validate_checkpoint(content: str) -> list[ValidationFinding]:
-    """Strict checkpoint validation for active/coordinator.md.
+    """Checkpoint validation for active/coordinator.md.
 
     Extracts ``key: value`` pairs and validates:
-    - All required keys present
-    - ``step`` is a valid cycle step
+    - Required keys present (``cycle``, ``next_step`` — the two fields that
+      drive control flow in ``determine_next_cycle()``)
+    - ``step`` is a valid cycle step (when present)
     - ``next_step`` is a valid next-step value
-    - ``cycle``, ``phases_completed``, ``phases_total`` are non-negative ints
+    - Integer fields are non-negative (when present)
     - ``phases_completed`` <= ``phases_total`` (when both are valid ints)
 
-    Returns a list of findings (empty = valid).
-    All checkpoint issues are ERROR severity — these drive control flow.
+    Optional keys (``step``, ``current_phase``/``phase``, ``phases_completed``,
+    ``phases_total``) produce WARNINGs when absent — ``parse_checkpoint()``
+    handles them gracefully with defaults so their absence does not break
+    control flow.
+
+    Accepts ``phase`` as an alias for ``current_phase`` (agents commonly
+    write this variant).
     """
     findings: list[ValidationFinding] = []
     prefix = "active/coordinator.md"
@@ -367,10 +416,15 @@ def validate_checkpoint(content: str) -> list[ValidationFinding]:
     for match in re.finditer(r"(?m)^(\w[\w_]*):\s*(.+)$", content):
         fields[match.group(1)] = match.group(2).strip()
 
-    # Required keys
-    missing = _CHECKPOINT_REQUIRED_KEYS - fields.keys()
-    if missing:
-        for key in sorted(missing):
+    # Resolve aliases (e.g. phase -> current_phase) for downstream checks.
+    for alias, canonical in _CHECKPOINT_ALIASES.items():
+        if alias in fields and canonical not in fields:
+            fields[canonical] = fields[alias]
+
+    # Required keys — ERROR (control-flow breaking).
+    missing_required = _CHECKPOINT_REQUIRED_KEYS - fields.keys()
+    if missing_required:
+        for key in sorted(missing_required):
             findings.append(
                 ValidationFinding(
                     severity=Severity.ERROR,
@@ -378,11 +432,25 @@ def validate_checkpoint(content: str) -> list[ValidationFinding]:
                     path=prefix,
                 )
             )
-        # Can't validate further without required keys.
         return findings
 
-    # Enum: step
-    if fields["step"] not in _VALID_STEPS:
+    # Optional keys — WARNING (parse_checkpoint defaults them).
+    missing_optional = _CHECKPOINT_OPTIONAL_KEYS - fields.keys()
+    # Don't warn about aliases that resolved.
+    missing_optional -= {v for _, v in _CHECKPOINT_ALIASES.items() if v in fields}
+    # Don't warn about the alias side when the canonical is present.
+    missing_optional -= set(_CHECKPOINT_ALIASES.keys())
+    for key in sorted(missing_optional):
+        findings.append(
+            ValidationFinding(
+                severity=Severity.WARNING,
+                message=f"optional key '{key}' missing (defaulted by parser)",
+                path=prefix,
+            )
+        )
+
+    # Enum: step (only validate when present)
+    if "step" in fields and fields["step"] not in _VALID_STEPS:
         findings.append(
             ValidationFinding(
                 severity=Severity.ERROR,
@@ -407,9 +475,11 @@ def validate_checkpoint(content: str) -> list[ValidationFinding]:
             )
         )
 
-    # Integer fields
+    # Integer fields (only validate when present)
     int_errors = False
     for key in ("cycle", "phases_completed", "phases_total"):
+        if key not in fields:
+            continue
         try:
             val = int(fields[key])
             if val < 0:
@@ -432,7 +502,11 @@ def validate_checkpoint(content: str) -> list[ValidationFinding]:
             int_errors = True
 
     # Consistency: phases_completed <= phases_total
-    if not int_errors:
+    if (
+        not int_errors
+        and "phases_completed" in fields
+        and "phases_total" in fields
+    ):
         completed = int(fields["phases_completed"])
         total = int(fields["phases_total"])
         if completed > total:
@@ -946,7 +1020,7 @@ def _check_task_statuses(
 #: the corresponding regex is used.  This keeps forms declarative
 #: (string descriptions) while enforcement is mechanical.
 _ANTI_PATTERN_MATCHERS: list[tuple[str, re.Pattern[str], str]] = [
-    ("file path", re.compile(r"[a-zA-Z0-9_/.-]+\.(py|ts|tsx|js|jsx|md|css|html|json|yaml|yml|toml|go|rs|sh)\b"), "file path in criterion"),
+    ("file path", re.compile(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_/.-]+\.(py|ts|tsx|js|jsx|md|css|html|json|yaml|yml|toml|go|rs|sh)\b"), "file path in criterion"),
     ("implementation", re.compile(r"\b(class|module|function|method|widget)\s+[A-Z]"), "implementation artifact name in criterion"),
     ("implementation", re.compile(r"\b(extract|refactor|build|implement|create|add)\s+(a\s+|the\s+)?\w+", re.IGNORECASE), "implementation verb as criterion action"),
     ("file inspection", re.compile(r"\b(file|module|class|directory|folder)\s+(exists?|contains?|has)\b", re.IGNORECASE), "criterion verifiable by file inspection"),

@@ -262,7 +262,6 @@ def determine_next_cycle(
                 "status.md",
                 "compose.py",
                 f"phases/{checkpoint.current_phase}/phase.md",
-                "active/coordinator.md",
             ]
         case "ASSESS":
             return "ASSESS", [
@@ -271,17 +270,15 @@ def determine_next_cycle(
                 f"phases/{checkpoint.current_phase}/execution.md",
                 "requirements.md",
                 "decisions.md",
-                "active/coordinator.md",
+                "assessment.md",
             ]
         case "VERIFY":
             return "VERIFY", [
                 "status.md", "intents.md", "compose.py",
-                "active/coordinator.md",
             ]
         case "EXIT":
             return "EXIT", [
                 "status.md", "handoff.md", "decisions.md",
-                "active/coordinator.md",
             ]
         case "COMPLETE":
             return "COMPLETE", []

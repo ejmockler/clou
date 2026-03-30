@@ -1,12 +1,6 @@
-"""Conversation surface — scrollable message widgets with animated tail.
+"""Conversation surface — scrollable message list with animated tail.
 
-Messages are mounted as ``Static`` widgets inside a ``VerticalScroll``
-container.  The *tail* widget shows the streaming preview; when a turn
-completes the content is promoted to a permanent ``MarkdownMessage``
-and the tail clears.
-
-Turn state and lifecycle logic live in ``TurnController`` (composition
-object).  This widget owns UI rendering and Textual timers.
+Turn state lives in ``TurnController``; this widget owns rendering and timers.
 """
 
 from __future__ import annotations
@@ -45,7 +39,6 @@ from clou.ui.turn_controller import TurnController
 from clou.ui.widgets.agent_disclosure import AgentDisclosure
 from clou.ui.widgets.edit_disclosure import (
     DISCLOSURE_PRUNE,
-    DISCLOSURE_SETTLE,
     EditDisclosure,
 )
 from clou.ui.widgets.message_widgets import MarkdownMessage, UserMessage
@@ -61,22 +54,6 @@ _SURFACE_HEX = PALETTE["surface"].to_hex()
 # ── Stream constants ──────────────────────────────────────────────
 _STREAM_FLUSH_INTERVAL: float = 0.1
 _MAX_STREAM_BUFFER: int = 500_000
-
-# ── Backward-compat aliases (tests import these from here) ───────
-_MarkdownMessage = MarkdownMessage
-_UserMessage = UserMessage
-_EditDisclosure = EditDisclosure
-_AgentDisclosure = AgentDisclosure
-_DISCLOSURE_SETTLE = DISCLOSURE_SETTLE
-_tool_summary = tool_summary
-
-
-def _tc_proxy(attr: str) -> property:
-    """Create a property that proxies to the TurnController attribute."""
-    return property(
-        lambda self: getattr(self._tc, attr),
-        lambda self, v: setattr(self._tc, attr, v),
-    )
 
 
 class ConversationWidget(DragScrollMixin, Widget):
@@ -105,24 +82,12 @@ class ConversationWidget(DragScrollMixin, Widget):
         width: auto;
         background: transparent;
     }}
-    ConversationWidget .thinking {{
-        padding-left: 4;
-        margin: 0;
-    }}
+    ConversationWidget .thinking,
     ConversationWidget .tool-activity {{
         padding-left: 4;
         margin: 0;
     }}
     """
-
-    # Turn state — proxied to TurnController for backward-compat.
-    _stream_buffer = _tc_proxy("stream_buffer")
-    _stream_uuid = _tc_proxy("stream_uuid")
-    _stream_dirty = _tc_proxy("stream_dirty")
-    _pending_text = _tc_proxy("pending_text")
-    _turn_text = _tc_proxy("turn_text")
-    _working = _tc_proxy("working")
-    _working_phase = _tc_proxy("working_phase")
 
     def __init__(
         self,
@@ -155,9 +120,7 @@ class ConversationWidget(DragScrollMixin, Widget):
         """Start in the initializing state — wave provides the pulse."""
         self.add_class("initializing")
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    # -- Internal helpers -----------------------------------------------
 
     def _clear_tail(self) -> None:
         """Reset #tail to idle — clear content and streaming class."""
@@ -185,9 +148,7 @@ class ConversationWidget(DragScrollMixin, Widget):
         self._mount_msg(EditDisclosure(styled, diff_body, classes="msg tool-activity"))
         self._ensure_disclosure_timer()
 
-    # ------------------------------------------------------------------
-    # Disclosure lifecycle
-    # ------------------------------------------------------------------
+    # -- Disclosure lifecycle --------------------------------------------
 
     def _ensure_disclosure_timer(self) -> None:
         """Start the disclosure collapse timer if not already running."""
@@ -221,9 +182,7 @@ class ConversationWidget(DragScrollMixin, Widget):
             self._disclosure_timer.stop()
             self._disclosure_timer = None
 
-    # ------------------------------------------------------------------
-    # Public helpers
-    # ------------------------------------------------------------------
+    # -- Public helpers --------------------------------------------------
 
     def add_user_message(self, text: str, *, queued: bool = False) -> None:
         """Append a user message and start the working indicator."""
@@ -263,9 +222,7 @@ class ConversationWidget(DragScrollMixin, Widget):
         """Append a brief dim error for bad slash commands."""
         self._append(Text(f"  {text}", style=_DIM_HEX))
 
-    # ------------------------------------------------------------------
-    # Working indicator
-    # ------------------------------------------------------------------
+    # -- Working indicator -----------------------------------------------
 
     def _start_working(self) -> None:
         """Begin breathing indicator in #tail."""
@@ -291,9 +248,7 @@ class ConversationWidget(DragScrollMixin, Widget):
         tail = self.query_one("#tail", Static)
         tail.update(breathing_text(self._tc.working_phase))
 
-    # ------------------------------------------------------------------
-    # Stream debounce
-    # ------------------------------------------------------------------
+    # -- Stream debounce -------------------------------------------------
 
     def _ensure_timer(self) -> None:
         """Start the stream flush timer if not already running."""
@@ -324,9 +279,7 @@ class ConversationWidget(DragScrollMixin, Widget):
             self._disclosure_timer.stop()
             self._disclosure_timer = None
 
-    # ------------------------------------------------------------------
-    # Startup lifecycle
-    # ------------------------------------------------------------------
+    # -- Startup lifecycle -----------------------------------------------
 
     def _end_initializing(self) -> None:
         """The system is present — wave stops, gold prompt appears."""
@@ -346,9 +299,7 @@ class ConversationWidget(DragScrollMixin, Widget):
         except LookupError:
             pass
 
-    # ------------------------------------------------------------------
-    # Pending text buffer
-    # ------------------------------------------------------------------
+    # -- Pending text buffer ---------------------------------------------
 
     def _flush_pending_text(self) -> None:
         """Flush buffered supervisor text as a normal response."""
@@ -359,12 +310,7 @@ class ConversationWidget(DragScrollMixin, Widget):
         self._append_markdown(text)
         self._clear_tail()
 
-    def _flush_activity_line(self) -> None:
-        """No-op — retained for call-site compatibility."""
-
-    # ------------------------------------------------------------------
-    # Message handlers
-    # ------------------------------------------------------------------
+    # -- Message handlers ------------------------------------------------
 
     def on_clou_supervisor_text(self, msg: ClouSupervisorText) -> None:
         """Append assistant text to history, or buffer as candidate narration."""
@@ -486,9 +432,7 @@ class ConversationWidget(DragScrollMixin, Widget):
         if not self._tc.working:
             self._start_working()
 
-    # ------------------------------------------------------------------
-    # Queue indicator
-    # ------------------------------------------------------------------
+    # -- Queue indicator -------------------------------------------------
 
     def update_queue_count(self, count: int) -> None:
         """Update the queue indicator with the number of pending messages.

@@ -82,12 +82,12 @@ def test_valid_coordinator(tmp_path: Path) -> None:
 
 def test_coordinator_missing_required_key(tmp_path: Path) -> None:
     """Missing a required key produces an error per missing key."""
-    # Missing step and next_step
-    content = "cycle: 1\ncurrent_phase: p1\nphases_completed: 0\nphases_total: 1\n"
+    # Missing cycle and next_step (both required)
+    content = "step: ASSESS\ncurrent_phase: p1\nphases_completed: 0\nphases_total: 1\n"
     _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     findings = validate_golden_context(tmp_path, "m1")
     msgs = _messages(findings)
-    assert any("missing required key 'step'" in m for m in msgs)
+    assert any("missing required key 'cycle'" in m for m in msgs)
     assert any("missing required key 'next_step'" in m for m in msgs)
 
 
@@ -137,13 +137,14 @@ def test_coordinator_completed_exceeds_total(tmp_path: Path) -> None:
 
 
 def test_coordinator_all_keys_missing(tmp_path: Path) -> None:
-    """Content with no key-value pairs produces errors for all required keys."""
+    """Content with no key-value pairs produces errors for required keys."""
     _write(
         tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md",
         "# Coordinator\nJust some text.\n",
     )
     findings = validate_golden_context(tmp_path, "m1")
-    assert len(findings) == 6  # one per required key
+    errors = [f for f in findings if f.severity.name == "ERROR"]
+    assert len(errors) == 2  # cycle + next_step
 
 
 def test_coordinator_valid_next_step_rework(tmp_path: Path) -> None:
@@ -160,6 +161,27 @@ def test_coordinator_valid_next_step_complete(tmp_path: Path) -> None:
     content = VALID_CHECKPOINT.replace("next_step: VERIFY", "next_step: COMPLETE")
     _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     assert validate_golden_context(tmp_path, "m1") == []
+
+
+def test_coordinator_phase_alias_accepted(tmp_path: Path) -> None:
+    """``phase:`` is accepted as alias for ``current_phase:``."""
+    content = "cycle: 3\nnext_step: VERIFY\nphase: impl\n"
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    errors = [f for f in findings if f.severity.name == "ERROR"]
+    assert errors == []
+
+
+def test_coordinator_minimal_checkpoint_valid(tmp_path: Path) -> None:
+    """Checkpoint with only required keys (cycle + next_step) has no errors."""
+    content = "cycle: 1\nnext_step: PLAN\n"
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    errors = [f for f in findings if f.severity.name == "ERROR"]
+    assert errors == []
+    # Optional keys missing produce warnings, not errors.
+    warnings = [f for f in findings if f.severity.name == "WARNING"]
+    assert any("optional key" in w.message for w in warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -915,12 +937,13 @@ def test_phase_level_and_flat_both_checked(tmp_path: Path) -> None:
 
 
 def test_checkpoint_errors_are_errors(tmp_path: Path) -> None:
-    """Missing keys and bad enums in coordinator checkpoint produce ERROR severity."""
-    content = "cycle: 1\ncurrent_phase: p1\nphases_completed: 0\nphases_total: 1\n"
+    """Missing required keys in coordinator checkpoint produce ERROR severity."""
+    # Missing both required keys (cycle and next_step)
+    content = "current_phase: p1\nphases_completed: 0\nphases_total: 1\nstep: PLAN\n"
     _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     findings = validate_golden_context(tmp_path, "m1")
-    assert all(f.severity == Severity.ERROR for f in findings)
-    assert len(findings) >= 2  # at least step and next_step missing
+    errs = [f for f in findings if f.severity == Severity.ERROR]
+    assert len(errs) >= 2  # cycle and next_step missing
 
 
 def test_status_errors_are_errors(tmp_path: Path) -> None:
@@ -1578,14 +1601,14 @@ class TestValidateDelivery:
         assert all(f.severity == Severity.ERROR for f in findings)
 
     def test_delivery_matching_next_step(self, tmp_path: Path) -> None:
-        """Both files have same next_step -> no cross-validation finding."""
+        """Both files have consistent state -> no cross-validation finding."""
         milestone_dir = tmp_path / "milestone"
         milestone_dir.mkdir()
         cp = milestone_dir / "active" / "coordinator.md"
         cp.parent.mkdir(parents=True)
         cp.write_text(
             "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
-            "current_phase: impl\nphases_completed: 1\nphases_total: 3\n"
+            "current_phase: impl\nphases_completed: 0\nphases_total: 3\n"
         )
         _write(
             milestone_dir / "status.md",
@@ -1604,7 +1627,7 @@ class TestValidateDelivery:
         cp.parent.mkdir(parents=True)
         cp.write_text(
             "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
-            "current_phase: impl\nphases_completed: 1\nphases_total: 3\n"
+            "current_phase: impl\nphases_completed: 0\nphases_total: 3\n"
         )
         _write(
             milestone_dir / "status.md",
@@ -1613,12 +1636,45 @@ class TestValidateDelivery:
         )
 
         findings = validate_delivery(milestone_dir, cp, "m1")
-        assert len(findings) == 1
-        assert findings[0].severity == Severity.ERROR
-        assert "diverges" in findings[0].message
-        assert "VERIFY" in findings[0].message
-        assert "ASSESS" in findings[0].message
-        assert findings[0].path == "milestones/m1/active/coordinator.md"
+        assert any(f.severity == Severity.ERROR and "diverges" in f.message for f in findings)
+
+    def test_delivery_divergent_cycle_count(self, tmp_path: Path) -> None:
+        """Different cycle count -> ERROR finding."""
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        cp.write_text(
+            "cycle: 5\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: impl\nphases_completed: 0\nphases_total: 3\n"
+        )
+        _write(
+            milestone_dir / "status.md",
+            "## Current State\nphase: impl\ncycle: 2\nnext_step: ASSESS\n"
+            "## Phase Progress\n| Phase | Status |\n|---|---|\n| impl | in_progress |\n",
+        )
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        assert any(f.severity == Severity.ERROR and "cycle" in f.message for f in findings)
+
+    def test_delivery_divergent_phase(self, tmp_path: Path) -> None:
+        """Different current phase -> ERROR finding."""
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        cp.write_text(
+            "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: api\nphases_completed: 0\nphases_total: 3\n"
+        )
+        _write(
+            milestone_dir / "status.md",
+            "## Current State\nphase: impl\ncycle: 2\nnext_step: ASSESS\n"
+            "## Phase Progress\n| Phase | Status |\n|---|---|\n| impl | in_progress |\n",
+        )
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        assert any(f.severity == Severity.ERROR and "phase" in f.message for f in findings)
 
     def test_delivery_status_missing_next_step(self, tmp_path: Path) -> None:
         """status.md lacks next_step -> no cross-validation finding (graceful skip)."""
@@ -1628,7 +1684,7 @@ class TestValidateDelivery:
         cp.parent.mkdir(parents=True)
         cp.write_text(
             "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
-            "current_phase: impl\nphases_completed: 1\nphases_total: 3\n"
+            "current_phase: impl\nphases_completed: 0\nphases_total: 3\n"
         )
         _write(
             milestone_dir / "status.md",

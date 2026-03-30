@@ -236,11 +236,11 @@ class TestClear:
     async def test_clear_stops_streaming(self) -> None:
         async with ClouApp().run_test() as pilot:
             conv = pilot.app.query_one(ConversationWidget)
-            conv._stream_buffer = "some streaming content"
-            conv._stream_dirty = True
+            conv._tc.stream_buffer = "some streaming content"
+            conv._tc.stream_dirty = True
             await dispatch(pilot.app, "/clear")
-            assert conv._stream_buffer == ""
-            assert conv._stream_dirty is False
+            assert conv._tc.stream_buffer == ""
+            assert conv._tc.stream_dirty is False
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,9 @@ from clou.ui.messages import (
     ClouTurnComplete,
     ClouTurnContentReady,
 )
-from clou.ui.widgets.conversation import ConversationWidget, _tool_summary
+from clou.ui.rendering.tool_summary import tool_summary
+from clou.ui.widgets.conversation import ConversationWidget
+from clou.ui.widgets.message_widgets import UserMessage
 import clou.ui.widgets.conversation as _conv_mod
 
 
@@ -56,8 +58,8 @@ class TestMounting:
     async def test_mounts_with_empty_state(self) -> None:
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
-            assert widget._stream_buffer == ""
-            assert widget._stream_uuid == ""
+            assert widget._tc.stream_buffer == ""
+            assert widget._tc.stream_uuid == ""
 
     @pytest.mark.asyncio
     async def test_has_history_and_tail(self) -> None:
@@ -88,7 +90,7 @@ class TestUserMessage:
             widget = pilot.app.query_one(ConversationWidget)
             widget.add_user_message("hello", queued=True)
             await pilot.pause()
-            user_msgs = widget.query(_conv_mod._UserMessage)
+            user_msgs = widget.query(UserMessage)
             assert len(user_msgs) >= 1
             rendered = user_msgs.last().render()
             assert "queued" in rendered.plain
@@ -100,7 +102,7 @@ class TestUserMessage:
             widget = pilot.app.query_one(ConversationWidget)
             widget.add_user_message("hello", queued=True)
             await pilot.pause()
-            user_msg = widget.query(_conv_mod._UserMessage).last()
+            user_msg = widget.query(UserMessage).last()
             assert user_msg._queued is True
             user_msg.mark_active()
             assert user_msg._queued is False
@@ -114,7 +116,7 @@ class TestUserMessage:
             widget = pilot.app.query_one(ConversationWidget)
             widget.add_user_message("hello", queued=True)
             await pilot.pause()
-            user_msg = widget.query(_conv_mod._UserMessage).last()
+            user_msg = widget.query(UserMessage).last()
             assert user_msg._queued is True
             widget.post_message(ClouProcessingStarted(text="hello"))
             await pilot.pause()
@@ -128,7 +130,7 @@ class TestUserMessage:
             widget.add_user_message("msg A", queued=True)
             widget.add_user_message("msg B", queued=True)
             await pilot.pause()
-            msgs = list(widget.query(_conv_mod._UserMessage))
+            msgs = list(widget.query(UserMessage))
             assert msgs[0]._queued is True
             assert msgs[1]._queued is True
             # First ClouProcessingStarted should mark A (first queued), not B.
@@ -149,7 +151,7 @@ class TestUserMessage:
             widget.add_user_message("msg1", queued=True)
             widget.add_user_message("msg2", queued=True)
             await pilot.pause()
-            user_msgs = widget.query(_conv_mod._UserMessage)
+            user_msgs = widget.query(UserMessage)
             assert all(m._queued for m in user_msgs)
             widget.reset_turn_state()
             await pilot.pause()
@@ -200,8 +202,8 @@ class TestStreamChunk:
             await pilot.pause()
             widget.post_message(ClouStreamChunk(text="lo", uuid="u1"))
             await pilot.pause()
-            assert widget._stream_buffer == "hello"
-            assert widget._stream_uuid == "u1"
+            assert widget._tc.stream_buffer == "hello"
+            assert widget._tc.stream_uuid == "u1"
 
     @pytest.mark.asyncio
     async def test_new_uuid_resets_buffer(self) -> None:
@@ -211,8 +213,8 @@ class TestStreamChunk:
             await pilot.pause()
             widget.post_message(ClouStreamChunk(text="new", uuid="u2"))
             await pilot.pause()
-            assert widget._stream_buffer == "new"
-            assert widget._stream_uuid == "u2"
+            assert widget._tc.stream_buffer == "new"
+            assert widget._tc.stream_uuid == "u2"
 
     @pytest.mark.asyncio
     async def test_stream_buffer_truncated_at_max(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -229,10 +231,10 @@ class TestStreamChunk:
                     ClouStreamChunk(text=char * chunk_size, uuid="u1")
                 )
                 await pilot.pause()
-            assert len(widget._stream_buffer) == cap
+            assert len(widget._tc.stream_buffer) == cap
             # Buffer should keep the tail (most recent content), not the head.
             last_char = str(total_chunks - 1)
-            assert widget._stream_buffer.endswith(last_char * chunk_size)
+            assert widget._tc.stream_buffer.endswith(last_char * chunk_size)
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +250,7 @@ class TestTurnComplete:
             # Simulate a streaming turn
             widget.post_message(ClouStreamChunk(text="streamed", uuid="u1"))
             await pilot.pause()
-            assert widget._stream_buffer == "streamed"
+            assert widget._tc.stream_buffer == "streamed"
 
             widget.post_message(
                 ClouTurnComplete(
@@ -258,8 +260,8 @@ class TestTurnComplete:
             await pilot.pause()
 
             # Buffer should be cleared
-            assert widget._stream_buffer == ""
-            assert widget._stream_uuid == ""
+            assert widget._tc.stream_buffer == ""
+            assert widget._tc.stream_uuid == ""
             # History should have the streamed content
             assert _msg_count(widget) >= 1
 
@@ -359,33 +361,33 @@ class TestToolUse:
 
 class TestToolSummary:
     def test_read_shows_filename(self) -> None:
-        assert _tool_summary("Read", {"file_path": "/a/b/main.py"}) == "Read main.py"
+        assert tool_summary("Read", {"file_path": "/a/b/main.py"}) == "Read main.py"
 
     def test_write_shows_filename_with_new(self) -> None:
-        assert _tool_summary("Write", {"file_path": "/tmp/out.txt"}) == "Write out.txt  (new)"
+        assert tool_summary("Write", {"file_path": "/tmp/out.txt"}) == "Write out.txt  (new)"
 
     def test_bash_shows_command(self) -> None:
-        result = _tool_summary("Bash", {"command": "npm test | head -20"})
+        result = tool_summary("Bash", {"command": "npm test | head -20"})
         assert result == "Bash npm test"
 
     def test_grep_shows_pattern(self) -> None:
-        assert _tool_summary("Grep", {"pattern": "def main"}) == "Grep /def main/"
+        assert tool_summary("Grep", {"pattern": "def main"}) == "Grep /def main/"
 
     def test_glob_shows_pattern(self) -> None:
-        assert _tool_summary("Glob", {"pattern": "**/*.py"}) == "Glob **/*.py"
+        assert tool_summary("Glob", {"pattern": "**/*.py"}) == "Glob **/*.py"
 
     def test_unknown_tool(self) -> None:
-        assert _tool_summary("CustomTool", {}) == "CustomTool"
+        assert tool_summary("CustomTool", {}) == "CustomTool"
 
     def test_empty_file_path(self) -> None:
-        assert _tool_summary("Read", {"file_path": ""}) == "Read"
+        assert tool_summary("Read", {"file_path": ""}) == "Read"
 
     def test_agent_shows_description(self) -> None:
-        result = _tool_summary("Agent", {"description": "explore the codebase"})
+        result = tool_summary("Agent", {"description": "explore the codebase"})
         assert result == "Agent explore the codebase"
 
     def test_edit_shows_stats(self) -> None:
-        result = _tool_summary("Edit", {
+        result = tool_summary("Edit", {
             "file_path": "/a/hooks.py",
             "old_string": "old\n",
             "new_string": "new\nline\n",
@@ -395,7 +397,7 @@ class TestToolSummary:
         assert "−1" in result
 
     def test_multi_edit_shows_stats(self) -> None:
-        result = _tool_summary("MultiEdit", {
+        result = tool_summary("MultiEdit", {
             "file_path": "/a/main.py",
             "edits": [
                 {"old_string": "a\n", "new_string": "b\nc\n"},
@@ -414,8 +416,8 @@ class TestToolSummary:
 class TestEditDisclosure:
     @pytest.mark.asyncio
     async def test_edit_tool_creates_disclosure(self) -> None:
-        """Edit tool call mounts an _EditDisclosure widget."""
-        from clou.ui.widgets.conversation import _EditDisclosure
+        """Edit tool call mounts an EditDisclosure widget."""
+        from clou.ui.widgets.edit_disclosure import EditDisclosure
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
@@ -428,13 +430,13 @@ class TestEditDisclosure:
                 })
             )
             await pilot.pause()
-            disclosures = widget.query(_EditDisclosure)
+            disclosures = widget.query(EditDisclosure)
             assert len(disclosures) >= 1
 
     @pytest.mark.asyncio
     async def test_edit_disclosure_shows_colored_stats(self) -> None:
         """Edit disclosure summary includes +N and −M."""
-        from clou.ui.widgets.conversation import _EditDisclosure
+        from clou.ui.widgets.edit_disclosure import EditDisclosure
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
@@ -447,7 +449,7 @@ class TestEditDisclosure:
                 })
             )
             await pilot.pause()
-            disclosure = widget.query_one(_EditDisclosure)
+            disclosure = widget.query_one(EditDisclosure)
             rendered = disclosure.render()
             text = rendered.plain
             assert "+1" in text
@@ -456,7 +458,7 @@ class TestEditDisclosure:
     @pytest.mark.asyncio
     async def test_edit_disclosure_shows_diff_body(self) -> None:
         """Edit disclosure shows inline diff when expanded."""
-        from clou.ui.widgets.conversation import _EditDisclosure
+        from clou.ui.widgets.edit_disclosure import EditDisclosure
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
@@ -469,7 +471,7 @@ class TestEditDisclosure:
                 })
             )
             await pilot.pause()
-            disclosure = widget.query_one(_EditDisclosure)
+            disclosure = widget.query_one(EditDisclosure)
             rendered = disclosure.render()
             text = rendered.plain
             assert "- removed" in text
@@ -477,8 +479,8 @@ class TestEditDisclosure:
 
     @pytest.mark.asyncio
     async def test_write_tool_creates_disclosure(self) -> None:
-        """Write tool call mounts an _EditDisclosure widget."""
-        from clou.ui.widgets.conversation import _EditDisclosure
+        """Write tool call mounts an EditDisclosure widget."""
+        from clou.ui.widgets.edit_disclosure import EditDisclosure
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
@@ -490,14 +492,14 @@ class TestEditDisclosure:
                 })
             )
             await pilot.pause()
-            disclosures = widget.query(_EditDisclosure)
+            disclosures = widget.query(EditDisclosure)
             assert len(disclosures) >= 1
 
     @pytest.mark.asyncio
     async def test_disclosure_collapses_after_settle(self) -> None:
         """Disclosure collapses when update_lifecycle passes settle threshold."""
         import time as _time
-        from clou.ui.widgets.conversation import _EditDisclosure, _DISCLOSURE_SETTLE
+        from clou.ui.widgets.edit_disclosure import EditDisclosure, DISCLOSURE_SETTLE
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
@@ -510,11 +512,11 @@ class TestEditDisclosure:
                 })
             )
             await pilot.pause()
-            disclosure = widget.query_one(_EditDisclosure)
+            disclosure = widget.query_one(EditDisclosure)
             assert disclosure._expanded is True
             # Simulate passage of time
             changed = disclosure.update_lifecycle(
-                disclosure._birth + _DISCLOSURE_SETTLE + 0.1
+                disclosure._birth + DISCLOSURE_SETTLE + 0.1
             )
             assert changed is True
             assert disclosure._expanded is False
@@ -522,7 +524,7 @@ class TestEditDisclosure:
     @pytest.mark.asyncio
     async def test_click_toggles_and_pins(self) -> None:
         """Clicking a disclosure toggles expansion and pins it."""
-        from clou.ui.widgets.conversation import _EditDisclosure
+        from clou.ui.widgets.edit_disclosure import EditDisclosure
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
@@ -535,7 +537,7 @@ class TestEditDisclosure:
                 })
             )
             await pilot.pause()
-            disclosure = widget.query_one(_EditDisclosure)
+            disclosure = widget.query_one(EditDisclosure)
             # Collapse it first
             disclosure._expanded = True
             disclosure.on_click()
@@ -548,7 +550,7 @@ class TestEditDisclosure:
     @pytest.mark.asyncio
     async def test_pinned_disclosure_does_not_auto_collapse(self) -> None:
         """Pinned disclosures ignore lifecycle collapse."""
-        from clou.ui.widgets.conversation import _EditDisclosure, _DISCLOSURE_SETTLE
+        from clou.ui.widgets.edit_disclosure import EditDisclosure, DISCLOSURE_SETTLE
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
@@ -561,10 +563,10 @@ class TestEditDisclosure:
                 })
             )
             await pilot.pause()
-            disclosure = widget.query_one(_EditDisclosure)
+            disclosure = widget.query_one(EditDisclosure)
             disclosure._pinned = True
             changed = disclosure.update_lifecycle(
-                disclosure._birth + _DISCLOSURE_SETTLE + 1.0
+                disclosure._birth + DISCLOSURE_SETTLE + 1.0
             )
             assert changed is False
             assert disclosure._expanded is True
@@ -600,13 +602,13 @@ class TestToolActivityLines:
             widget._initializing = False
             widget.add_user_message("do stuff")
             await pilot.pause()
-            assert widget._working is True
+            assert widget._tc.working is True
             for i in range(5):
                 widget.post_message(
                     ClouToolUse(name="Read", tool_input={"file_path": f"/a/{i}.py"})
                 )
                 await pilot.pause()
-            assert widget._working is True
+            assert widget._tc.working is True
 
 
 # ---------------------------------------------------------------------------
@@ -639,40 +641,40 @@ class TestFlushStream:
         """_tick does not update tail when _stream_dirty is False."""
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
-            widget._stream_dirty = False
-            widget._stream_buffer = "should not matter"
+            widget._tc.stream_dirty = False
+            widget._tc.stream_buffer = "should not matter"
             tail = widget.query_one("#tail", Static)
             tail.update("")
             widget._tick()
             await pilot.pause()
             # _stream_dirty should remain False
-            assert widget._stream_dirty is False
+            assert widget._tc.stream_dirty is False
 
     @pytest.mark.asyncio
     async def test_resets_dirty_flag(self) -> None:
         """_tick sets _stream_dirty to False when it was True."""
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
-            widget._stream_dirty = True
-            widget._stream_buffer = "hello"
+            widget._tc.stream_dirty = True
+            widget._tc.stream_buffer = "hello"
             widget._tick()
             await pilot.pause()
-            assert widget._stream_dirty is False
+            assert widget._tc.stream_dirty is False
 
     @pytest.mark.asyncio
     async def test_updates_tail_with_buffer(self) -> None:
         """_tick updates #tail with Markdown of the buffer."""
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
-            widget._stream_dirty = True
-            widget._stream_buffer = "# heading\nparagraph"
+            widget._tc.stream_dirty = True
+            widget._tc.stream_buffer = "# heading\nparagraph"
             widget._tick()
             await pilot.pause()
             tail = widget.query_one("#tail", Static)
             # After tick, tail should have been updated (non-empty).
             # The content is a Markdown object — verify _stream_dirty was cleared
             # and that the update was applied.
-            assert widget._stream_dirty is False
+            assert widget._tc.stream_dirty is False
             # The tail's update() was called with Markdown — check it's not empty.
             visual = tail.render()
             assert visual is not None
@@ -787,11 +789,11 @@ class TestProcessingStarted:
             widget.add_user_message("query")
             await pilot.pause()
             widget._stop_working()
-            assert widget._working is False
+            assert widget._tc.working is False
             # ProcessingStarted restarts working.
             widget.post_message(ClouProcessingStarted(text="query"))
             await pilot.pause()
-            assert widget._working is True
+            assert widget._tc.working is True
 
     @pytest.mark.asyncio
     async def test_processing_started_noop_when_already_working(self) -> None:
@@ -800,10 +802,10 @@ class TestProcessingStarted:
             widget = pilot.app.query_one(ConversationWidget)
             widget.add_user_message("query")
             await pilot.pause()
-            assert widget._working is True
+            assert widget._tc.working is True
             widget.post_message(ClouProcessingStarted(text="query"))
             await pilot.pause()
-            assert widget._working is True
+            assert widget._tc.working is True
 
 
 # ---------------------------------------------------------------------------
@@ -1004,7 +1006,7 @@ class TestPersistenceBoundary:
             )
             await pilot.pause()
             # _turn_text should be empty (streamed path), stream buffer was consumed.
-            assert widget._stream_buffer == ""
+            assert widget._tc.stream_buffer == ""
 
     @pytest.mark.asyncio
     async def test_non_streamed_turn_persisted(self) -> None:
@@ -1014,13 +1016,13 @@ class TestPersistenceBoundary:
             widget._initializing = False
             widget.post_message(ClouSupervisorText(text="direct response", model="opus"))
             await pilot.pause()
-            assert widget._turn_text == "direct response"
+            assert widget._tc.turn_text == "direct response"
             widget.post_message(
                 ClouTurnComplete(input_tokens=0, output_tokens=0, cost_usd=0, duration_ms=0)
             )
             await pilot.pause()
             # After turn complete, _turn_text is cleared.
-            assert widget._turn_text == ""
+            assert widget._tc.turn_text == ""
 
     @pytest.mark.asyncio
     async def test_flushed_pending_text_persisted(self) -> None:
@@ -1032,14 +1034,14 @@ class TestPersistenceBoundary:
             await pilot.pause()
             widget.post_message(ClouSupervisorText(text="short", model="opus"))
             await pilot.pause()
-            assert widget._pending_text == "short"
+            assert widget._tc.pending_text == "short"
             widget.post_message(
                 ClouTurnComplete(input_tokens=0, output_tokens=0, cost_usd=0, duration_ms=0)
             )
             await pilot.pause()
             # Pending text was flushed and accumulated, then cleared on turn complete.
-            assert widget._pending_text is None
-            assert widget._turn_text == ""
+            assert widget._tc.pending_text is None
+            assert widget._tc.turn_text == ""
 
     @pytest.mark.asyncio
     async def test_multiple_supervisor_texts_accumulated(self) -> None:
@@ -1051,8 +1053,8 @@ class TestPersistenceBoundary:
             await pilot.pause()
             widget.post_message(ClouSupervisorText(text="B" * 201, model="opus"))
             await pilot.pause()
-            assert "A" * 201 in widget._turn_text
-            assert "B" * 201 in widget._turn_text
+            assert "A" * 201 in widget._tc.turn_text
+            assert "B" * 201 in widget._tc.turn_text
 
     @pytest.mark.asyncio
     async def test_turn_text_cleared_on_new_user_message(self) -> None:
@@ -1062,10 +1064,10 @@ class TestPersistenceBoundary:
             widget._initializing = False
             widget.post_message(ClouSupervisorText(text="A" * 201, model="opus"))
             await pilot.pause()
-            assert widget._turn_text != ""
+            assert widget._tc.turn_text != ""
             widget.add_user_message("next question")
             await pilot.pause()
-            assert widget._turn_text == ""
+            assert widget._tc.turn_text == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1074,12 +1076,12 @@ class TestPersistenceBoundary:
 
 
 class TestAgentDisclosure:
-    """Agent tool calls render as collapsible _AgentDisclosure widgets."""
+    """Agent tool calls render as collapsible AgentDisclosure widgets."""
 
     @pytest.mark.asyncio
     async def test_agent_tool_creates_disclosure(self) -> None:
-        """Agent tool_use mounts an _AgentDisclosure in history."""
-        from clou.ui.widgets.conversation import _AgentDisclosure
+        """Agent tool_use mounts an AgentDisclosure in history."""
+        from clou.ui.widgets.agent_disclosure import AgentDisclosure
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
@@ -1092,14 +1094,14 @@ class TestAgentDisclosure:
                 )
             )
             await pilot.pause()
-            disclosures = list(widget.query(_AgentDisclosure))
+            disclosures = list(widget.query(AgentDisclosure))
             assert len(disclosures) == 1
             assert disclosures[0]._description == "Find bugs"
             assert disclosures[0]._status == "running"
 
     @pytest.mark.asyncio
     async def test_disclosure_starts_collapsed(self) -> None:
-        from clou.ui.widgets.conversation import _AgentDisclosure
+        from clou.ui.widgets.agent_disclosure import AgentDisclosure
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
@@ -1112,13 +1114,13 @@ class TestAgentDisclosure:
                 )
             )
             await pilot.pause()
-            d = list(widget.query(_AgentDisclosure))[0]
+            d = list(widget.query(AgentDisclosure))[0]
             assert not d._expanded
 
     @pytest.mark.asyncio
     async def test_tool_result_fills_disclosure(self) -> None:
         """Matching tool_result completes the disclosure."""
-        from clou.ui.widgets.conversation import _AgentDisclosure
+        from clou.ui.widgets.agent_disclosure import AgentDisclosure
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
@@ -1139,14 +1141,14 @@ class TestAgentDisclosure:
                 )
             )
             await pilot.pause()
-            d = list(widget.query(_AgentDisclosure))[0]
+            d = list(widget.query(AgentDisclosure))[0]
             assert d._status == "success"
             assert d._result == "Found the answer."
             assert "toolu_3" not in widget._pending_agents
 
     @pytest.mark.asyncio
     async def test_error_result_marks_disclosure(self) -> None:
-        from clou.ui.widgets.conversation import _AgentDisclosure
+        from clou.ui.widgets.agent_disclosure import AgentDisclosure
 
         async with ConversationApp().run_test() as pilot:
             widget = pilot.app.query_one(ConversationWidget)
@@ -1167,7 +1169,7 @@ class TestAgentDisclosure:
                 )
             )
             await pilot.pause()
-            d = list(widget.query(_AgentDisclosure))[0]
+            d = list(widget.query(AgentDisclosure))[0]
             assert d._status == "error"
 
     @pytest.mark.asyncio
