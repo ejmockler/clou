@@ -125,6 +125,7 @@ class HarnessTemplate:
     artifact_forms: dict[str, ArtifactForm] = field(
         default_factory=dict,
     )
+    pause_on_user_message: bool = False
     budget_usd: float | None = None
 
 
@@ -335,16 +336,16 @@ _INLINE_FALLBACK = HarnessTemplate(
                 "WebSearch", "WebFetch",
             ],
         ),
-        "assessor": AgentSpec(
+        "brutalist": AgentSpec(
             description=(
-                "Invoke quality gate tools on changed code and "
-                "structure findings into assessment.md. Does not "
-                "evaluate findings — captures only."
+                "Read-only quality gate agent. Invokes brutalist MCP "
+                "tools on changed code and writes raw findings to "
+                "assessment.md. Cannot evaluate, dismiss, or edit code."
             ),
             prompt_ref="assessor",
-            tier="assessor",
+            tier="brutalist",
             tools=[
-                "Read", "Write", "Bash", "Grep", "Glob",
+                "Read", "Write", "Grep", "Glob",
                 "mcp__brutalist__roast_codebase",
                 "mcp__brutalist__roast_architecture",
                 "mcp__brutalist__roast_security",
@@ -353,6 +354,20 @@ _INLINE_FALLBACK = HarnessTemplate(
                 "mcp__brutalist__roast_file_structure",
                 "mcp__brutalist__roast_dependencies",
                 "mcp__brutalist__roast_test_coverage",
+                "mcp__brutalist__roast_cli_debate",
+                "mcp__brutalist__brutalist_discover",
+            ],
+        ),
+        "assess-evaluator": AgentSpec(
+            description=(
+                "Classify each finding in assessment.md against "
+                "requirements.md. Writes classifications to decisions.md. "
+                "Does not discover new findings or edit code."
+            ),
+            prompt_ref="assess-evaluator",
+            tier="assess-evaluator",
+            tools=[
+                "Read", "Write", "Grep", "Glob",
             ],
         ),
         "verifier": AgentSpec(
@@ -381,7 +396,7 @@ _INLINE_FALLBACK = HarnessTemplate(
     quality_gates=[
         QualityGateSpec(
             mcp_server="brutalist",
-            assess_agent="assessor",
+            assess_agent="brutalist",
             verify_agent="verifier",
             required=True,
         ),
@@ -403,6 +418,7 @@ _INLINE_FALLBACK = HarnessTemplate(
             "roadmap.md",
             "requests.md",
             "understanding.md",
+            "memory.md",
             "milestones/*/milestone.md",
             "milestones/*/intents.md",
             "milestones/*/requirements.md",
@@ -425,8 +441,12 @@ _INLINE_FALLBACK = HarnessTemplate(
             "milestones/*/phases/verification/artifacts/*",
             "milestones/*/handoff.md",
         ],
-        "assessor": [
+        "brutalist": [
             "milestones/*/assessment.md",
+        ],
+        "assess-evaluator": [
+            "milestones/*/assessment.md",
+            "milestones/*/decisions.md",
         ],
     },
     compose_conventions=ComposeConventions(

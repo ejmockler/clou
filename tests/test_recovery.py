@@ -16,9 +16,21 @@ import pytest
 from clou.recovery import (
     Checkpoint,
     ConvergenceState,
+    MemoryPattern,
+    _consolidated_milestones,
+    _milestone_sort_key,
+    _parse_memory,
+    _render_memory,
     _safe_int,
+    _analyze_compose,
+    _count_metrics_section_rows,
+    _parse_metrics_header,
+    _reinforce_or_create,
+    _apply_decay,
     assess_convergence,
     attempt_self_heal,
+    consolidate_milestone,
+    consolidate_pending,
     determine_next_cycle,
     git_commit_phase,
     git_revert_golden_context,
@@ -1526,3 +1538,538 @@ def test_staging_exclude_patterns() -> None:
         assert not any(
             fnmatch.fnmatch(f, pat) for pat in _STAGING_EXCLUDE_PATTERNS
         ), f"Should include {f}"
+
+
+# ---------------------------------------------------------------------------
+# DB-18: Memory consolidation
+# ---------------------------------------------------------------------------
+
+_SAMPLE_MEMORY = """\
+# Operational Memory
+
+## Patterns
+
+### cycle-count-distribution
+type: cost-calibration
+observed: 12-reasoning-loop, 13-convergence
+reinforced: 2
+last_active: 13-convergence
+
+2 cycles per milestone on average.
+
+### decomposition-topology
+type: decomposition
+observed: 12-reasoning-loop
+reinforced: 1
+last_active: 12-reasoning-loop
+status: fading
+
+1 phase, sequential execution.
+
+## Archived
+
+### old-pattern
+type: debt
+observed: 5-legacy
+reinforced: 1
+last_active: 5-legacy
+status: archived
+
+Legacy pattern no longer relevant.
+"""
+
+_SAMPLE_METRICS = """\
+# Metrics: 14-test
+
+outcome: completed
+cycles: 5
+duration: 35m 10s
+tokens_in: 500
+tokens_out: 50000
+agents_spawned: 6
+agents_completed: 6
+agents_failed: 0
+crash_retries: 0
+validation_failures: 2
+context_exhaustions: 0
+
+## Cycles
+
+| # | Type | Duration | Tokens In | Tokens Out | Outcome |
+|---|------|----------|-----------|------------|---------|
+| 1 | PLAN | 5m | 100 | 10000 | EXECUTE |
+| 2 | EXECUTE | 10m | 200 | 20000 | ASSESS |
+| 3 | ASSESS | 8m | 100 | 8000 | VERIFY |
+| 4 | VERIFY | 10m | 50 | 10000 | EXIT |
+| 5 | EXIT | 2m | 50 | 2000 | COMPLETE |
+
+## Rework
+
+| Cycle | From | To | Phase |
+|-------|------|----|-------|
+| 3 | ASSESS | EXECUTE | impl |
+
+## Incidents
+
+- Cycle 1: validation_failure (attempt 1, 1 errors)
+- Cycle 3: validation_failure (attempt 1, 1 errors)
+"""
+
+
+class TestParseMemory:
+    """Tests for _parse_memory round-trip."""
+
+    def test_parse_basic(self) -> None:
+        patterns = _parse_memory(_SAMPLE_MEMORY)
+        assert len(patterns) == 3
+        assert patterns[0].name == "cycle-count-distribution"
+        assert patterns[0].type == "cost-calibration"
+        assert patterns[0].reinforced == 2
+        assert patterns[0].observed == ["12-reasoning-loop", "13-convergence"]
+        assert patterns[0].status == "active"
+
+    def test_parse_fading(self) -> None:
+        patterns = _parse_memory(_SAMPLE_MEMORY)
+        assert patterns[1].status == "fading"
+
+    def test_parse_archived(self) -> None:
+        patterns = _parse_memory(_SAMPLE_MEMORY)
+        assert patterns[2].status == "archived"
+        assert patterns[2].name == "old-pattern"
+
+    def test_round_trip_preserves_data(self) -> None:
+        patterns = _parse_memory(_SAMPLE_MEMORY)
+        rendered = _render_memory(patterns)
+        reparsed = _parse_memory(rendered)
+        assert len(reparsed) == len(patterns)
+        for orig, new in zip(patterns, reparsed):
+            assert orig.name == new.name
+            assert orig.type == new.type
+            assert orig.observed == new.observed
+            assert orig.reinforced == new.reinforced
+            assert orig.status == new.status
+            assert orig.description == new.description
+
+    def test_description_with_colon_not_parsed_as_field(self) -> None:
+        """Known-fields whitelist prevents description corruption."""
+        content = """\
+# Operational Memory
+
+## Patterns
+
+### test-pattern
+type: debt
+observed: m1
+reinforced: 1
+last_active: m1
+
+Sequential: 3 phases in a row.
+"""
+        patterns = _parse_memory(content)
+        assert len(patterns) == 1
+        assert "Sequential" in patterns[0].description
+        assert patterns[0].type == "debt"
+
+    def test_empty_memory(self) -> None:
+        patterns = _parse_memory("")
+        assert patterns == []
+
+    def test_empty_memory_header_only(self) -> None:
+        patterns = _parse_memory("# Operational Memory\n\n## Patterns\n")
+        assert patterns == []
+
+
+class TestReinforceOrCreate:
+
+    def test_create_new(self) -> None:
+        patterns: list[MemoryPattern] = []
+        _reinforce_or_create(patterns, "test", "debt", "m1", "desc")
+        assert len(patterns) == 1
+        assert patterns[0].reinforced == 1
+        assert patterns[0].observed == ["m1"]
+
+    def test_reinforce_existing(self) -> None:
+        patterns = [MemoryPattern(
+            name="test", type="debt", observed=["m1"],
+            reinforced=1, last_active="m1",
+        )]
+        _reinforce_or_create(patterns, "test", "debt", "m2", "desc2")
+        assert patterns[0].reinforced == 2
+        assert patterns[0].observed == ["m1", "m2"]
+
+    def test_idempotent_same_milestone(self) -> None:
+        patterns = [MemoryPattern(
+            name="test", type="debt", observed=["m1"],
+            reinforced=1, last_active="m1",
+        )]
+        _reinforce_or_create(patterns, "test", "debt", "m1", "desc2")
+        # Should NOT increment reinforced for same milestone.
+        assert patterns[0].reinforced == 1
+        assert patterns[0].observed == ["m1"]
+
+
+class TestApplyDecay:
+
+    def test_active_within_threshold(self) -> None:
+        p = MemoryPattern(
+            name="recent", type="debt", observed=["m8"],
+            reinforced=1, last_active="8-test",
+        )
+        milestones = [f"{i}-ms" for i in range(1, 11)]
+        _apply_decay([p], "10-ms", milestones, fading_threshold=5, archive_threshold=10)
+        assert p.status == "active"
+
+    def test_fading_at_threshold(self) -> None:
+        p = MemoryPattern(
+            name="old", type="debt", observed=["m3"],
+            reinforced=1, last_active="3-ms",
+        )
+        milestones = [f"{i}-ms" for i in range(1, 11)]
+        _apply_decay([p], "9-ms", milestones, fading_threshold=5, archive_threshold=10)
+        assert p.status == "fading"
+
+    def test_archived_at_threshold(self) -> None:
+        p = MemoryPattern(
+            name="ancient", type="debt", observed=["m1"],
+            reinforced=1, last_active="1-ms",
+        )
+        milestones = [f"{i}-ms" for i in range(1, 15)]
+        _apply_decay([p], "14-ms", milestones, fading_threshold=5, archive_threshold=10)
+        assert p.status == "archived"
+
+    def test_reinforced_3_skips_fading(self) -> None:
+        """reinforced=3 at distance 7 stays active (fading requires < 3)."""
+        p = MemoryPattern(
+            name="medium", type="debt", observed=["m1"],
+            reinforced=3, last_active="3-ms",
+        )
+        milestones = [f"{i}-ms" for i in range(1, 11)]
+        _apply_decay([p], "10-ms", milestones, fading_threshold=5, archive_threshold=10)
+        assert p.status == "active"
+
+    def test_high_reinforced_exempt(self) -> None:
+        """Patterns with reinforced >= 5 don't decay."""
+        p = MemoryPattern(
+            name="durable", type="debt", observed=["m1"],
+            reinforced=5, last_active="1-ms",
+        )
+        milestones = [f"{i}-ms" for i in range(1, 20)]
+        _apply_decay([p], "19-ms", milestones, fading_threshold=5, archive_threshold=10)
+        assert p.status == "active"
+
+
+class TestMilestoneSortKey:
+
+    def test_numeric_prefix(self) -> None:
+        names = ["10-baz", "2-bar", "1-foo", "3-qux"]
+        result = sorted(names, key=_milestone_sort_key)
+        assert result == ["1-foo", "2-bar", "3-qux", "10-baz"]
+
+    def test_no_numeric_prefix(self) -> None:
+        names = ["beta", "alpha"]
+        result = sorted(names, key=_milestone_sort_key)
+        assert result == ["alpha", "beta"]
+
+
+class TestParseMetricsHeader:
+
+    def test_basic(self) -> None:
+        header = _parse_metrics_header(_SAMPLE_METRICS)
+        assert header["outcome"] == "completed"
+        assert header["cycles"] == "5"
+        assert header["tokens_out"] == "50000"
+        assert header["validation_failures"] == "2"
+
+
+class TestCountMetricsSectionRows:
+
+    def test_rework_rows(self) -> None:
+        assert _count_metrics_section_rows(_SAMPLE_METRICS, "## Rework") == 1
+
+    def test_missing_section(self) -> None:
+        assert _count_metrics_section_rows(_SAMPLE_METRICS, "## Quality Gate") == 0
+
+
+class TestAnalyzeCompose:
+    """Tests for _analyze_compose topology extraction."""
+
+    def test_sequential(self, tmp_path: Path) -> None:
+        compose = tmp_path / "compose.py"
+        compose.write_text('''\
+async def phase_a() -> A:
+    """Phase A."""
+async def phase_b(a: A) -> B:
+    """Phase B."""
+async def verify():
+    """Verify."""
+async def execute():
+    a = await phase_a()
+    b = await phase_b(a)
+    await verify()
+''')
+        count, has_gather = _analyze_compose(compose)
+        assert count == 2  # verify excluded
+        assert has_gather is False
+
+    def test_parallel_gather(self, tmp_path: Path) -> None:
+        compose = tmp_path / "compose.py"
+        compose.write_text('''\
+async def phase_a() -> A:
+    """Phase A."""
+async def phase_b() -> B:
+    """Phase B."""
+async def verify():
+    """Verify."""
+async def execute():
+    a, b = await gather(phase_a(), phase_b())
+    await verify()
+''')
+        count, has_gather = _analyze_compose(compose)
+        assert count == 2
+        assert has_gather is True
+
+    def test_missing_file(self, tmp_path: Path) -> None:
+        count, has_gather = _analyze_compose(tmp_path / "missing.py")
+        assert count == 0
+        assert has_gather is False
+
+    def test_syntax_error(self, tmp_path: Path) -> None:
+        compose = tmp_path / "compose.py"
+        compose.write_text("def broken(:\n  pass\n")
+        count, has_gather = _analyze_compose(compose)
+        assert count == 0
+        assert has_gather is False
+
+
+
+    """Integration test for consolidate_milestone."""
+
+    def _setup_milestone(self, tmp_path: Path, name: str = "14-test") -> Path:
+        """Create a minimal milestone directory with metrics.md and compose.py."""
+        ms_dir = tmp_path / ".clou" / "milestones" / name
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "metrics.md").write_text(_SAMPLE_METRICS)
+        (ms_dir / "compose.py").write_text('''\
+async def implement_feature() -> Feature:
+    """Implement the feature.
+    Criteria: feature works."""
+
+async def verify():
+    """Verify the feature.
+    Criteria: tests pass."""
+
+async def execute():
+    feature = await implement_feature()
+    await verify()
+''')
+        return ms_dir
+
+    def test_creates_memory_md(self, tmp_path: Path) -> None:
+        self._setup_milestone(tmp_path)
+        result = consolidate_milestone(tmp_path, "14-test")
+        assert result is True
+        memory_path = tmp_path / ".clou" / "memory.md"
+        assert memory_path.exists()
+        content = memory_path.read_text()
+        assert "# Operational Memory" in content
+        assert "cycle-count-distribution" in content
+
+    def test_extracts_cost_calibration(self, tmp_path: Path) -> None:
+        self._setup_milestone(tmp_path)
+        consolidate_milestone(tmp_path, "14-test")
+        patterns = _parse_memory(
+            (tmp_path / ".clou" / "memory.md").read_text()
+        )
+        cost = [p for p in patterns if p.type == "cost-calibration"]
+        assert len(cost) == 1
+        assert "5 cycles" in cost[0].description
+        assert "50,000" in cost[0].description
+
+    def test_extracts_decomposition(self, tmp_path: Path) -> None:
+        self._setup_milestone(tmp_path)
+        consolidate_milestone(tmp_path, "14-test")
+        patterns = _parse_memory(
+            (tmp_path / ".clou" / "memory.md").read_text()
+        )
+        decomp = [p for p in patterns if p.type == "decomposition"]
+        assert len(decomp) == 1
+        assert "1 phases" in decomp[0].description  # verify excluded
+
+    def test_extracts_rework(self, tmp_path: Path) -> None:
+        self._setup_milestone(tmp_path)
+        consolidate_milestone(tmp_path, "14-test")
+        patterns = _parse_memory(
+            (tmp_path / ".clou" / "memory.md").read_text()
+        )
+        rework = [p for p in patterns if p.name == "rework-frequency"]
+        assert len(rework) == 1
+        assert "1 rework" in rework[0].description
+
+    def test_extracts_validation_debt(self, tmp_path: Path) -> None:
+        self._setup_milestone(tmp_path)
+        consolidate_milestone(tmp_path, "14-test")
+        patterns = _parse_memory(
+            (tmp_path / ".clou" / "memory.md").read_text()
+        )
+        debt = [p for p in patterns if p.type == "debt"]
+        assert len(debt) == 1
+        assert "2 validation failures" in debt[0].description
+
+    def test_reinforces_existing_patterns(self, tmp_path: Path) -> None:
+        self._setup_milestone(tmp_path, "14-test")
+        self._setup_milestone(tmp_path, "15-test")
+        consolidate_milestone(tmp_path, "14-test")
+        consolidate_milestone(tmp_path, "15-test")
+        patterns = _parse_memory(
+            (tmp_path / ".clou" / "memory.md").read_text()
+        )
+        cost = [p for p in patterns if p.type == "cost-calibration"]
+        assert len(cost) == 1
+        assert cost[0].reinforced == 2
+        assert "14-test" in cost[0].observed
+        assert "15-test" in cost[0].observed
+
+    def test_idempotent_consolidation(self, tmp_path: Path) -> None:
+        self._setup_milestone(tmp_path)
+        consolidate_milestone(tmp_path, "14-test")
+        consolidate_milestone(tmp_path, "14-test")
+        patterns = _parse_memory(
+            (tmp_path / ".clou" / "memory.md").read_text()
+        )
+        cost = [p for p in patterns if p.type == "cost-calibration"]
+        assert cost[0].reinforced == 1  # not 2
+
+    def test_extracts_quality_gate_unavailability(self, tmp_path: Path) -> None:
+        ms_dir = self._setup_milestone(tmp_path)
+        # Add a Quality Gate section with unavailable tools.
+        metrics = ms_dir / "metrics.md"
+        content = metrics.read_text()
+        content += """\
+
+## Quality Gate
+
+| Cycle | Tools Invoked | Tools Unavailable | Tool Count |
+|-------|---------------|-------------------|------------|
+| 3 | roast_codebase | roast_architecture | 5 |
+"""
+        metrics.write_text(content)
+        consolidate_milestone(tmp_path, "14-test")
+        patterns = _parse_memory(
+            (tmp_path / ".clou" / "memory.md").read_text()
+        )
+        qg = [p for p in patterns if p.type == "quality-gate"]
+        assert len(qg) == 1
+        assert "unavailable" in qg[0].description
+
+    def test_extracts_escalation_frequency(self, tmp_path: Path) -> None:
+        ms_dir = self._setup_milestone(tmp_path)
+        # Add an Escalations section.
+        metrics = ms_dir / "metrics.md"
+        content = metrics.read_text()
+        content += """\
+
+## Escalations
+
+| Cycle | Classification | Severity |
+|-------|----------------|----------|
+| 5 | validation_failure | blocking |
+"""
+        metrics.write_text(content)
+        consolidate_milestone(tmp_path, "14-test")
+        patterns = _parse_memory(
+            (tmp_path / ".clou" / "memory.md").read_text()
+        )
+        esc = [p for p in patterns if p.name == "escalation-frequency"]
+        assert len(esc) == 1
+        assert "1 escalation" in esc[0].description
+
+    def test_no_metrics_returns_false(self, tmp_path: Path) -> None:
+        ms_dir = tmp_path / ".clou" / "milestones" / "14-test"
+        ms_dir.mkdir(parents=True)
+        assert consolidate_milestone(tmp_path, "14-test") is False
+
+
+class TestDetermineNextCycleMemory:
+    """DB-18: memory.md in PLAN read set."""
+
+    def test_plan_includes_memory_when_exists(self, tmp_path: Path) -> None:
+        cp_path = tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md"
+        cp_path.parent.mkdir(parents=True)
+        (tmp_path / ".clou" / "memory.md").write_text("# Operational Memory\n")
+        cycle, read_set = determine_next_cycle(cp_path, "m1")
+        assert "memory.md" in read_set
+
+    def test_plan_excludes_memory_when_absent(self, tmp_path: Path) -> None:
+        cp_path = tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md"
+        cp_path.parent.mkdir(parents=True)
+        cycle, read_set = determine_next_cycle(cp_path, "m1")
+        assert "memory.md" not in read_set
+
+
+class TestConsolidatePending:
+    """DB-18: self-healing pending-consolidation sweep."""
+
+    def _make_milestone(self, tmp_path: Path, name: str) -> None:
+        ms_dir = tmp_path / ".clou" / "milestones" / name
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "metrics.md").write_text(_SAMPLE_METRICS)
+        (ms_dir / "compose.py").write_text('''\
+async def do_work() -> Done:
+    """Work."""
+async def execute():
+    await do_work()
+''')
+
+    def test_bootstraps_when_no_memory(self, tmp_path: Path) -> None:
+        """First run: no memory.md, 3 milestones → consolidates all 3."""
+        self._make_milestone(tmp_path, "12-alpha")
+        self._make_milestone(tmp_path, "13-beta")
+        self._make_milestone(tmp_path, "14-gamma")
+        count = consolidate_pending(tmp_path)
+        assert count == 3
+        memory = tmp_path / ".clou" / "memory.md"
+        assert memory.exists()
+        patterns = _parse_memory(memory.read_text())
+        cost = [p for p in patterns if p.type == "cost-calibration"]
+        assert cost[0].reinforced == 3
+        assert "12-alpha" in cost[0].observed
+        assert "14-gamma" in cost[0].observed
+
+    def test_skips_already_consolidated(self, tmp_path: Path) -> None:
+        """Second run: milestones already in memory.md → no-op."""
+        self._make_milestone(tmp_path, "12-alpha")
+        consolidate_pending(tmp_path)
+        count = consolidate_pending(tmp_path)
+        assert count == 0
+
+    def test_catches_new_milestone(self, tmp_path: Path) -> None:
+        """Milestone added after initial consolidation → picks it up."""
+        self._make_milestone(tmp_path, "12-alpha")
+        consolidate_pending(tmp_path)
+        self._make_milestone(tmp_path, "13-beta")
+        count = consolidate_pending(tmp_path)
+        assert count == 1
+
+    def test_no_milestones_dir(self, tmp_path: Path) -> None:
+        assert consolidate_pending(tmp_path) == 0
+
+    def test_milestones_without_metrics(self, tmp_path: Path) -> None:
+        """Milestones with no metrics.md (never ran) are skipped."""
+        ms_dir = tmp_path / ".clou" / "milestones" / "12-empty"
+        ms_dir.mkdir(parents=True)
+        assert consolidate_pending(tmp_path) == 0
+
+    def test_chronological_order(self, tmp_path: Path) -> None:
+        """Milestones consolidated in numeric order (decay correctness)."""
+        self._make_milestone(tmp_path, "2-second")
+        self._make_milestone(tmp_path, "1-first")
+        self._make_milestone(tmp_path, "10-tenth")
+        consolidate_pending(tmp_path)
+        patterns = _parse_memory(
+            (tmp_path / ".clou" / "memory.md").read_text()
+        )
+        cost = [p for p in patterns if p.type == "cost-calibration"]
+        # last_active should be the last milestone consolidated (10-tenth)
+        assert cost[0].last_active == "10-tenth"
+        # observed should list all three in order they were consolidated
+        assert cost[0].observed == ["1-first", "2-second", "10-tenth"]

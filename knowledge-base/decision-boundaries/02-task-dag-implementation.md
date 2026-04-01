@@ -2,7 +2,7 @@
 
 **Status:** DECIDED — Sequential phases + typed-function composition
 **Severity:** High — affects coordinator's core loop
-**Decided:** 2026-03-19
+**Decided:** 2026-03-19, **updated** 2026-03-30 (typed edges, width enforcement)
 
 ## Decision
 
@@ -27,6 +27,58 @@ async def agent_task(input_artifact: InputType) -> OutputType:
 - **Completion** is type satisfaction — does the output artifact match the return type's criteria?
 
 This representation is structurally isomorphic to the computation the coordinator must reason about. The transformer recognizes the structure through its deep code-trained priors rather than reconstructing it from prose descriptions.
+
+## Edge Types
+
+compose.py encodes three types of dependency edges:
+
+### Data Dependency (function arguments)
+
+The primary and strongest edge type. `implement_auth(user_model)` requires `user_model` as input — the downstream function cannot start until the upstream function has produced the artifact. Expressed through Python's type system. The AST validator can verify these structurally.
+
+### Ordering Constraint (annotation)
+
+A phase must complete before another starts, but no data flows between them. Example: database migrations must run before API implementation, even though the API doesn't take the migration output as a typed argument. Expressed as a decorator or comment annotation:
+
+```python
+@requires("setup_database")
+async def implement_api_tests() -> TestSuite:
+    """API integration tests.
+    Criteria: tests exercise all endpoints"""
+```
+
+### Artifact Dependency (annotation)
+
+A phase needs a file or service produced by another phase, but the dependency is environmental rather than typed. Example: frontend tests need a running API server. Expressed as an annotation:
+
+```python
+@needs("services/api-server")
+async def wire_frontend(shell: FrontendShell) -> App:
+    """Connect UI to API.
+    Criteria: operations work through UI"""
+```
+
+The typed data dependency is the strongest — Python's type checker and the AST validator verify it structurally. Ordering and artifact dependencies are weaker (annotation-level) but explicit — they're visible in the call graph and the validator parses them.
+
+## Width Enforcement
+
+compose.py must express the natural concurrency of the milestone's work. The default is width (parallel phases via `gather()`), not depth (serial chain).
+
+### Minimum Width Rule
+
+A compose.py with more than two task functions must use at least one `gather()` call, unless every function has a data dependency on the previous function's output (fully serial data flow is the only exemption). A serial chain of independent functions is an under-decomposed graph — the planner failed to identify parallelism.
+
+### No Two-Node Milestones
+
+A milestone with only two phases (implement + verify) is under-decomposed. The planner must identify at least three substantive phases (plus verification). This forces the planner to reason about the work's internal structure rather than treating it as a monolithic block.
+
+### Concurrency as Default
+
+The coordinator-plan.md prompt guides the planner to start with "what work is independent?" rather than "what order should things happen in?" The planner identifies independent workstreams first, then adds ordering constraints where data flow or environmental requirements demand serialization.
+
+The AST validator enforces this:
+- **Width check:** If `len(task_functions) > 2` and `gather_count == 0`, emit warning: "No concurrent phases in a {N}-task graph — verify all tasks have sequential data dependencies"
+- **Two-node check:** If `len(task_functions) <= 2` (excluding verify), emit error: "Under-decomposed milestone — identify at least 3 substantive phases"
 
 ## The Composition File: `compose.py`
 
@@ -104,6 +156,9 @@ The orchestrator validates `compose.py` via a PostToolUse hook when the coordina
 3. **Acyclicity** — no circular dependencies (cycle detection via DFS)
 4. **Type compatibility** — output types match downstream input types
 5. **Convergence** — `execute()` entry point exists and all branches reach it
+6. **Edge parsing** — `@requires` and `@needs` annotations resolved to dependency edges
+7. **Width** — graphs with >2 task functions must contain `gather()` unless all edges are serial data dependencies
+8. **Minimum decomposition** — milestones must have ≥3 substantive task functions (excluding verify)
 
 ### Implementation
 

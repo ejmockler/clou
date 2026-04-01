@@ -393,6 +393,17 @@ class ConversationWidget(DragScrollMixin, Widget):
             return
         if msg.name in ("ask_user", "mcp__clou__ask_user"):
             self._stop_working()
+            question = msg.tool_input.get("question", "")
+            choices = msg.tool_input.get("choices")
+            parts: list[str] = []
+            if question:
+                parts.append(f"**{question}**")
+            if isinstance(choices, list):
+                for i, c in enumerate(choices, 1):
+                    parts.append(f"{i}. {c}")
+            md = "\n".join(parts).strip()
+            if md:
+                self._append_markdown(md)
             self._clear_tail()
             return
         if msg.name == "Agent":

@@ -2,7 +2,7 @@
 
 How transformers digest context at scale, what works for multi-agent prompt architectures, and what current approaches are missing. This document grounds Clou's design decisions in research rather than intuition.
 
-Last updated: 2026-03-25
+Last updated: 2026-03-29
 
 ## 1. Context Is Adversarial at Scale
 
@@ -545,7 +545,7 @@ ADaPT implements the downward half of aspiration adaptation (Simon): lower granu
 ### Clou Implication
 
 - `compose.py` validated by AST parsing (external verifier) — directly implements LLM-Modulo.
-- Quality gates as external verification — the coordinator does not self-assess quality. The "intermediate tokens aren't reasoning" finding makes this non-negotiable: coordinator reasoning in `decisions.md` is pattern completion, not verifiable reasoning. The quality gate is the only reliable signal.
+- Quality gates as external verification — the coordinator does not self-assess quality. The "intermediate tokens aren't reasoning" finding makes this non-negotiable: coordinator reasoning in `decisions.md` is pattern completion, not verifiable reasoning. The quality gate is the strongest reliable signal. When the external gate is unavailable, the assessor falls back to spawning internal subagents across implementation verticals (architecture, security, code quality, test coverage, dependencies). This degraded signal is weaker than external multi-model verification but stronger than coordinator self-assessment — multiple focused perspectives reduce the blind-spot surface even without cross-model agreement.
 - Coordinator ASSESS cycle with explicit criteria — criteria-driven evaluation against requirements.md, not self-generated judgment.
 - Agent team outputs (execution.md) inspected by the coordinator, not self-validated by workers.
 - ADaPT's failure-driven re-decomposition could improve the ASSESS→rework transition: when rework is triggered, the coordinator could decompose the failed task more finely rather than retrying at the same granularity. This is a template-level optimization, not an architectural change — the compose conventions determine whether re-decomposition is available.
@@ -886,6 +886,162 @@ These four findings converge on a concrete design response: the coordinator's PL
 
 ---
 
+## 16. Memory Systems for LLM Agents
+
+The gap between "filing system" and "memory system" is the gap between static context assembly and dynamic salience resolution. Filing systems map fixed keys to fixed files. Memory systems score, consolidate, decay, and retrieve based on the current situation. Recent research (2024–2026) establishes the empirical foundation for this transition — and reveals that the mechanisms align structurally with how transformers process context.
+
+### Salience-Based Retrieval
+
+The foundational architecture is Park et al.'s Generative Agents (UIST 2023): store all experiences as natural-language memory objects, score them on three axes — **recency** (exponential decay from last access), **relevance** (embedding cosine similarity to current situation), and **importance** (LLM-rated significance, 1–10) — and surface the top-scoring set. A separate "reflection" process periodically synthesizes higher-level observations from memory clusters, creating an abstraction hierarchy.
+
+Subsequent systems iterate on this template:
+
+- **A-MEM** (arXiv:2502.12110): Zettelkasten-inspired. Memories are interconnected notes with structured attributes (keywords, contextual descriptions, tags). New information triggers link discovery to existing memories, creating a dynamic knowledge network that evolves through use. Outperforms SOTA baselines across six foundation models.
+
+- **Mem0** (arXiv:2504.19413): Production-oriented. Dynamically extracts, consolidates, and retrieves from conversations. Graph variant captures relational structure. 26% relative gains over OpenAI's memory, 91% lower p95 latency, >90% token cost reduction.
+
+- **MemGPT / Letta** (arXiv:2310.08560): Frames the LLM as an OS with virtual context management, analogous to paging between RAM and disk. Three tiers: Core Memory (always in context), Recall Memory (searchable database via semantic search), Archival Memory (long-term, paged back on demand). The agent self-directs memory editing through tool calls.
+
+- **A-MAC** (arXiv:2603.04549, ICLR 2026 MemAgent Workshop): Treats memory admission as a structured decision problem. Decomposes memory value into five factors: future utility, factual confidence, semantic novelty, temporal recency, and **content type prior**. Ablation studies showed content type prior was the single most influential factor — more than recency, relevance, or novelty. 0.583 F1 with 31% latency reduction. Critical finding: without explicit admission control, agents accumulate hallucinated and obsolete facts.
+
+### Memory Consolidation
+
+The Complementary Learning Systems (CLS) framework — fast hippocampal learning complemented by slow neocortical consolidation — has become the dominant paradigm for agent memory architecture:
+
+- **CraniMem** (arXiv:2603.15642): Directly implements neuroscience-inspired consolidation. A bounded episodic buffer for immediate task continuity and a structured long-term knowledge graph for persistent semantic retention. **Goal-conditioned gating** selectively filters what enters memory based on task relevance. A **scheduled consolidation loop** replays high-utility traces into the knowledge graph while pruning low-utility items. Outperforms Vanilla RAG and Mem0 on long-horizon tasks with distraction.
+
+- **HiCL** (arXiv:2508.16651): Grounded in the hippocampal trisynaptic circuit. Dual-memory system with replay-based consolidation propagating hippocampal traces to cortex, extracting statistical overlap from different encoding episodes. Enables rapid learning without catastrophic forgetting.
+
+- **"Memory in the Age of AI Agents"** (arXiv:2512.13564, 46 co-authors): The comprehensive 2025 survey. Three-dimensional taxonomy: memory forms (token-level, parametric, latent), memory functions (factual, experiential, working), and memory evolution (formation, consolidation, retrieval). Identifies that conversion pathways from episodic to semantic memory are underexplored: "repeatedly experiencing similar events should allow extraction of stable structures, gradually forming abstract semantic knowledge — but current systems lack principled mechanisms for this."
+
+- **"Episodic Memory is the Missing Piece"** (arXiv:2502.06975): Position paper arguing that as LLMs become autonomous agents, they require episodic memory supporting single-shot learning of instance-specific contexts. Identifies five key properties that underlie adaptive, context-sensitive behavior.
+
+### Forgetting Mechanisms
+
+The 2025 memory survey identified "missing forgetting mechanisms" as a critical gap. Six fundamental memory operations exist (formation, retrieval, indexing, consolidation, updating, forgetting) — most systems implement only the first three.
+
+- **MemoryBank** (arXiv:2305.10250): First system to integrate the **Ebbinghaus Forgetting Curve** into LLM agent memory. Memory updater permits forgetting or reinforcing memories based on time elapsed and relative significance.
+
+- **ACT-R Memory Architecture** (HAI 2024): Integrates the ACT-R memory activation model directly into LLM generation. Memory recall and forgetting become linked to content generation itself, making decay part of the generation computation rather than a post-hoc filter.
+
+- **FOREVER** (arXiv:2601.03938): Grounds Ebbinghaus-style replay in a **model-centric notion of time** defined by parameter update dynamics rather than wall-clock time. "Virtual Ebbinghaus days" calibrated by optimizer update magnitude. Key insight: identical time steps can produce varying degrees of change, so decay intervals must align with the system's internal evolution, not raw time.
+
+- **"Rethinking Memory in LLM-based Agents"** (arXiv:2505.00675): Defines six fundamental memory operations — Consolidation, Updating, Indexing, **Forgetting**, Retrieval, and Compression. Explicitly calls out forgetting as an under-developed operation that needs parity with retrieval.
+
+- **"From Human Memory to AI Memory"** (arXiv:2504.15965): Identifies that forgetting in LLMs exhibits structured temporal patterns resembling human memory decay: rapid early performance drops followed by slower degradation. The "missing forgetting" gap: most agent memory systems only add and retrieve, with no principled mechanism for decay or removal.
+
+### Temporal Knowledge Graphs
+
+Agent memory must answer temporal queries: "What was true at time T?" and "What changed between sessions N and M?"
+
+- **Zep / Graphiti** (arXiv:2501.13956): Temporally-aware knowledge graph engine. A **bi-temporal model** tracks both when an event occurred (t_valid) and when it was ingested (t_ingest). Every edge carries explicit validity intervals (t_valid, t_invalid). Updates are non-lossy: when facts change, old edges are invalidated with timestamps rather than deleted, maintaining a complete timeline. DMR benchmark: 94.8% vs. MemGPT's 93.4%. LongMemEval: up to 18.5% accuracy improvement with 90% latency reduction.
+
+- **MAGMA** (arXiv:2601.03236): Represents each memory across **orthogonal semantic, temporal, causal, and entity graphs**. Retrieval as policy-guided traversal over these relational views. 45.5% higher reasoning accuracy on long-context benchmarks, 95% token reduction, 40% faster query latency. Key insight: temporal, causal, semantic, and entity relationships should be orthogonal graphs, not collapsed into a single store — retrieval traverses the right graph for the query type.
+
+- **TReMu** (ACL 2025, arXiv:2502.01630): Time-aware memorization through timeline summarization. Events in each dialogue session are summarized with inferred dates, generating retrievable memory units. Integrates neuro-symbolic temporal reasoning. Raises GPT-4o from 29.83 to 77.67 on temporal reasoning benchmarks.
+
+- **Memory-T1** (arXiv:2512.20092): RL-learned time-aware memory selection. Coarse-to-fine: temporal and relevance filters produce a candidate set, then an RL agent selects precise evidence. Multi-level reward optimizes answer accuracy, evidence grounding, and **temporal consistency**. Boosts a 7B model to 67.0% on Time-Dialog, outperforming a 14B baseline by 10.2%.
+
+### Hierarchical and Tiered Architectures
+
+The emerging consensus is three tiers (working/episodic/semantic) with explicit movement policies between them:
+
+- **Cognitive Workspace** (arXiv:2508.13171): Emulates human cognitive mechanisms of external memory use. Three innovations: active memory management with deliberate curation, hierarchical cognitive buffers enabling persistent working states, and task-driven context optimization. Draws from Baddeley's working memory model, Clark's extended mind thesis, and Hutchins' distributed cognition. 58.6% memory reuse rate (vs. 0% for traditional RAG), 17–18% net efficiency gain. Statistical significance: p < 0.001, Cohen's d > 23.
+
+- **MemoryOS** (arXiv:2506.06326, EMNLP 2025 Oral): OS-inspired three-tier architecture — short-term (current conversation), mid-term (dialogue-chain FIFO), and long-term personal memory (segmented page organization). Four modules: Storage, Updating, Retrieval, Generation. On LoCoMo: 49.11% F1 improvement and 46.18% BLEU-1 improvement over GPT-4o-mini baselines.
+
+- **SYNAPSE** (arXiv:2601.02744): Memory as a dynamic graph where relevance emerges from **spreading activation** rather than pre-computed links. Dual-layer topology synergizes granular interaction logs (episodic) with synthesized abstract concepts (semantic). **Lateral inhibition** and **temporal decay** dynamically highlight relevant sub-graphs while filtering interference. A **"feeling of knowing" protocol** rejects hallucinations. New SOTA on LoCoMo (+7.2 F1), 23% multi-hop improvement, 95% token reduction.
+
+- **FluxMem** (arXiv:2602.14038): No single memory structure fits all interactions. Equips agents with multiple complementary memory structures and **learns to select among them** based on interaction-level features. Treats memory structure selection as a context-adaptive decision.
+
+- **Multi-Agent Memory Architecture** (arXiv:2603.10062): Three-layer memory hierarchy (I/O, cache, memory) for multi-agent systems. Explicit parallels to computer architecture: cache coherence, memory consistency models, concurrent access challenges.
+
+### Attention-as-Retrieval: Implications for External Memory Design
+
+The Hopfield equivalence (§2) established that attention IS associative memory retrieval. Recent work characterizes the optimal properties of the stored pattern library:
+
+- **Optimal Hopfield Capacity** (NeurIPS 2024, arXiv:2410.23126): First tight optimal asymptotic memory capacity for modern Hopfield models. Connects memory configuration to **spherical codes** from information theory — stored patterns as well-separated points on a hypersphere. U-Hop+ achieves optimal capacity in sub-linear time. **Implication for external memory: the optimal pattern library consists of maximally diverse, minimally redundant stored patterns.** Consolidation that merges near-duplicate memories isn't tidying — it's expanding effective retrieval capacity.
+
+- **Hopfield-Fenchel-Young Networks** (NeurIPS 2024, arXiv:2411.08590): Generalizes Hopfield models to broader energy functions. Using Tsallis and norm entropies, derives differentiable update rules enabling **sparse retrieval** — selecting a small sharp subset of stored patterns rather than a soft average over all. Extends to structured associations via SparseMAP. **Implication: retrieval should activate a small subset sharply, not a soft average. Fewer, highly relevant memories injected into context outperform broad context.**
+
+- **Continuous-Time Hopfield** (arXiv:2502.10122): Compresses large discrete Hopfield memories into smaller, continuous-time representations. Inspired by psychological theories of continuous neural resource allocation in working memory. Enables storage of more patterns in less space — theoretical support for consolidation as a compression mechanism that preserves retrieval fidelity.
+
+The convergence: the external memory store the orchestrator assembles IS the transformer's pattern library. Its quality directly determines retrieval quality during the forward pass. The optimal library is **diverse** (spherical codes), **sparse** (few sharp activations), and **consolidated** (near-duplicates merged). This is not a metaphor — it is the mathematical structure of the attention mechanism applied to the design problem of context assembly.
+
+### Context Engineering for Multi-Session Agents
+
+How agents maintain coherence across hundreds of sessions:
+
+- **Facts as First Class Objects** (arXiv:2603.17781): Benchmarks in-context memory against Knowledge Objects (KOs) — discrete hash-addressed tuples with O(1) retrieval. In-context: Claude Sonnet 4.5 achieves 100% exact-match accuracy from 10 to 7,000 facts. But production deployment reveals three failure modes: capacity limits (prompts overflow at ~8,000 facts), **compaction loss** (summarization destroys 60% of facts), and **goal drift** (cascading compaction erodes 54% of project constraints while the model continues with full confidence). KOs achieve 100% accuracy at 252x lower cost. **Critical finding: the model doesn't know when its context has been corrupted by compaction.**
+
+- **Codified Context** (arXiv:2602.20478): Developed during construction of a 108,000-line C# system across 283 development sessions. Three-component infrastructure: a hot-memory constitution encoding conventions and retrieval hooks, 19 specialized domain-expert agents, and a cold-memory knowledge base of 34 on-demand specification documents. Directly addresses coherence loss across sessions and prevention of repeated known mistakes.
+
+- **Context Engineering Survey** (arXiv:2603.09619): Frames context engineering as a discipline distinct from prompt engineering. Five quality criteria: **relevance, sufficiency, isolation, economy, and provenance**. Cumulative pyramid maturity model.
+
+- **MemGuide** (AAAI 2026, arXiv:2505.20231): Intent-driven memory selection. Two-stage: Intent-Aligned Retrieval (goal-consistent QA-formatted memory units), then Missing-Slot Guided Filtering (reranks by slot-completion gain). Boosts task success rate from 88% to 99% and reduces dialogue length by 2.84 turns. Key insight: retrieval should be driven by what the current task *needs*, not by what's most similar to the query.
+
+### Memory Benchmarks
+
+Evaluation of agent memory systems is maturing rapidly, exposing gaps:
+
+- **MemoryArena** (arXiv:2602.16313): Unified evaluation gym for memory in multi-session Memory-Agent-Environment loops. Four task domains: web navigation, preference-constrained planning, progressive information search, sequential formal reasoning. **Critical finding: agents with near-saturated performance on existing long-context benchmarks (LoCoMo) perform poorly in this agentic setting.** Existing assessments evaluate memorization and action separately; realistic scenarios require agents to acquire memories through environmental interaction and apply them to subsequent dependent tasks.
+
+- **MemBench** (ACL 2025 Findings, arXiv:2506.21605): Three evaluation dimensions: effectiveness (accuracy), efficiency (number of memory operations), capacity (performance degradation as store grows). First benchmark to explicitly test how performance degrades at scale.
+
+- **MemoryAgentBench** (ICLR 2026, arXiv:2507.05257): Identifies four core competencies from memory science: accurate retrieval, test-time learning, long-range understanding, and **selective forgetting**. Finding: no current method masters all four competencies, with selective forgetting being the weakest.
+
+- **Anatomy of Agentic Memory** (arXiv:2602.19320): Taxonomizes Memory-Augmented Generation into four structures. Identifies four systemic pain points: benchmark saturation (existing benchmarks are too easy), metric validity (metrics don't align with semantic utility), backbone-dependent accuracy (performance varies wildly across models), and overlooked system-level costs (latency/throughput from memory maintenance).
+
+### Clou Implication
+
+The research converges on three operations Clou currently lacks:
+
+**1. Consolidation.** Clou accumulates episodic records (decisions.md, execution.md, assessment.md, escalations) that are never distilled into cross-milestone semantic knowledge. CraniMem's scheduled consolidation loop is the model: at natural boundaries (milestone completion), high-utility episodic traces are replayed into structured semantic memory while low-utility traces are pruned. For Clou, this means a milestone-boundary consolidation pass that extracts patterns (recurring quality gate findings, fragile code areas, successful decomposition strategies) into a cross-milestone semantic artifact, then archives the episodic detail.
+
+**2. Forgetting.** Without principled decay, the `.clou/` directory grows without bound. A-MAC demonstrates that hallucinated and obsolete facts accumulate without admission control. MemoryAgentBench confirms selective forgetting is the weakest competency across all current systems — and the one most needed. For Clou, forgetting should be calibrated to milestone distance (FOREVER's model-centric time, not wall-clock time): memories not accessed across N milestones lose salience; superseded facts get temporal invalidation (Graphiti's bi-temporal model); telemetry and session files get lifecycle management.
+
+**3. Scored retrieval.** A-MAC's finding that content type prior dominates means the orchestrator's first question should be "what kind of memory does this cycle need?" not "which files match?" MemGuide's intent-driven selection — retrieval driven by what the task needs, not what's most similar — maps directly to cycle-type-aware assembly. The Hopfield capacity and sparse retrieval results provide the mathematical grounding: assemble a diverse, non-redundant, small sharp set of patterns for each cycle's context window.
+
+The attention-as-retrieval framing (§2, extended here) makes the architectural connection explicit: **the orchestrator is building the external Hopfield network that the transformer retrieves from.** The quality of each cycle depends on the quality of this pattern library. The optimal library is diverse (spherical codes), sparse (few sharp activations beat soft averaging), and consolidated (near-duplicates merged to expand effective capacity). Static per-cycle read sets are a fixed Hopfield network with the same patterns for every query. Scored retrieval is an adaptive network that reconfigures its stored patterns based on what's being asked.
+
+**Sources:**
+- Park et al., "Generative Agents: Interactive Simulacra of Human Behavior," UIST 2023: [arXiv:2304.03442](https://arxiv.org/abs/2304.03442)
+- Xu et al., "A-MEM: Agentic Memory for LLM Agents," 2025: [arXiv:2502.12110](https://arxiv.org/abs/2502.12110)
+- Chhikara et al., "Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory," 2025: [arXiv:2504.19413](https://arxiv.org/abs/2504.19413)
+- Packer et al., "MemGPT: Towards LLMs as Operating Systems," 2023: [arXiv:2310.08560](https://arxiv.org/abs/2310.08560)
+- Zhang et al., "Adaptive Memory Admission Control for LLM Agents," ICLR 2026 MemAgent Workshop: [arXiv:2603.04549](https://arxiv.org/abs/2603.04549)
+- Mody et al., "CraniMem: Cranial Inspired Gated and Bounded Memory," 2026: [arXiv:2603.15642](https://arxiv.org/abs/2603.15642)
+- "HiCL: Hippocampal-Inspired Continual Learning," 2025: [arXiv:2508.16651](https://arxiv.org/abs/2508.16651)
+- Hu et al., "Memory in the Age of AI Agents," 2025: [arXiv:2512.13564](https://arxiv.org/abs/2512.13564)
+- Pink et al., "Episodic Memory is the Missing Piece," 2025: [arXiv:2502.06975](https://arxiv.org/abs/2502.06975)
+- Zhong et al., "MemoryBank: Enhancing LLMs with Long-Term Memory," 2023: [arXiv:2305.10250](https://arxiv.org/abs/2305.10250)
+- "Human-Like Remembering and Forgetting in LLM Agents," HAI 2024: [ACM DL](https://dl.acm.org/doi/10.1145/3765766.3765803)
+- "FOREVER: Forgetting Curve-Inspired Memory Replay," 2026: [arXiv:2601.03938](https://arxiv.org/abs/2601.03938)
+- Du et al., "Rethinking Memory in LLM-based Agents," 2025: [arXiv:2505.00675](https://arxiv.org/abs/2505.00675)
+- Wu et al., "From Human Memory to AI Memory," 2025: [arXiv:2504.15965](https://arxiv.org/abs/2504.15965)
+- Rasmussen et al., "Zep: A Temporal Knowledge Graph Architecture for Agent Memory," 2025: [arXiv:2501.13956](https://arxiv.org/abs/2501.13956)
+- Jiang et al., "MAGMA: Multi-Graph Agentic Memory Architecture," 2026: [arXiv:2601.03236](https://arxiv.org/abs/2601.03236)
+- Ge et al., "TReMu: Towards Neuro-Symbolic Temporal Reasoning," ACL 2025: [arXiv:2502.01630](https://arxiv.org/abs/2502.01630)
+- Du et al., "Memory-T1: Reinforcement Learning for Temporal Reasoning," 2025: [arXiv:2512.20092](https://arxiv.org/abs/2512.20092)
+- An, "Cognitive Workspace: Active Memory Management for LLMs," 2025: [arXiv:2508.13171](https://arxiv.org/abs/2508.13171)
+- Kang et al., "MemoryOS," EMNLP 2025 Oral: [arXiv:2506.06326](https://arxiv.org/abs/2506.06326)
+- Jiang et al., "SYNAPSE: Episodic-Semantic Memory via Spreading Activation," 2026: [arXiv:2601.02744](https://arxiv.org/abs/2601.02744)
+- Lu et al., "FluxMem: Choosing How to Remember," 2026: [arXiv:2602.14038](https://arxiv.org/abs/2602.14038)
+- "Multi-Agent Memory from a Computer Architecture Perspective," 2026: [arXiv:2603.10062](https://arxiv.org/abs/2603.10062)
+- "Provably Optimal Memory Capacity for Modern Hopfield Models," NeurIPS 2024: [arXiv:2410.23126](https://arxiv.org/abs/2410.23126)
+- "Hopfield-Fenchel-Young Networks," NeurIPS 2024: [arXiv:2411.08590](https://arxiv.org/abs/2411.08590)
+- "Modern Hopfield Networks with Continuous-Time Memories," 2025: [arXiv:2502.10122](https://arxiv.org/abs/2502.10122)
+- Zahn & Chana, "Facts as First Class Objects," 2026: [arXiv:2603.17781](https://arxiv.org/abs/2603.17781)
+- Vasilopoulos, "Codified Context: Infrastructure for AI Agents," 2026: [arXiv:2602.20478](https://arxiv.org/abs/2602.20478)
+- Vishnyakova, "Context Engineering: From Prompts to Corporate Multi-Agent Architecture," 2026: [arXiv:2603.09619](https://arxiv.org/abs/2603.09619)
+- Du et al., "MemGuide: Intent-Driven Memory Selection," AAAI 2026: [arXiv:2505.20231](https://arxiv.org/abs/2505.20231)
+- He et al., "MemoryArena: Benchmarking Agent Memory," 2026: [arXiv:2602.16313](https://arxiv.org/abs/2602.16313)
+- Tan et al., "MemBench," ACL 2025 Findings: [arXiv:2506.21605](https://arxiv.org/abs/2506.21605)
+- "MemoryAgentBench," ICLR 2026: [arXiv:2507.05257](https://arxiv.org/abs/2507.05257)
+- Jiang et al., "Anatomy of Agentic Memory," 2026: [arXiv:2602.19320](https://arxiv.org/abs/2602.19320)
+
+---
+
 ## Summary: Research-Grounded Design Principles
 
 | Research Finding | Clou Design Response |
@@ -898,7 +1054,7 @@ These four findings converge on a concrete design response: the coordinator's PL
 | Structured formats (XML) outperform prose | Use XML tags in Clou prompts |
 | Decomposition outperforms monolithic prompts | Per-cycle-type prompts, not one mega-prompt |
 | Role prompting doesn't improve accuracy | Brief identity anchor, not elaborate persona |
-| LLMs can't self-verify plans | External verification: AST for compose.py, Brutalist for quality |
+| LLMs can't self-verify plans | External verification: AST for compose.py, Brutalist for quality; degraded fallback via internal vertical subagents when gate unavailable |
 | Compositionality fails at 2+ hops, cascading through chains | Structured intermediate artifacts (execution.md), explicit ASSESS cycle |
 | Blackboard architectures outperform master-slave | `.clou/` directory as shared medium |
 | Observation masking > LLM summarization | Golden context as structured files, not compressed conversation |
@@ -923,3 +1079,14 @@ These four findings converge on a concrete design response: the coordinator's PL
 | Parallel DAG construction yields 3.7x speedup (LLMCompiler) | gather() in compose.py for independent workstreams |
 | Milestone-level granularity is the decomposition sweet spot (HiPlan) | Phase-level decomposition: verifiable artifacts within DAG capacity |
 | Treewidth as decomposition stopping criterion (ACONIC) | "When NOT to parallelize" clause; depth matches problem complexity |
+| Content type prior dominates memory value scoring (A-MAC) | Cycle-type determines what *kind* of memory is needed before scoring relevance |
+| Consolidation from episodic → semantic is underexplored (2025 survey) | Milestone-boundary consolidation: extract cross-milestone patterns, archive episodic detail |
+| Forgetting is the weakest agent memory competency (MemoryAgentBench) | Relevance-weighted decay calibrated to milestone distance, not wall-clock time |
+| Summarization destroys 60% of facts; model doesn't know (KOs) | Structured external storage (golden context), not compressed conversation |
+| Optimal Hopfield capacity = maximally diverse stored patterns (spherical codes) | Consolidation merges near-duplicates to expand effective retrieval capacity |
+| Sparse retrieval outperforms soft averaging (Hopfield-Fenchel-Young) | Few highly relevant memories injected > broad context flooding |
+| Bi-temporal models enable "what was true at time T" (Graphiti) | Superseded facts get temporal invalidation, not deletion |
+| Intent-driven retrieval outperforms similarity-driven (MemGuide) | Retrieval driven by what the cycle needs, not what matches the query |
+| Spreading activation surfaces related subgraphs (SYNAPSE) | Context assembly should activate clusters of related memories, not isolated facts |
+| No single memory structure fits all interactions (FluxMem) | Orchestrator adapts context-building strategy per cycle type |
+| Goal-conditioned gating filters memory admission (CraniMem) | Not all observations deserve to be memories; admission control prevents pollution |

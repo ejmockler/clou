@@ -283,7 +283,7 @@ Quality gates are essential infrastructure (Design Principle 10, DB-05). The pat
 The software template uses level 1 (Brutalist). Future templates may use level 2. Level 3 is the degraded mode — always available but weakest.
 
 **The template's `quality_gates[].required` field determines behavior:**
-- `required=True`: gate unavailability is a blocking error (escalate to supervisor and user). This is Brutalist's current status.
+- `required=True`: the gate is the preferred assessment mechanism. When unavailable, the assessor automatically falls back to degraded internal review — spawning subagents across implementation verticals (architecture, security, code quality, test coverage, dependencies). The coordinator proceeds with `status: degraded` findings. This is Brutalist's current status. The degraded fallback is stronger than coordinator self-assessment (level 3) but weaker than the external gate (level 1).
 - `required=False`: gate unavailability triggers coordinator self-assessment (level 3 fallback) with a logged decision noting the degradation.
 
 A template with no quality gates at all is valid but operates entirely at level 3 — the weakest configuration. The coordinator's judgment loop still runs; it just lacks external calibration. The system doesn't prevent this, but it's an explicit choice recorded in the template.

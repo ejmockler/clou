@@ -86,6 +86,25 @@ def _isolate_sessions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent tests from writing telemetry to the real project directory.
+
+    ``telemetry.init()`` is called in ``ClouApp.on_mount()`` and writes
+    a JSONL file per session.  Without this, every ``run_test()`` call
+    leaks a 113-byte ghost file into ``.clou/telemetry/``.
+    """
+    from clou import telemetry
+
+    def _noop_init(session_id: str, project_dir: Path) -> telemetry.SpanLog:  # noqa: ARG001
+        # Return a SpanLog pointed at a throwaway path that won't be created
+        # because we also neuter the global — callers only use the global API.
+        return telemetry.SpanLog(project_dir / ".clou" / "telemetry" / "test.jsonl")
+
+    monkeypatch.setattr("clou.telemetry.init", _noop_init)
+    monkeypatch.setattr("clou.telemetry._log", None)
+
+
+@pytest.fixture(autouse=True)
 def _no_supervisor(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,

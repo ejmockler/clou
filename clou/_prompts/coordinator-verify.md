@@ -17,6 +17,10 @@ handoff.
    - Key raw artifacts (snapshots, screenshots, response bodies)
    - Observable outcomes from intents.md
    Quality gate experience assessment is structural — it always runs.
+   If the quality gate is unavailable, the assessor falls back to
+   degraded internal review (see assessor.md). Evaluate degraded
+   findings identically to gate findings. Log the degraded
+   classification in decisions.md.
 5. Evaluate quality gate findings against intents.md scope.
 6. For each finding, decide and log in decisions.md:
    - Accept (code issue): create rework EXECUTE task. Log finding,

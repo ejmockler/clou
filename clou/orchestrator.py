@@ -54,7 +54,10 @@ from clou.harness import (
 from clou.hooks import HookConfig, build_hooks
 from clou.prompts import build_cycle_prompt, load_prompt
 from clou.recovery import (
+    archive_milestone_episodic,
     attempt_self_heal,
+    consolidate_milestone,
+    consolidate_pending,
     determine_next_cycle,
     git_commit_phase,
     git_revert_golden_context,
@@ -372,10 +375,27 @@ def _build_mcp_server(
 
     @tool(
         "ask_user",
-        "Pause and wait for the user's response. Call this after "
-        "presenting questions or choices in your text output. "
+        "Ask the user a question. The question text and choices are "
+        "displayed by the tool — do NOT write the question in your "
+        "text output.  You may output reasoning or context before "
+        "calling this tool, but the question itself goes here. "
+        "An open-ended option is auto-appended to choices. "
         "Returns the user's answer as plain text.",
-        {},
+        {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The question to ask the user.",
+                },
+                "choices": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "2-4 concrete answer options.",
+                },
+            },
+            "required": ["question"],
+        },
     )
     async def ask_user_tool(args: dict[str, Any]) -> dict[str, Any]:
         if gate is None:
@@ -383,7 +403,12 @@ def _build_mcp_server(
                 "content": [{"type": "text", "text": "No gate available."}],
                 "is_error": True,
             }
-        gate.open()
+        question: str = args.get("question", "")
+        raw_choices: list[str] | None = args.get("choices")
+        full_choices: list[str] | None = None
+        if raw_choices is not None:
+            full_choices = [*raw_choices, "Something else \u2014 I'll type my answer"]
+        gate.open(question=question, choices=full_choices)
         answer = await gate.wait()
         return {"content": [{"type": "text", "text": answer}]}
 
@@ -404,6 +429,19 @@ async def run_supervisor(
 ) -> None:
     """Start and manage the supervisor session."""
     clou_dir = project_dir / ".clou"
+
+    # Ensure operational memory is consistent before the supervisor
+    # reads memory.md at orient (DB-18). Consolidates any completed
+    # milestones not yet reflected in memory.md — handles bootstrap,
+    # crash recovery, and code deployment across existing projects.
+    if clou_dir.exists():
+        try:
+            n = consolidate_pending(project_dir)
+            if n:
+                log.info("Consolidated %d pending milestone(s) into memory.md", n)
+        except Exception:
+            log.warning("Pending consolidation failed", exc_info=True)
+
     user_gate = UserGate()
     clou_server = _build_mcp_server(project_dir, app=app, gate=user_gate)
 
@@ -412,41 +450,62 @@ async def run_supervisor(
     tmpl = load_template(tmpl_name)
     hooks = _to_sdk_hooks(build_hooks("supervisor", project_dir, template=tmpl))
 
-    # Supervisor gets quality gate MCP servers + clou (not all template
-    # servers — e.g., CDP is for the verifier, not the supervisor).
-    gate_servers = {g.mcp_server for g in tmpl.quality_gates}
-    all_mcp = template_mcp_servers(tmpl)
-    mcp_dict: dict[str, Any] = {
-        name: spec for name, spec in all_mcp.items() if name in gate_servers
-    }
-    mcp_dict["clou"] = clou_server
+    # Supervisor gets clou MCP server only — no quality gate servers.
+    # Quality gates are invoked by the brutalist during ASSESS cycles,
+    # not by the supervisor.  Keeping the tool set small prevents
+    # Claude Code from deferring critical tools like ask_user behind
+    # ToolSearch.
+    mcp_dict: dict[str, Any] = {"clou": clou_server}
 
     # The SDK session's working directory is where the user invoked clou,
     # not necessarily where .clou/ lives (which may be the global workspace).
     work_dir = getattr(app, "_work_dir", project_dir) if app else project_dir
 
-    # Block built-in AskUserQuestion — it requires the interactive
-    # permission component which bypassPermissions skips.  The model
-    # should use ask_user (clou MCP tool) instead.
+    # Handle AskUserQuestion via the gate: intercept the permission
+    # request, display the question in the UI, wait for the user's
+    # answer, and return it as updated_input so the model sees the
+    # populated answers.  All other tools are auto-approved.
     async def _can_use_tool(
         name: str,
         tool_input: dict[str, Any],
         ctx: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
         if name == "AskUserQuestion":
-            return PermissionResultDeny(
-                message="Use ask_user instead. It pauses for user input.",
+            questions = tool_input.get("questions", [])
+            if not questions:
+                return PermissionResultAllow()
+            # Take the first question (supervisor asks one at a time).
+            q = questions[0]
+            q_text = q.get("question", "")
+            options_list = q.get("options", [])
+            choice_labels = [o.get("label", "") for o in options_list if o.get("label")]
+            user_gate.open(question=q_text, choices=choice_labels)
+            answer = await user_gate.wait()
+            answers = {q_text: answer}
+            return PermissionResultAllow(
+                updated_input={**tool_input, "answers": answers},
             )
         return PermissionResultAllow()
 
+    # Restrict to the tools the supervisor actually uses.
+    # AskUserQuestion is built-in (always eagerly loaded, never
+    # deferred behind ToolSearch).  MCP tools are kept for
+    # coordinator spawning and milestone management.
     options = ClaudeAgentOptions(
         system_prompt=load_prompt("supervisor", project_dir),
-        permission_mode="bypassPermissions",
         cwd=str(work_dir),
         model="opus",
         hooks=hooks,
         mcp_servers=mcp_dict,
         can_use_tool=_can_use_tool,
+        allowed_tools=[
+            "Read", "Write", "Edit", "Glob", "Grep", "Bash",
+            "AskUserQuestion",
+            "mcp__clou__clou_spawn_coordinator",
+            "mcp__clou__clou_status",
+            "mcp__clou__clou_init",
+            "mcp__clou__clou_create_milestone",
+        ],
     )
 
     async with ClaudeSDKClient(options=options) as supervisor:
@@ -676,6 +735,8 @@ async def run_coordinator(
     tmpl = load_template(tmpl_name)
     log.info("Using harness template: %s", tmpl.name)
 
+    _pause_on_message: bool = getattr(tmpl, "pause_on_user_message", False)
+
     clou_dir = project_dir / ".clou"
     checkpoint_path = clou_dir / "milestones" / milestone / "active" / "coordinator.md"
     # Outside .clou/active/ so git_revert_golden_context doesn't touch it.
@@ -791,9 +852,11 @@ async def run_coordinator(
 
             # Check for user messages at cycle boundary.
             # If the user typed during autonomous work, pause the coordinator
-            # and let the supervisor handle it.
+            # and let the supervisor handle it — but only when the harness
+            # template opts in via pause_on_user_message (default: False).
             if (
-                _active_app is not None
+                _pause_on_message
+                and _active_app is not None
                 and hasattr(_active_app, "_user_input_queue")
                 and isinstance(_active_app._user_input_queue, deque)
                 and _active_app._user_input_queue
@@ -839,11 +902,31 @@ async def run_coordinator(
                         )
                     )
 
+            # Check checkpoint for rework before determine_next_cycle
+            # collapses the next_step variants (DB-18).
+            _rework_requested = False
+            if checkpoint_path.exists():
+                _cp_pre = parse_checkpoint(checkpoint_path.read_text())
+                if "rework" in _cp_pre.next_step.lower():
+                    _rework_requested = True
+
             cycle_type, read_set = determine_next_cycle(
                 checkpoint_path,
                 milestone,
                 decisions_path=decisions_path,
             )
+
+            # Emit rework telemetry only when checkpoint explicitly
+            # requested rework, not on any ASSESS→EXECUTE transition (DB-18).
+            if _rework_requested and cycle_type == "EXECUTE":
+                telemetry.event(
+                    "cycle.rework",
+                    milestone=milestone,
+                    cycle_num=read_cycle_count(checkpoint_path) + 1,
+                    from_step="ASSESS",
+                    to_step="EXECUTE",
+                    phase=_cp_pre.current_phase,
+                )
 
             if cycle_type == "COMPLETE":
                 log.info("Milestone %r complete", milestone)
@@ -856,6 +939,11 @@ async def run_coordinator(
             if cycle_count >= _MAX_CYCLES:
                 log.warning("Milestone %r hit %d-cycle limit", milestone, _MAX_CYCLES)
                 await write_cycle_limit_escalation(project_dir, milestone, cycle_count)
+                telemetry.event(
+                    "escalation.created", milestone=milestone,
+                    cycle_num=cycle_count + 1, classification="cycle_limit",
+                    severity="blocking",
+                )
                 _post_new_escalations()
                 _ms_outcome = "escalated_cycle_limit"
                 return "escalated_cycle_limit"
@@ -902,6 +990,11 @@ async def run_coordinator(
                     project_dir, milestone, cycle_type,
                     _staleness_count, _phases_now, _cp_next,
                 )
+                telemetry.event(
+                    "escalation.created", milestone=milestone,
+                    cycle_num=cycle_count + 1, classification="staleness",
+                    severity="blocking",
+                )
                 _post_new_escalations()
                 _ms_outcome = "escalated_staleness"
                 return "escalated_staleness"
@@ -929,6 +1022,12 @@ async def run_coordinator(
                 if readiness_retries >= _MAX_VALIDATION_RETRIES:
                     await write_validation_escalation(
                         project_dir, milestone, readiness,
+                    )
+                    telemetry.event(
+                        "escalation.created", milestone=milestone,
+                        cycle_num=cycle_count + 1,
+                        classification="validation_failure",
+                        severity="blocking",
                     )
                     _post_new_escalations()
                     _ms_outcome = "escalated_validation"
@@ -1042,6 +1141,12 @@ async def run_coordinator(
                 if crash_retries >= _MAX_CRASH_RETRIES:
                     log.error("Milestone %r hit crash retry limit", milestone)
                     await write_agent_crash_escalation(project_dir, milestone)
+                    telemetry.event(
+                        "escalation.created", milestone=milestone,
+                        cycle_num=cycle_count + 1,
+                        classification="agent_crash",
+                        severity="blocking",
+                    )
                     _post_new_escalations()
                     _ms_outcome = "escalated_crash_loop"
                     return "escalated_crash_loop"
@@ -1054,6 +1159,12 @@ async def run_coordinator(
                 )
                 log.error("Agent team crash for %r, escalating", milestone)
                 await write_agent_crash_escalation(project_dir, milestone)
+                telemetry.event(
+                    "escalation.created", milestone=milestone,
+                    cycle_num=cycle_count + 1,
+                    classification="agent_crash",
+                    severity="blocking",
+                )
                 _post_new_escalations()
                 _ms_outcome = "escalated_agent_crash"
                 return "escalated_agent_crash"
@@ -1165,6 +1276,12 @@ async def run_coordinator(
                     await write_validation_escalation(
                         project_dir, milestone, findings
                     )
+                    telemetry.event(
+                        "escalation.created", milestone=milestone,
+                        cycle_num=cycle_count + 1,
+                        classification="validation_failure",
+                        severity="blocking",
+                    )
                     _post_new_escalations()
                     _ms_outcome = "escalated_validation"
                     return "escalated_validation"
@@ -1238,6 +1355,20 @@ async def run_coordinator(
             telemetry.event("milestone.end", milestone=milestone, outcome=_ms_outcome)
         except Exception:
             log.warning("telemetry summary write failed for %r", milestone, exc_info=True)
+
+        # Consolidate operational memory and archive episodic files (DB-18).
+        # Runs after metrics.md is written so consolidation can read it.
+        # Archive only if consolidation succeeded — don't delete episodic
+        # evidence before patterns have been extracted.
+        if _ms_outcome == "completed":
+            try:
+                consolidated = consolidate_milestone(project_dir, milestone)
+                if consolidated:
+                    await archive_milestone_episodic(project_dir, milestone)
+            except Exception:
+                log.warning(
+                    "memory consolidation failed for %r", milestone, exc_info=True,
+                )
         _active_app = None
 
 
@@ -1281,6 +1412,22 @@ async def _run_single_cycle(
             allowUnsandboxedCommands=False,
         ),
     )
+
+    # Quality gate tool tracking (DB-18).
+    # During ASSESS cycles, observe which MCP tools the quality gate
+    # agent calls via TaskProgressMessage.last_tool_name.  At cycle end,
+    # compare against the template's expected tools to detect unavailability.
+    _qg_expected: set[str] = set()
+    _qg_seen: set[str] = set()
+    if cycle_type == "ASSESS" and template is not None:
+        for gate in template.quality_gates:
+            agent_name = gate.assess_agent
+            agent_spec = template.agents.get(agent_name)
+            if agent_spec is not None:
+                _qg_expected |= {
+                    t for t in agent_spec.tools
+                    if t.startswith("mcp__")
+                }
 
     try:
         async with ClaudeSDKClient(options=options) as coordinator:
@@ -1329,6 +1476,11 @@ async def _run_single_cycle(
                             task_id=msg.task_id,
                             description=msg.description,
                         )
+                    elif hasattr(msg, "last_tool_name"):
+                        # TaskProgressMessage — track quality gate tools.
+                        tool_name = msg.last_tool_name
+                        if isinstance(tool_name, str) and tool_name in _qg_expected:
+                            _qg_seen.add(tool_name)
                     elif hasattr(msg, "status") and hasattr(msg, "summary"):
                         _au = getattr(msg, "usage", {}) or {}
                         telemetry.event(
@@ -1366,6 +1518,17 @@ async def _run_single_cycle(
                         "checkpoint and exit."
                     )
                     return "agent_team_crash"
+
+        # Emit quality gate telemetry after ASSESS cycle completes (DB-18).
+        if _qg_expected:
+            telemetry.event(
+                "quality_gate.result",
+                milestone=milestone,
+                cycle_num=cycle_num,
+                tools_invoked=sorted(_qg_seen),
+                tools_unavailable=sorted(_qg_expected - _qg_seen),
+                finding_count=len(_qg_seen),
+            )
 
         return read_cycle_outcome(project_dir, milestone)
 

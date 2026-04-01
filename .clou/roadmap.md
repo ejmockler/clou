@@ -30,6 +30,6 @@ description: Arc reasoning, presentation, sharpening, and revision. Supervisor r
 path: 15-disposition-aware-questioning
 description: Exploring vs converging question strategies. Two signal sources (understanding.md density + user response characteristics), gradient-based question selection, Groan Zone handling with convergence suppression, fast path for pre-converged users. 3 cycles.
 
-### 16. Width-Aware Planning — current
+### 16. Width-Aware Planning — completed
 path: 16-width-aware-planning
 description: Coordinator planner gains width-aware decomposition guidance. Task graphs express independence via gather() when scope has parallel workstreams, reason about critical path, and stay narrow when scope is single-dimensional. Research foundations gain decomposition topology section grounding the guidance in LAMaS, LLMCompiler, HiPlan, and ACONIC.

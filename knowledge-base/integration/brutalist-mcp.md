@@ -152,14 +152,28 @@ supervisor_mcp["clou"] = clou_server
 
 ## Brutalist Availability
 
-Brutalist is a required quality gate in the software-construction template (`required=True` in DB-11). If Brutalist MCP becomes unavailable during an ASSESS cycle, this is a **blocking error**:
+Brutalist is a required quality gate in the software-construction template (`required=True` in DB-11). If Brutalist MCP becomes unavailable during an ASSESS cycle, the assessor **automatically falls back to degraded internal review** — it does not block progress.
 
-1. The coordinator writes a `blocked` escalation with the specific error (connection refused, npm failure, etc.)
-2. The coordinator exits the cycle — it does not proceed without quality assessment
-3. The supervisor reads the escalation and informs the user
-4. Resolution: user fixes Brutalist installation/network, then coordinator resumes
+### Degraded Fallback
 
-This behavior is driven by the template's `quality_gates[].required` flag. A template with `required=False` would fall back to coordinator self-assessment (weakest configuration). Brutalist's `required=True` status reflects Design Principle 10 (fail loud) and DB-05 (essential infrastructure). See [DB-11](../decision-boundaries/11-harness-architecture.md) for the full quality gate pluggability design.
+When the quality gate is unreachable (npm 403, connection error, timeout), the assessor:
+
+1. Spawns parallel subagents across implementation verticals (architecture, security, code quality, test coverage, dependencies) — only verticals relevant to what changed.
+2. Each subagent reads the changed files and reviews from its vertical's perspective.
+3. Writes `assessment.md` with `status: degraded`, documenting the gate error and internal findings.
+4. The coordinator proceeds normally — evaluating degraded findings identically to gate findings — and logs the degraded classification in `decisions.md`.
+
+This produces findings without external multi-model perspective. The assessment is clearly marked as degraded so the coordinator and supervisor know the confidence level is lower than a full quality gate pass.
+
+### Research Grounding
+
+The degraded fallback is grounded in §9 (LLM-Modulo): external verification is preferred but internal multi-perspective review provides a non-zero signal. It addresses the §10 finding that "self-reflection without external validation → false beliefs persist indefinitely" by: (a) clearly marking the degraded status, (b) using multiple internal perspectives (vertical decomposition) rather than a single self-assessment, and (c) preserving the coordinator's critical evaluation layer.
+
+### When Blocking Still Occurs
+
+The `blocked` status is reserved for irrecoverable errors — not quality gate unavailability. Examples: the assessor cannot read execution.md, compose.py is missing, or no files changed to assess. These are structural failures that degraded review cannot address.
+
+This behavior is driven by the template's `quality_gates[].required` flag. The `required=True` flag means the gate is the preferred assessment mechanism and its unavailability is noted as degraded, not that unavailability blocks progress. See [DB-11](../decision-boundaries/11-harness-architecture.md) for the full quality gate pluggability design.
 
 ## What Brutalist Does NOT Replace
 

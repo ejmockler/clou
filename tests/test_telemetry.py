@@ -368,3 +368,90 @@ class TestWriteMilestoneSummary:
             assert "99000" not in content
         finally:
             telemetry._log = old
+
+    def test_quality_gate_section(self, tmp_path: Path) -> None:
+        """DB-18: quality_gate.result events produce a Quality Gate table."""
+        old = telemetry._log
+        try:
+            init("test-qg", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 1000
+                c["output_tokens"] = 1000
+            event(
+                "quality_gate.result", milestone="m1", cycle_num=3,
+                tools_invoked=["roast_codebase", "roast_security"],
+                tools_unavailable=["roast_architecture"],
+                finding_count=7,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Quality Gate" in content
+            assert "roast_codebase, roast_security" in content
+            assert "roast_architecture" in content
+            assert "7" in content
+        finally:
+            telemetry._log = old
+
+    def test_rework_section(self, tmp_path: Path) -> None:
+        """DB-18: cycle.rework events produce a Rework table."""
+        old = telemetry._log
+        try:
+            init("test-rw", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 1000
+                c["output_tokens"] = 1000
+            event(
+                "cycle.rework", milestone="m1", cycle_num=3,
+                from_step="ASSESS", to_step="EXECUTE", phase="impl",
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Rework" in content
+            assert "ASSESS" in content
+            assert "impl" in content
+        finally:
+            telemetry._log = old
+
+    def test_escalation_section(self, tmp_path: Path) -> None:
+        """DB-18: escalation.created events produce an Escalations table."""
+        old = telemetry._log
+        try:
+            init("test-esc", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 1000
+                c["output_tokens"] = 1000
+            event(
+                "escalation.created", milestone="m1", cycle_num=5,
+                classification="validation_failure", severity="blocking",
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Escalations" in content
+            assert "validation_failure" in content
+            assert "blocking" in content
+        finally:
+            telemetry._log = old
+
+    def test_no_db18_sections_when_no_events(self, tmp_path: Path) -> None:
+        """DB-18 sections absent when no DB-18 events were emitted."""
+        old = telemetry._log
+        try:
+            self._populate_log(tmp_path)
+            write_milestone_summary(tmp_path, "auth", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "auth" / "metrics.md"
+            ).read_text()
+            assert "## Quality Gate" not in content
+            assert "## Rework" not in content
+            assert "## Escalations" not in content
+        finally:
+            telemetry._log = old

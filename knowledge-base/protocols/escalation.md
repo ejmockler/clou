@@ -81,9 +81,11 @@ An agent team member died unexpectedly during execution. The orchestrator killed
 **Example:** "Teammate implementing auth service crashed (context exhaustion). 2/4 tasks completed in execution.md. Remaining: session management, password reset."
 
 ### `infrastructure_failure`
-Essential Clou infrastructure (Brutalist MCP, Playwright MCP) is unavailable. The coordinator cannot proceed without it.
+Essential Clou infrastructure (Playwright MCP, other required services) is unavailable. The coordinator cannot proceed without it.
 
-**Example:** "Brutalist MCP returned connection error during ASSESS cycle. Cannot perform quality assessment."
+**Note:** Brutalist MCP unavailability is **not** an infrastructure_failure escalation. The assessor automatically falls back to degraded internal review (spawning subagents across implementation verticals). The coordinator proceeds with `status: degraded` findings. See [brutalist-mcp.md](../integration/brutalist-mcp.md) for the degraded fallback design.
+
+**Example:** "Playwright MCP returned connection error during VERIFY cycle. Cannot perform perceptual verification."
 
 ### `validation_failure`
 The orchestrator detected malformed golden context after 3 consecutive retry attempts for the same cycle. Structural validation failed repeatedly.

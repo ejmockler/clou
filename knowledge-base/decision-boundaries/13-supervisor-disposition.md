@@ -1,7 +1,7 @@
 # DB-13: Supervisor Disposition
 
 **Status:** DECIDED
-**Decided:** 2026-03-28
+**Decided:** 2026-03-28, **updated** 2026-03-30 (structured questioning via ask_user)
 **Severity:** High — the supervisor's core skill is understanding what the user is reaching toward; disposition design determines whether that understanding accumulates or resets each session
 **Question:** How does the supervisor navigate between open-ended exploration and convergence on actionable scope, and how does it make that understanding durable?
 
@@ -107,6 +107,69 @@ Understanding.md has clean ownership: `[supervisor writes]`. This is consistent 
 
 The supervisor also updates understanding.md after milestone completion (reading handoff.md outcomes and updating the "Resolved" section). This is a supervisor-initiated write at a natural checkpoint, not a coordinator-initiated write.
 
+## Structured Questioning via ask_user
+
+The ask_user MCP tool is the mechanical enforcement of the supervisor's questioning discipline. It gains a structured choices parameter.
+
+### Tool Contract
+
+```python
+ask_user(question: str, choices: list[str] | None = None) -> str
+```
+
+The question text lives inside the tool call, not in the model's text output. This is a structural constraint: the model cannot "half-complete" a question by outputting it as text. The question IS the tool call.
+
+When called:
+1. The tool passes `question` and `choices` to the gate
+2. The gate carries both to the UI
+3. The SDK auto-appends one open-ended option (e.g., "Something else — I'll type my answer")
+4. The UI displays the question and choices together
+5. The user selects a choice or writes freeform
+6. The gate returns the response to the tool
+
+### Why the Question Is Inside the Tool
+
+The previous design ("present the question as text, then call ask_user") had a structural failure mode: the model outputs the question as text (step 1 feels complete), then skips the tool call (step 2 feels redundant). This was observed repeatedly — the model asked questions inline and either forgot to call ask_user or deferred it behind ToolSearch.
+
+Moving the question into the tool eliminates this: the model's text output is context/reasoning only. The question cannot exist outside the tool call. The model must call ask_user to ask anything.
+
+### SDK-Level Open-Ended Enforcement
+
+The open-ended option is appended by the tool implementation. The supervisor cannot present a closed question regardless of prompt adherence.
+
+### Disposition Determines Choice Character
+
+The supervisor's disposition (exploring vs. converging) determines the character of the choices:
+
+- **Exploring:** Choices surface different directions. "What matters most — A, B, or C?" Broad, non-committal.
+- **Converging:** Choices scope boundaries. "Is X in scope for this milestone? Yes / No, defer / Not at all." Specific, binding.
+- **Re-entry (post-milestone, per DB-16):** Choices present natural next steps. "Looks good, continue / Needs X fixed / Rethink scope." Derived from handoff.md.
+
+### Gate Changes
+
+The UserGate primitive (`gate.py`) carries both question and choices:
+
+```python
+class UserGate:
+    def open(self, *, question: str | None = None,
+             choices: list[str] | None = None) -> None:
+        """Signal waiting. Question and choices displayed by UI."""
+
+    @property
+    def question(self) -> str | None:
+        """The question text, or None if gate is closed."""
+
+    @property
+    def choices(self) -> list[str] | None:
+        """The choices (with SDK-appended open-ended option), or None."""
+```
+
+The UI reads `gate.question` and `gate.choices` to render the question and input interface.
+
+### Why Every Question Gets Choices
+
+Freeform text gates invite two failure modes: (1) the supervisor asks vague questions that don't advance understanding, and (2) the human writes paragraph responses that the supervisor must parse and may misinterpret. Structured choices force the supervisor to crystallize its reasoning into concrete options before asking, and give the human fast paths for common responses. The open-ended escape hatch preserves full expressiveness when needed.
+
 ## Resolved Questions
 
 - [x] **Mode vs. disposition:** Disposition, not mode. No toggle, no command. Inferred from conversational signals. Reflects Kaner's Groan Zone — the transition is organic.
@@ -124,3 +187,5 @@ The supervisor also updates understanding.md after milestone completion (reading
 | **DB-07 (Milestone Ownership)** | Understanding.md ownership is `[supervisor writes]`. No split-ownership exception needed. |
 | **DB-08 (File Schemas)** | Understanding.md schema: concept-oriented sections (What this project is becoming / Active tensions / Continuity / Resolved), ~500-800 tokens, validated by user before writes. Narrative tier validation (form-only, per DB-12). |
 | **DB-12 (Validation Tiers)** | Understanding.md is a narrative-tier artifact — form-checked (required sections present), content quality assessed by user validation rather than quality gate. |
+| **DB-16 (Autonomous Cycles)** | Re-entry after milestone completion uses structured ask_user with choices derived from handoff.md. Supervisor disposition at re-entry inferred from human's feedback character. |
+| **Gate / Orchestrator** | UserGate gains choices field. ask_user MCP tool gains choices parameter. SDK auto-appends open-ended option. UI presents multiple-choice when gate.choices is set. |

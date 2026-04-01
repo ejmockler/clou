@@ -41,6 +41,16 @@ These are what the research predicts will fail:
 - **"Here's the full plan — do you approve?"** (front-loaded validation — Suchman says plans made before touching material will be wrong)
 - **Generating all planning files before any dialogue** (Otto's ENVIRONMENT stage — waterfall)
 
+### Structured Questioning
+
+When the supervisor needs input from the human, all questions use `ask_user` with a `choices` parameter providing 2-4 concrete options. The SDK auto-appends an open-ended option — the supervisor never includes "other" or "something else" as a choice.
+
+The current disposition (from the orchestrator's disposition tracking) determines the character of choices:
+- **Exploring** → broad directions ("add social features / focus on performance / pivot to mobile-first")
+- **Converging** → specific boundaries ("keep the current auth flow / switch to OAuth / defer auth to M2")
+
+This replaces open-ended questions ("what do you think?") and unbounded enumerations ("pick from these 8 options"). The human reacts to concrete proposals, not abstract prompts.
+
 ### The Conversational Phases
 
 #### Phase 1: Listen and Recognize
@@ -169,15 +179,24 @@ If a template needs agents to explore domain artifacts before planning (e.g., re
    - Write disposition (status, resolved_by, resolution)
 5. Update project.md, roadmap.md as needed
 6. If current milestone is complete:
-   a. Review handoff.md and verification results
-   b. Mark milestone as complete in roadmap.md
-   c. Advance to next milestone
-   d. Create milestone directory, write milestone.md and requirements.md
-   e. Call `clou_spawn_coordinator(milestone_name)` — orchestrator reads
+   a. Walk the human through what was built using handoff.md
+      - Present the output for the human to USE (try it, feel out
+        capabilities), not just review a document
+      - The human interacts with the running output — discovers edges,
+        forms impressions, notices what's missing or surprising
+   b. After the human has used the output, capture what they learned
+      - Use ask_user with choices derived from handoff.md for structured
+        re-entry (e.g., "works as expected / found an issue / want to
+        adjust scope / ready for next milestone")
+   c. Review handoff.md, decisions.md, status.md, and metrics.md
+   d. Mark milestone as complete in roadmap.md
+   e. Advance to next milestone
+   f. Create milestone directory, write milestone.md and requirements.md
+   g. Call `clou_spawn_coordinator(milestone_name)` — orchestrator reads
       template from project.md, configures agents/gates/permissions, starts
       coordinator session
-   f. Coordinator runs autonomously; supervisor waits for completion
-   g. On completion, read handoff.md, decisions.md, status.md, and metrics.md
+   h. Coordinator runs autonomously; supervisor waits for completion
+   i. On completion, read handoff.md, decisions.md, status.md, and metrics.md
 7. If no active milestone and roadmap has remaining milestones:
    a. Begin next milestone (same as 6c-6e)
 8. If no active milestone and roadmap is complete:

@@ -48,6 +48,12 @@ def main() -> None:
         _run_init()
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == "auth":
+        from clou.auth import run_auth_command
+
+        run_auth_command()
+        return
+
     from pathlib import Path
 
     from clou.project import resolve_project_dir_or_exit

@@ -1,17 +1,23 @@
 """Compose.py call graph validation.
 
-Validates milestone composition files against five structural properties:
+Validates milestone composition files against seven structural properties:
 
 1. Well-formedness \u2014 valid Python syntax
 2. Completeness \u2014 every called function is defined
 3. Acyclicity \u2014 no circular dependencies (type-based DFS)
 4. Type compatibility \u2014 output types match downstream input types
 5. Convergence \u2014 execute() entry point exists, all tasks are reachable
+6. Width \u2014 graphs with >2 tasks should use gather() for concurrency
+7. Minimum decomposition \u2014 at least 3 substantive phases required
 
 The compose.py format (DB-02) encodes tasks as async function definitions
 and the execution plan as the body of execute(). This module validates the
 call graph using Python's ast module \u2014 no runtime execution, no external
 dependencies.
+
+Decorator edges:
+    @requires("phase_name") \u2014 ordering constraint (no data flow)
+    @needs("path/to/artifact") \u2014 artifact dependency (environmental)
 
 Public API:
     validate(source: str) -> list[str]
@@ -39,6 +45,9 @@ type _Call = tuple[str, list[tuple[int, str]], list[str]]
 _BUILTINS = frozenset({"gather"})
 
 _ENTRY_NAMES = ("execute", "execute_milestone")
+
+# Functions excluded from the task count for minimum decomposition.
+_NON_TASK_NAMES = frozenset({*_ENTRY_NAMES, "verify"})
 
 _CONTROL_FLOW = (
     ast.If,
@@ -84,6 +93,13 @@ def extract_dag_data(
                 producer = var_producer.get(var)
                 if producer and producer != func and producer not in deps[func]:
                     deps[func].append(producer)
+
+    # Add @requires decorator edges (ordering constraints)
+    requires_edges, _ = _extract_decorator_edges(tree)
+    for func_name, dep_name in requires_edges:
+        if func_name in deps and dep_name in sigs:
+            if dep_name not in deps[func_name]:
+                deps[func_name].append(dep_name)
 
     return tasks, deps
 
@@ -170,6 +186,15 @@ def validate(source: str) -> list[str]:
     # Type compatibility: argument types match parameter annotations
     errors += _check_types(sigs, calls, var_types)
 
+    # Parse decorator edges (validates without erroring on their presence)
+    _extract_decorator_edges(tree)
+
+    # Width: multi-task graphs should use gather() for concurrency
+    errors += _check_width(sigs, entry, calls)
+
+    # Minimum decomposition: at least 3 substantive phases
+    errors += _check_min_decomposition(sigs)
+
     return errors
 
 
@@ -193,6 +218,91 @@ def _extract_sigs(tree: ast.Module) -> dict[str, Sig]:
             ret = ast.unparse(node.returns) if node.returns else None
             sigs[node.name] = Sig(node.name, params, ret)
     return sigs
+
+
+def _extract_decorator_edges(
+    tree: ast.Module,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Extract @requires and @needs decorator edges from async defs.
+
+    Returns ``(requires_edges, needs_edges)`` where each edge is
+    ``(function_name, dependency_name_or_path)``.
+    """
+    requires: list[tuple[str, str]] = []
+    needs: list[tuple[str, str]] = []
+    for node in ast.iter_child_nodes(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        for dec in node.decorator_list:
+            if not isinstance(dec, ast.Call):
+                continue
+            dec_name = _call_name(dec)
+            if dec_name == "requires" and dec.args:
+                arg = dec.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    requires.append((node.name, arg.value))
+            elif dec_name == "needs" and dec.args:
+                arg = dec.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    needs.append((node.name, arg.value))
+    return requires, needs
+
+
+def _has_gather(entry: ast.AsyncFunctionDef) -> bool:
+    """Check whether execute() contains any gather() calls."""
+    for node in ast.walk(entry):
+        if isinstance(node, ast.Call) and _call_name(node) == "gather":
+            return True
+    return False
+
+
+def _check_width(
+    sigs: dict[str, Sig],
+    entry: ast.AsyncFunctionDef,
+    calls: list[_Call],
+) -> list[str]:
+    """Warn if a multi-task graph has no concurrent phases.
+
+    If there are more than 2 task functions and no gather() call in
+    execute(), emit a warning -- unless every task consumes the output of
+    the previous one (fully serial data flow).
+    """
+    task_names = [n for n in sigs if n not in _NON_TASK_NAMES]
+    if len(task_names) <= 2:
+        return []
+    if _has_gather(entry):
+        return []
+
+    # Check for fully serial data flow: every call (after the first) takes
+    # a variable produced by the immediately preceding call.
+    task_calls = [c for c in calls if c[0] in sigs and c[0] not in _NON_TASK_NAMES]
+    if len(task_calls) >= 2:
+        all_serial = True
+        for i in range(1, len(task_calls)):
+            prev_targets = set(task_calls[i - 1][2])
+            curr_arg_vars = {var for _, var in task_calls[i][1]}
+            if not curr_arg_vars or not (curr_arg_vars & prev_targets):
+                all_serial = False
+                break
+        if all_serial:
+            return []
+
+    n = len(task_names)
+    return [
+        f"No concurrent phases in a {n}-task graph "
+        f"\u2014 verify all tasks have sequential data dependencies"
+    ]
+
+
+def _check_min_decomposition(sigs: dict[str, Sig]) -> list[str]:
+    """Error if there are fewer than 3 substantive task phases."""
+    task_count = sum(1 for n in sigs if n not in _NON_TASK_NAMES)
+    if task_count <= 2:
+        return [
+            "Under-decomposed milestone "
+            "\u2014 identify at least 3 substantive phases"
+        ]
+    return []
 
 
 def _find_entry(tree: ast.Module) -> ast.AsyncFunctionDef | None:

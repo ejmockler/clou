@@ -126,9 +126,9 @@ _STRUCTURAL_FILES = frozenset({
     "status.md",
 })
 
-#: Only project.md resolves under .clou/ (root-scoped).
-#: All other read_set entries resolve under .clou/milestones/{milestone}/.
-_ROOT_SCOPED_FILES = frozenset({"project.md"})
+#: Files that resolve under .clou/ (root-scoped) rather than
+#: .clou/milestones/{milestone}/ (milestone-scoped). DB-18 adds memory.md.
+_ROOT_SCOPED_FILES = frozenset({"project.md", "memory.md"})
 
 
 def validate_delivery(
@@ -654,6 +654,7 @@ def _validate_assessment(path: Path) -> list[ValidationFinding]:
         return findings
 
     # "blocked" is a valid terminal state — no findings required.
+    # "degraded" proceeds like "completed" — findings are expected.
     if status_match.group(1) == "blocked":
         return findings
 

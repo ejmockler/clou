@@ -41,18 +41,17 @@ template = HarnessTemplate(
                 "WebFetch",
             ],
         ),
-        "assessor": AgentSpec(
+        "brutalist": AgentSpec(
             description=(
-                "Invoke quality gate tools on changed code and "
-                "structure findings into assessment.md. Does not "
-                "evaluate findings — captures only."
+                "Read-only quality gate agent. Invokes brutalist MCP "
+                "tools on changed code and writes raw findings to "
+                "assessment.md. Cannot evaluate, dismiss, or edit code."
             ),
             prompt_ref="assessor",
-            tier="assessor",
+            tier="brutalist",
             tools=[
                 "Read",
                 "Write",
-                "Bash",
                 "Grep",
                 "Glob",
                 "mcp__brutalist__roast_codebase",
@@ -63,6 +62,23 @@ template = HarnessTemplate(
                 "mcp__brutalist__roast_file_structure",
                 "mcp__brutalist__roast_dependencies",
                 "mcp__brutalist__roast_test_coverage",
+                "mcp__brutalist__roast_cli_debate",
+                "mcp__brutalist__brutalist_discover",
+            ],
+        ),
+        "assess-evaluator": AgentSpec(
+            description=(
+                "Classify each finding in assessment.md against "
+                "requirements.md. Writes classifications to decisions.md. "
+                "Does not discover new findings or edit code."
+            ),
+            prompt_ref="assess-evaluator",
+            tier="assess-evaluator",
+            tools=[
+                "Read",
+                "Write",
+                "Grep",
+                "Glob",
             ],
         ),
         "verifier": AgentSpec(
@@ -97,7 +113,7 @@ template = HarnessTemplate(
     quality_gates=[
         QualityGateSpec(
             mcp_server="brutalist",
-            assess_agent="assessor",
+            assess_agent="brutalist",
             verify_agent="verifier",
             required=True,
         ),
@@ -119,6 +135,7 @@ template = HarnessTemplate(
             "roadmap.md",
             "requests.md",
             "understanding.md",
+            "memory.md",
             "milestones/*/milestone.md",
             "milestones/*/intents.md",
             "milestones/*/requirements.md",
@@ -141,8 +158,12 @@ template = HarnessTemplate(
             "milestones/*/phases/verification/artifacts/*",
             "milestones/*/handoff.md",
         ],
-        "assessor": [
+        "brutalist": [
             "milestones/*/assessment.md",
+        ],
+        "assess-evaluator": [
+            "milestones/*/assessment.md",
+            "milestones/*/decisions.md",
         ],
     },
     compose_conventions=ComposeConventions(

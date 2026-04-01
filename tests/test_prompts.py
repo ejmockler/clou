@@ -42,7 +42,7 @@ def test_load_prompt_missing_tier_raises() -> None:
 
 
 def test_load_prompt_different_tiers(tmp_path: Path) -> None:
-    for tier in ("supervisor", "coordinator", "worker", "assessor", "verifier"):
+    for tier in ("supervisor", "coordinator", "worker", "assessor", "assess-evaluator", "verifier"):
         result = load_prompt(tier, tmp_path)
         assert len(result) > 0
 

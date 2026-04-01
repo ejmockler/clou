@@ -5,9 +5,10 @@ Bridges the SDK's tool model (call → result) and the TUI's input model
 wait for user input opens a gate, awaits the response, and returns it
 as the tool result.
 
-Usage inside an MCP tool handler::
+The question text lives inside the tool call — the model does not output
+questions as text.  The gate carries the question to the UI::
 
-    gate.open()
+    gate.open(question="Which matters more?", choices=["Speed", "Safety"])
     answer = await gate.wait()
     return {"content": [{"type": "text", "text": answer}]}
 
@@ -33,14 +34,42 @@ class UserGate:
 
     def __init__(self) -> None:
         self._future: asyncio.Future[str] | None = None
+        self._question: str | None = None
+        self._choices: list[str] | None = None
 
     @property
     def is_open(self) -> bool:
         """True while a tool is waiting for the user's response."""
         return self._future is not None and not self._future.done()
 
-    def open(self) -> None:
+    @property
+    def question(self) -> str | None:
+        """The question text, or None if gate is closed."""
+        if not self.is_open:
+            return None
+        return self._question
+
+    @property
+    def choices(self) -> list[str] | None:
+        """The choices presented to the user, or None if gate is closed or no choices."""
+        if not self.is_open:
+            return None
+        return self._choices
+
+    def open(
+        self,
+        *,
+        question: str | None = None,
+        choices: list[str] | None = None,
+    ) -> None:
         """Signal that a tool is waiting for user input.
+
+        Args:
+            question: The question text to display.  The model should
+                put the question here, not in its text output.
+            choices: Optional list of choices to present.  When provided
+                the UI renders structured options instead of free-form
+                text input.
 
         If a previous gate is still open, it is cancelled (the tool
         receives ``asyncio.CancelledError``).  This prevents zombie
@@ -48,6 +77,8 @@ class UserGate:
         """
         if self._future is not None and not self._future.done():
             self._future.cancel()
+        self._question = question
+        self._choices = choices
         self._future = asyncio.get_running_loop().create_future()
 
     async def wait(self) -> str:
@@ -60,7 +91,9 @@ class UserGate:
         """Deliver the user's response to the waiting tool.
 
         No-op if the gate is not open (e.g. tool already timed out or
-        was cancelled).
+        was cancelled).  Clears stored question and choices on delivery.
         """
         if self._future is not None and not self._future.done():
             self._future.set_result(text)
+            self._question = None
+            self._choices = None

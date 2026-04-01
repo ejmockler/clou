@@ -59,6 +59,7 @@ The `.clou/` directory is the system of record for all Clou planning state. It i
 │                   └── *.png, *.json   # Raw perception captures (DB-09)
 │
 ├── understanding.md                    # [supervisor writes] — durable conceptual memory (DB-13)
+├── memory.md                           # [orchestrator writes, supervisor annotates] — operational memory (DB-18)
 │
 └── active/
     └── supervisor.md                   # [supervisor checkpoint]
@@ -307,8 +308,8 @@ Cross-file consistency between checkpoint and status.md is validated at cycle bo
 | Tier | Writes | Reads |
 |---|---|---|
 | User | `requests.md`, credential confirmations in `services/*/status.md` | Anything (via supervisor conversation) |
-| Supervisor | `project.md`, `roadmap.md`, `requests.md` (processing), `understanding.md` (DB-13), milestone creation (`milestone.md`, `intents.md` (DB-14), `requirements.md`), escalation dispositions, `active/supervisor.md` | Everything |
-| Orchestrator | `metrics.md` (automated telemetry summary) | Span log, golden context structure |
+| Supervisor | `project.md`, `roadmap.md`, `requests.md` (processing), `understanding.md` (DB-13), `memory.md` (annotations, DB-18), milestone creation (`milestone.md`, `intents.md` (DB-14), `requirements.md`), escalation dispositions, `active/supervisor.md` | Everything |
+| Orchestrator | `metrics.md` (automated telemetry summary), `memory.md` (structural consolidation, DB-18) | Span log, golden context structure |
 | Coordinator | `compose.py`, `status.md`, `decisions.md`, `escalations/`, phase directories (`phase.md`), `milestones/<name>/active/coordinator.md` | Everything in its milestone directory + `project.md` |
 | Agent Teams | `phases/*/execution.md` within assigned phase | Phase spec + codebase |
 | Assessor | `assessment.md` (quality gate findings, DB-11) | Phase execution + compose.py + project context |
@@ -321,7 +322,7 @@ Cross-file consistency between checkpoint and status.md is validated at cycle bo
 The orchestrator reads the coordinator checkpoint (`milestones/<name>/active/coordinator.md`) separately and injects cycle context into the prompt. The checkpoint is not in any agent read set — it is orchestrator infrastructure.
 
 ```
-PLAN:    milestone.md, intents.md, requirements.md, project.md
+PLAN:    milestone.md, intents.md, requirements.md, project.md, memory.md (DB-18)
 EXECUTE: status.md, compose.py, phases/{phase}/phase.md
 ASSESS:  status.md, compose.py, phases/{phase}/execution.md, requirements.md, decisions.md, assessment.md
 VERIFY:  status.md, intents.md, compose.py
@@ -330,7 +331,7 @@ EXIT:    status.md, handoff.md, decisions.md
 
 The cycle prompt also injects resolved write paths — exact file paths the coordinator must use for each cycle type. See [DB-15](./decision-boundaries/15-architectural-tensions.md) D1.
 
-All read set entries except `project.md` resolve under `.clou/milestones/<name>/`. Quality peaks at 7-9 chunks filling 40-70% of the context window (chunking research) — the read sets are sized to this range.
+All read set entries except `project.md` and `memory.md` resolve under `.clou/milestones/<name>/`. Quality peaks at 7-9 chunks filling 40-70% of the context window (chunking research) — the read sets are sized to this range.
 
 ## Structural Validation
 
@@ -351,3 +352,74 @@ If validation fails: git-revert golden context files to pre-cycle state, restart
 - **Agent teams write `execution.md` during the cycle** — the only mid-cycle golden context write by non-coordinator agents. `execution.md` is written incrementally (not only at completion) so that crash recovery can preserve partial work.
 - **Coordinator-only commits at phase completion.** Agent teams write code but do not commit. The coordinator reviews changes and commits tractable deltas at phase completion.
 - **`milestone.md` is immutable after handoff** — supervisor creates it, coordinator reads but never writes to it. Coordinator progress goes in `status.md`. See [DB-07](./decision-boundaries/07-milestone-ownership.md).
+
+## Memory Lifecycle
+
+> **Architecture:** [DB-18](./decision-boundaries/18-memory-architecture.md). Not yet implemented.
+
+Golden context is the external pattern library that the transformer retrieves from during each cycle (Research Foundations §2, §16). Three lifecycle operations transform it from append-only storage into a memory system:
+
+### Consolidation (Episodic → Semantic)
+
+At milestone completion, after `metrics.md` is written, a consolidation pass extracts cross-milestone patterns from episodic records into `memory.md`.
+
+**Inputs** (episodic, per-milestone): decisions.md (finding categories and dispositions), metrics.md (cycle counts, token usage, incidents), escalation files (classification, resolution), compose.py (phase topology).
+
+**Outputs** (semantic, cross-milestone): Pattern entries in `memory.md` with provenance, reinforcement counts, and content type — recurring quality gate findings, fragile code areas, successful decomposition strategies, cost calibration data.
+
+**Who:** The orchestrator performs structural consolidation (automated — extracting statistics and pattern frequencies). The supervisor adds conceptual annotations during re-entry conversation (DB-16) when presenting completed work to the user.
+
+**Archival**: After consolidation, completed milestone directories retain `milestone.md`, final `status.md`, `metrics.md`, and `compose.py`. Full episodic detail (decisions.md, execution.md, assessment.md, escalations) is preserved in git history only.
+
+### `memory.md` — Operational Memory
+
+Distinct from `understanding.md` (user-validated intent, DB-13). `memory.md` captures system-derived operational patterns. The supervisor reads both at orient but writes them through different protocols.
+
+**Schema:**
+```markdown
+# Operational Memory
+
+## Patterns
+
+### <pattern-name>
+type: <decomposition | quality-gate | cost-calibration | escalation | debt>
+observed: <comma-separated milestone names>
+reinforced: <count>
+last_active: <milestone name>
+invalidated: <milestone name, or empty>
+
+<pattern description — 1-3 sentences>
+
+## Archived
+(Faded or invalidated patterns, preserved for historical query)
+```
+
+**Written by:** Orchestrator (structural patterns at consolidation), Supervisor (conceptual annotations during re-entry)
+**Read by:** Supervisor (at orient), Coordinator (during PLAN cycle only)
+
+### Forgetting (Principled Decay)
+
+Memories decay based on milestone distance, not wall-clock time (FOREVER's model-centric time principle):
+
+- **Active** (default): `last_active` within 5 milestones. Included in scored retrieval.
+- **Fading**: `last_active` 5–10 milestones ago, `reinforced` < 3. Remains in memory.md but excluded from active context. Marked `status: fading`.
+- **Archived**: `last_active` > 10 milestones ago, or explicitly invalidated. Moved to `## Archived` section.
+
+**Temporal invalidation**: When a pattern is contradicted, it gets `invalidated: <milestone>` rather than being deleted. Remains queryable for historical reasoning. Can be reversed if future evidence re-confirms.
+
+**Operational cleanup**: Telemetry JSONL and session transcripts are deleted after consolidation into metrics.md. Episodic files (decisions.md, execution.md, assessment.md) are removed from working tree after consolidation (git history preserves full detail).
+
+### Scored Retrieval (Dynamic Context Assembly)
+
+The static per-cycle read sets (DB-03) become the *minimum* set. `memory.md` is added to the PLAN cycle read set and the supervisor orient read set. Content type (`type:` field) is the primary retrieval signal.
+
+| Cycle | memory.md | Pattern types surfaced |
+|---|---|---|
+| PLAN | Yes | `decomposition`, `cost-calibration`, `debt` |
+| EXECUTE | No | — |
+| ASSESS | Conditional (known recurring findings) | `quality-gate`, `escalation` |
+| VERIFY | No | — |
+| EXIT | No | — |
+| Supervisor orient | Yes (full file) | All types |
+
+Scoring within type: `reinforced:` count (higher = more confident) > `last_active:` distance (closer = more relevant) > `status:` (active > fading; archived excluded).

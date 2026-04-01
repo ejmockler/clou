@@ -33,6 +33,7 @@ WRITE_PERMISSIONS: dict[str, list[str]] = {
         "roadmap.md",
         "requests.md",
         "understanding.md",
+        "memory.md",
         "milestones/*/milestone.md",
         "milestones/*/intents.md",
         "milestones/*/requirements.md",
@@ -55,8 +56,12 @@ WRITE_PERMISSIONS: dict[str, list[str]] = {
         "milestones/*/phases/verification/artifacts/*",
         "milestones/*/handoff.md",
     ],
-    "assessor": [
+    "brutalist": [
         "milestones/*/assessment.md",
+    ],
+    "assess-evaluator": [
+        "milestones/*/assessment.md",
+        "milestones/*/decisions.md",
     ],
 }
 
@@ -326,7 +331,8 @@ def _scoped_permissions(
 AGENT_TIER_MAP: dict[str, str] = {
     "implementer": "worker",
     "verifier": "verifier",
-    "assessor": "assessor",
+    "brutalist": "brutalist",
+    "assess-evaluator": "assess-evaluator",
 }
 
 

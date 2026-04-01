@@ -720,6 +720,51 @@ error: Brutalist MCP unavailable
     assert validate_golden_context(tmp_path, "m1") == []
 
 
+def test_assessment_degraded_status_requires_findings(tmp_path: Path) -> None:
+    """Degraded status proceeds like completed — findings are expected."""
+    content = """\
+# Assessment: implementation
+
+## Summary
+status: degraded
+internal_reviewers: 3
+gate_error: npm 403
+
+## Quality Gate Status
+gate: unavailable
+
+## Internal Reviewers
+- architecture: invoked
+- security: skipped (no auth code)
+- code_quality: invoked
+- test_coverage: invoked
+
+## Findings
+
+### F1: Unused import
+**Severity:** minor
+**Source:** internal/code_quality
+**Finding:** "utils.py imports os but never uses it"
+"""
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "assessment.md", content)
+    assert validate_golden_context(tmp_path, "m1") == []
+
+
+def test_assessment_degraded_missing_findings_is_error(tmp_path: Path) -> None:
+    """Degraded without findings section should error like completed."""
+    content = """\
+# Assessment: implementation
+
+## Summary
+status: degraded
+gate_error: npm 403
+"""
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "assessment.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("missing '## Findings'" in m for m in msgs)
+
+
 def test_assessment_missing_findings_section(tmp_path: Path) -> None:
     content = """\
 # Assessment: implementation

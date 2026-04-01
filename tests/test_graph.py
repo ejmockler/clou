@@ -83,8 +83,16 @@ def test_execute_milestone_entry_point() -> None:
 async def task_a() -> A:
     \"\"\"Do A.\"\"\"
 
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c(b: B) -> C:
+    \"\"\"Do C.\"\"\"
+
 async def execute_milestone():
     a = await task_a()
+    b = await task_b(a)
+    c = await task_c(b)
 """
     assert validate(code) == []
 
@@ -141,7 +149,7 @@ async def execute():
 
 
 def test_helper_function_not_flagged_as_unused() -> None:
-    """Non-async helpers are not task functions — not flagged as unused."""
+    """Non-async helpers are not task functions -- not flagged as unused."""
     code = """\
 def load_config():
     pass
@@ -149,8 +157,16 @@ def load_config():
 async def task_a() -> A:
     \"\"\"Uses config.\"\"\"
 
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c(b: B) -> C:
+    \"\"\"Do C.\"\"\"
+
 async def execute():
     a = await task_a()
+    b = await task_b(a)
+    c = await task_c(b)
 """
     assert validate(code) == []
 
@@ -225,12 +241,16 @@ def test_types_match() -> None:
 async def produce() -> Widget:
     \"\"\"Make a widget.\"\"\"
 
-async def consume(w: Widget) -> Done:
-    \"\"\"Use a widget.\"\"\"
+async def transform(w: Widget) -> Gadget:
+    \"\"\"Transform widget into gadget.\"\"\"
+
+async def consume(g: Gadget) -> Done:
+    \"\"\"Use a gadget.\"\"\"
 
 async def execute():
     w = await produce()
-    d = await consume(w)
+    g = await transform(w)
+    d = await consume(g)
 """
     assert validate(code) == []
 
@@ -244,9 +264,13 @@ async def task_a():
 async def task_b(x):
     \"\"\"No types.\"\"\"
 
+async def task_c(y):
+    \"\"\"No types.\"\"\"
+
 async def execute():
     a = await task_a()
     b = await task_b(a)
+    c = await task_c(b)
 """
     assert validate(code) == []
 
@@ -279,8 +303,16 @@ def test_no_params() -> None:
 async def standalone() -> Result:
     \"\"\"No dependencies.\"\"\"
 
+async def enhance(r: Result) -> Better:
+    \"\"\"Enhance result.\"\"\"
+
+async def finalize(b: Better) -> Done:
+    \"\"\"Finalize.\"\"\"
+
 async def execute():
     r = await standalone()
+    b = await enhance(r)
+    d = await finalize(b)
 """
     assert validate(code) == []
 
@@ -288,11 +320,19 @@ async def execute():
 def test_standalone_await_no_assignment() -> None:
     """await without assignment (e.g., cleanup tasks)."""
     code = """\
-async def cleanup() -> None:
+async def setup() -> Env:
+    \"\"\"Set up.\"\"\"
+
+async def build(e: Env) -> App:
+    \"\"\"Build app.\"\"\"
+
+async def cleanup(a: App) -> None:
     \"\"\"Clean up.\"\"\"
 
 async def execute():
-    await cleanup()
+    e = await setup()
+    a = await build(e)
+    await cleanup(a)
 """
     assert validate(code) == []
 
@@ -527,3 +567,208 @@ async def execute():
     assert set(deps["combine"]) == {"task_a", "task_b"}
     assert deps["task_a"] == []
     assert deps["task_b"] == []
+
+
+# ---------------------------------------------------------------------------
+# @requires decorator edges
+# ---------------------------------------------------------------------------
+
+
+def test_requires_decorator_edges() -> None:
+    """@requires decorator creates ordering edges in the DAG."""
+    code = """\
+async def setup() -> Schema:
+    \"\"\"Create schema.\"\"\"
+
+@requires("setup")
+async def migrate(s: Schema) -> Migrated:
+    \"\"\"Run migrations after setup.\"\"\"
+
+async def seed(m: Migrated) -> Seeded:
+    \"\"\"Seed data.\"\"\"
+
+async def execute():
+    s = await setup()
+    m = await migrate(s)
+    d = await seed(m)
+"""
+    tasks, deps = extract_dag_data(code)
+    # @requires("setup") adds setup as a dependency of migrate
+    assert "setup" in deps["migrate"]
+
+
+def test_requires_decorator_validates_cleanly() -> None:
+    """A well-formed compose.py with @requires validates without errors."""
+    code = """\
+async def setup() -> Schema:
+    \"\"\"Create schema.\"\"\"
+
+@requires("setup")
+async def migrate(s: Schema) -> Migrated:
+    \"\"\"Run migrations.\"\"\"
+
+async def seed(m: Migrated) -> Seeded:
+    \"\"\"Seed data.\"\"\"
+
+async def execute():
+    s = await setup()
+    m = await migrate(s)
+    d = await seed(m)
+"""
+    assert validate(code) == []
+
+
+# ---------------------------------------------------------------------------
+# @needs decorator
+# ---------------------------------------------------------------------------
+
+
+def test_needs_decorator_parses_without_error() -> None:
+    """@needs decorator is parsed without causing validation errors."""
+    code = """\
+async def setup() -> Schema:
+    \"\"\"Create schema.\"\"\"
+
+@needs("config/database.yml")
+async def migrate(s: Schema) -> Migrated:
+    \"\"\"Run migrations.\"\"\"
+
+async def seed(m: Migrated) -> Seeded:
+    \"\"\"Seed data.\"\"\"
+
+async def execute():
+    s = await setup()
+    m = await migrate(s)
+    d = await seed(m)
+"""
+    assert validate(code) == []
+
+
+# ---------------------------------------------------------------------------
+# Width check
+# ---------------------------------------------------------------------------
+
+
+def test_width_warning_no_gather() -> None:
+    """4-task graph with no gather() emits a width warning."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b() -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c() -> C:
+    \"\"\"Do C.\"\"\"
+
+async def task_d() -> D:
+    \"\"\"Do D.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b()
+    c = await task_c()
+    d = await task_d()
+"""
+    errors = validate(code)
+    assert any("No concurrent phases" in e and "4-task graph" in e for e in errors)
+
+
+def test_width_no_warning_with_gather() -> None:
+    """4-task graph with gather() does not emit a width warning."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b() -> B:
+    \"\"\"Do B.\"\"\"
+
+async def combine(a: A, b: B) -> C:
+    \"\"\"Combine.\"\"\"
+
+async def finalize(c: C) -> D:
+    \"\"\"Finalize.\"\"\"
+
+async def execute():
+    a, b = await gather(task_a(), task_b())
+    c = await combine(a, b)
+    d = await finalize(c)
+"""
+    errors = validate(code)
+    assert not any("No concurrent phases" in e for e in errors)
+
+
+def test_width_serial_data_flow_no_warning() -> None:
+    """4-task fully serial graph where each takes previous output -- no warning."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c(b: B) -> C:
+    \"\"\"Do C.\"\"\"
+
+async def task_d(c: C) -> D:
+    \"\"\"Do D.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b(a)
+    c = await task_c(b)
+    d = await task_d(c)
+"""
+    errors = validate(code)
+    assert not any("No concurrent phases" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Minimum decomposition
+# ---------------------------------------------------------------------------
+
+
+def test_min_decomposition_error() -> None:
+    """2-task graph (excluding verify) emits under-decomposed error."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def verify(b: B) -> Handoff:
+    \"\"\"Verify.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b(a)
+    h = await verify(b)
+"""
+    errors = validate(code)
+    assert any("Under-decomposed milestone" in e for e in errors)
+
+
+def test_min_decomposition_passes_with_enough_tasks() -> None:
+    """3-task graph (excluding verify) passes minimum decomposition."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c(b: B) -> C:
+    \"\"\"Do C.\"\"\"
+
+async def verify(c: C) -> Handoff:
+    \"\"\"Verify.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b(a)
+    c = await task_c(b)
+    h = await verify(c)
+"""
+    errors = validate(code)
+    assert not any("Under-decomposed" in e for e in errors)

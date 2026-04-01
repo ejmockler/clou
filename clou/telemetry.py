@@ -272,6 +272,73 @@ def write_milestone_summary(
                     f"| — |"
                 )
 
+    # -- Quality gate results (DB-18 telemetry extension) --
+    qg_events = [
+        r for r in records
+        if r.get("event") == "quality_gate.result"
+        and r.get("milestone") == milestone
+    ]
+    if qg_events:
+        lines.extend([
+            "",
+            "## Quality Gate",
+            "",
+            "| Cycle | Tools Invoked | Tools Unavailable | Tool Count |",
+            "|-------|---------------|-------------------|------------|",
+        ])
+        for qg in qg_events:
+            invoked = ", ".join(qg.get("tools_invoked", []))
+            unavail = ", ".join(qg.get("tools_unavailable", []))
+            lines.append(
+                f"| {qg.get('cycle_num', '?')} "
+                f"| {invoked or 'none'} "
+                f"| {unavail or 'none'} "
+                f"| {qg.get('finding_count', 0)} |"
+            )
+
+    # -- Rework events (DB-18 telemetry extension) --
+    rework_events = [
+        r for r in records
+        if r.get("event") == "cycle.rework"
+        and r.get("milestone") == milestone
+    ]
+    if rework_events:
+        lines.extend([
+            "",
+            "## Rework",
+            "",
+            "| Cycle | From | To | Phase |",
+            "|-------|------|----|-------|",
+        ])
+        for rw in rework_events:
+            lines.append(
+                f"| {rw.get('cycle_num', '?')} "
+                f"| {rw.get('from_step', '?')} "
+                f"| {rw.get('to_step', '?')} "
+                f"| {rw.get('phase', '?')} |"
+            )
+
+    # -- Escalation summary (DB-18 telemetry extension) --
+    esc_events = [
+        r for r in records
+        if r.get("event") == "escalation.created"
+        and r.get("milestone") == milestone
+    ]
+    if esc_events:
+        lines.extend([
+            "",
+            "## Escalations",
+            "",
+            "| Cycle | Classification | Severity |",
+            "|-------|----------------|----------|",
+        ])
+        for esc in esc_events:
+            lines.append(
+                f"| {esc.get('cycle_num', '?')} "
+                f"| {esc.get('classification', '?')} "
+                f"| {esc.get('severity', '?')} |"
+            )
+
     # -- Incidents --
     if incidents:
         lines.extend(["", "## Incidents", ""])

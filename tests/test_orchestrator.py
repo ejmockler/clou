@@ -1250,6 +1250,189 @@ class TestRunCoordinator:
 
 
 # ---------------------------------------------------------------------------
+# Cycle-boundary pause_on_user_message flag
+# ---------------------------------------------------------------------------
+
+
+class TestCycleBoundaryPauseFlag:
+    """Test that pause_on_user_message controls whether user messages
+    pause the coordinator at cycle boundaries.
+
+    The /stop check, budget check, and cycle limit check must ALWAYS
+    work regardless of the flag.
+    """
+
+    @pytest.fixture
+    def project_dir(self, tmp_path: Path) -> Path:
+        """Create minimal .clou structure."""
+        active = tmp_path / ".clou" / "active"
+        active.mkdir(parents=True)
+        prompts = tmp_path / ".clou" / "prompts"
+        prompts.mkdir(parents=True)
+        (prompts / "coordinator-system.xml").write_text("<system/>")
+        return tmp_path
+
+    def _make_template(self, *, pause: bool, budget_usd: float | None = None) -> Any:
+        """Return a mock template with the given pause_on_user_message."""
+        tmpl = MagicMock()
+        tmpl.name = "test-template"
+        tmpl.pause_on_user_message = pause
+        tmpl.budget_usd = budget_usd
+        tmpl.quality_gates = []
+        return tmpl
+
+    def _make_app_with_queue(self) -> MagicMock:
+        """Build a mock app with a populated _user_input_queue (deque)."""
+        import asyncio
+        from collections import deque
+
+        mock_app = MagicMock()
+        mock_app._user_input_queue = deque(["hello from user"])
+        mock_app._stop_requested = asyncio.Event()
+        mock_app.post_message = MagicMock()
+        return mock_app
+
+    @pytest.mark.asyncio
+    async def test_default_does_not_pause_for_user_messages(
+        self, project_dir: Path,
+    ) -> None:
+        """With pause_on_user_message=False (default), pending user messages
+        do NOT pause the coordinator — it continues to COMPLETE."""
+        import clou.orchestrator as orch
+
+        mock_app = self._make_app_with_queue()
+
+        with (
+            patch(
+                f"{_P}.load_template",
+                return_value=self._make_template(pause=False),
+            ),
+            patch(
+                f"{_P}.determine_next_cycle",
+                return_value=("COMPLETE", []),
+            ),
+            patch.object(orch, "_active_app", mock_app),
+        ):
+            result = await run_coordinator(
+                project_dir, "auth", app=mock_app,
+            )
+
+        assert result == "completed"
+
+    @pytest.mark.asyncio
+    async def test_pause_true_pauses_for_user_messages(
+        self, project_dir: Path,
+    ) -> None:
+        """With pause_on_user_message=True, pending user messages
+        pause the coordinator at the cycle boundary."""
+        import clou.orchestrator as orch
+
+        mock_app = self._make_app_with_queue()
+
+        with (
+            patch(
+                f"{_P}.load_template",
+                return_value=self._make_template(pause=True),
+            ),
+            patch(
+                f"{_P}.determine_next_cycle",
+                return_value=("EXECUTE", ["status.md"]),
+            ),
+            patch.object(orch, "_active_app", mock_app),
+        ):
+            result = await run_coordinator(
+                project_dir, "auth", app=mock_app,
+            )
+
+        assert result == "paused"
+
+    @pytest.mark.asyncio
+    async def test_stop_always_works_regardless_of_flag(
+        self, project_dir: Path,
+    ) -> None:
+        """The /stop check fires even when pause_on_user_message=False."""
+        import asyncio
+
+        import clou.orchestrator as orch
+
+        mock_app = MagicMock()
+        mock_app._stop_requested = asyncio.Event()
+        mock_app._stop_requested.set()
+        mock_app._user_input_queue = MagicMock()  # not a deque — won't match
+
+        with (
+            patch(
+                f"{_P}.load_template",
+                return_value=self._make_template(pause=False),
+            ),
+            patch.object(orch, "_active_app", mock_app),
+        ):
+            result = await run_coordinator(
+                project_dir, "auth", app=mock_app,
+            )
+
+        assert result == "stopped"
+
+    @pytest.mark.asyncio
+    async def test_budget_always_checked_regardless_of_flag(
+        self, project_dir: Path,
+    ) -> None:
+        """Budget exhaustion fires even when pause_on_user_message=False."""
+        import clou.orchestrator as orch
+
+        mock_app = self._make_app_with_queue()
+        # Set cumulative cost to exceed budget.
+        orch._cumulative_cost_usd["auth"] = 10.0
+
+        try:
+            with (
+                patch(
+                    f"{_P}.load_template",
+                    return_value=self._make_template(
+                        pause=False, budget_usd=5.0,
+                    ),
+                ),
+                patch(
+                    f"{_P}.determine_next_cycle",
+                    return_value=("EXECUTE", ["status.md"]),
+                ),
+                patch(f"{_P}.read_cycle_count", return_value=1),
+                patch.object(orch, "_active_app", mock_app),
+            ):
+                result = await run_coordinator(
+                    project_dir, "auth", app=mock_app,
+                )
+        finally:
+            orch._cumulative_cost_usd.pop("auth", None)
+
+        assert result == "escalated_budget"
+
+    @pytest.mark.asyncio
+    async def test_cycle_limit_always_checked_regardless_of_flag(
+        self, project_dir: Path,
+    ) -> None:
+        """Cycle limit fires even when pause_on_user_message=False."""
+        with (
+            patch(
+                f"{_P}.load_template",
+                return_value=self._make_template(pause=False),
+            ),
+            patch(
+                f"{_P}.determine_next_cycle",
+                return_value=("PLAN", ["milestone.md"]),
+            ),
+            patch(f"{_P}.read_cycle_count", return_value=20),
+            patch(
+                f"{_P}.write_cycle_limit_escalation",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await run_coordinator(project_dir, "auth")
+
+        assert result == "escalated_cycle_limit"
+
+
+# ---------------------------------------------------------------------------
 # run_supervisor — resume failure feedback
 # ---------------------------------------------------------------------------
 
@@ -1570,3 +1753,110 @@ class TestCanUseTool:
             ToolPermissionContext(signal=None, suggestions=[]),
         )
         assert result.behavior == "allow"
+
+
+# ---------------------------------------------------------------------------
+# ask_user MCP tool — structured choices
+# ---------------------------------------------------------------------------
+
+
+class TestAskUserTool:
+    """The ask_user MCP tool passes choices through to the gate."""
+
+    @staticmethod
+    def _extract_ask_user_handler(tmp_path: Path) -> tuple:
+        """Build the MCP server and extract the ask_user tool handler + gate."""
+        from claude_agent_sdk import SdkMcpTool
+
+        from clou.gate import UserGate
+        from clou.orchestrator import _build_mcp_server
+
+        gate = UserGate()
+        captured_tools: list[SdkMcpTool[Any]] = []
+
+        original_create = None
+        try:
+            from claude_agent_sdk import create_sdk_mcp_server as _orig
+
+            original_create = _orig
+        except ImportError:
+            pass
+
+        def _capture_create(name: str, **kwargs: Any) -> Any:
+            tools = kwargs.get("tools", [])
+            captured_tools.extend(tools or [])
+            return original_create(name, **kwargs)
+
+        with patch(f"{_P}.create_sdk_mcp_server", side_effect=_capture_create):
+            _build_mcp_server(tmp_path, gate=gate)
+
+        ask_user = next(t for t in captured_tools if t.name == "ask_user")
+        return ask_user.handler, gate
+
+    @pytest.mark.asyncio
+    async def test_ask_user_no_choices(self, tmp_path: Path) -> None:
+        """ask_user without choices opens gate with no choices."""
+        handler, gate = self._extract_ask_user_handler(tmp_path)
+
+        import asyncio
+
+        async def _respond_soon() -> None:
+            await asyncio.sleep(0)
+            gate.respond("hello")
+
+        task = asyncio.create_task(_respond_soon())
+        result = await handler({"question": "How are you?"})
+        await task
+        assert result == {"content": [{"type": "text", "text": "hello"}]}
+        # Question was passed through to gate
+        # (gate is now closed, so question is None, but it was set during open)
+
+    @pytest.mark.asyncio
+    async def test_ask_user_with_choices_appends_open_ended(
+        self, tmp_path: Path,
+    ) -> None:
+        """ask_user auto-appends an open-ended option to the choices list."""
+        handler, gate = self._extract_ask_user_handler(tmp_path)
+
+        import asyncio
+
+        async def _respond_soon() -> None:
+            # Give the handler time to call gate.open()
+            await asyncio.sleep(0)
+            # Verify question and choices were set with auto-appended option
+            assert gate.question == "Pick one"
+            assert gate.choices is not None
+            assert gate.choices == [
+                "A",
+                "B",
+                "Something else \u2014 I'll type my answer",
+            ]
+            gate.respond("A")
+
+        task = asyncio.create_task(_respond_soon())
+        result = await handler({"question": "Pick one", "choices": ["A", "B"]})
+        await task
+        assert result == {"content": [{"type": "text", "text": "A"}]}
+
+    @pytest.mark.asyncio
+    async def test_ask_user_no_gate_returns_error(self, tmp_path: Path) -> None:
+        """ask_user returns an error when no gate is available."""
+        from claude_agent_sdk import SdkMcpTool
+
+        from clou.orchestrator import _build_mcp_server
+
+        captured_tools: list[SdkMcpTool[Any]] = []
+
+        from claude_agent_sdk import create_sdk_mcp_server as _orig
+
+        def _capture_create(name: str, **kwargs: Any) -> Any:
+            tools = kwargs.get("tools", [])
+            captured_tools.extend(tools or [])
+            return _orig(name, **kwargs)
+
+        with patch(f"{_P}.create_sdk_mcp_server", side_effect=_capture_create):
+            _build_mcp_server(tmp_path, gate=None)
+
+        ask_user = next(t for t in captured_tools if t.name == "ask_user")
+        result = await ask_user.handler({})
+        assert result["is_error"] is True

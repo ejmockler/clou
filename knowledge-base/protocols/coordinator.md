@@ -26,8 +26,18 @@ The coordinator is NOT a dispatcher. It does not simply assign work and collect 
    f. Identify dependency structure and independent workstreams
    g. Write compose.py — the typed-function call graph for the milestone
       - Each task is an async function with typed params and return type
-      - Determine graph width: independent workstreams use gather(),
+      - Concurrency is the default — gather() is the common case.
+        Decompose with width: independent workstreams use gather(),
         serial dependencies use sequential await
+      - Serial chains require justification — each sequential dependency
+        must trace to a data or environmental requirement
+      - Minimum 3 substantive phases (excluding verification)
+      - compose.py supports three edge types:
+        · Data dependencies — function arguments (return value flows to param)
+        · Ordering constraints — @requires decorator (must complete first,
+          but no data flows)
+        · Artifact dependencies — @needs decorator (depends on a file or
+          resource produced by another task)
       - Reason about critical path — minimize the longest sequential chain
       - Phase boundaries are marked with comments
       - The orchestrator validates via AST (cycles, types, completeness)
@@ -48,25 +58,35 @@ The coordinator is NOT a dispatcher. It does not simply assign work and collect 
    e. Park branches blocked on credential_request escalations
    f. Write active/coordinator.md checkpoint
 
-4. ASSESS
-   a. Run quality gate tools on completed work — invoke the assess agent
-      defined by the active harness template (DB-11). For software-construction:
-      query all relevant Brutalist domains (roast_codebase, roast_architecture,
-      roast_security, roast_infrastructure, roast_dependencies,
-      roast_test_coverage, roast_file_structure — based on what changed).
-   b. Evaluate quality gate feedback critically against:
-      - Milestone requirements and constraints
-      - Delegated authority boundaries
-      - Project-level principles from project.md
-   c. For each finding:
-      - Valid feedback → create rework tasks, loop to EXECUTE
+4. ASSESS (two-dispatch protocol)
+   a. First dispatch — quality gate agent (read-only):
+      - Invoke the assess agent defined by the active harness template (DB-11)
+      - For software-construction: query all relevant Brutalist domains
+        (roast_codebase, roast_architecture, roast_security,
+        roast_infrastructure, roast_dependencies, roast_test_coverage,
+        roast_file_structure — based on what changed)
+      - Agent is read-only: invokes quality gates, writes assessment.md
+        with raw findings. No classification, no judgment — raw signal only.
+   b. Second dispatch — assessor-evaluator agent:
+      - Reads assessment.md (raw findings from first dispatch)
+      - Classifies each finding against requirements.md + intents.md
+      - Classification schema:
+        · valid — finding addresses a real gap vs. requirements (→ rework)
+        · noise — finding is stylistic, out-of-scope, or already addressed (→ dismiss)
+        · architectural — finding implies a structural change beyond
+          delegated authority (→ escalate)
+        · security — always classified as valid regardless of scope
+      - Writes decisions.md with classified findings and reasoning
+   c. Coordinator reads decisions.md for routing:
+      - valid findings → create rework tasks, loop to EXECUTE
         If repeated rework on the same task fails, the coordinator may
         re-decompose the failed task into finer subtasks rather than
         retrying at the same granularity (ADaPT pattern — see Research
         Foundations §9). Re-decomposition updates compose.py and is
         re-validated by the orchestrator via AST parsing.
-      - Invalid feedback → log override reasoning in decisions.md
-      - Exceeds authority → file escalation
+      - noise findings → logged as dismissed in decisions.md (no action)
+      - architectural findings → file escalation
+      - security findings → always rework, never dismiss
    d. Write active/coordinator.md checkpoint
 
 5. VERIFY (see Verification Protocol)

@@ -155,7 +155,8 @@ def test_load_template_valid() -> None:
     tmpl = load_template("software-construction")
     assert tmpl.name == "software-construction"
     assert "implementer" in tmpl.agents
-    assert "assessor" in tmpl.agents
+    assert "brutalist" in tmpl.agents
+    assert "assess-evaluator" in tmpl.agents
     assert "verifier" in tmpl.agents
 
 
@@ -206,15 +207,15 @@ def test_software_template_tools_match_orchestrator() -> None:
     """Template agent tools match orchestrator._build_agents() exactly."""
     from clou.harnesses.software_construction import template
 
-    # These are the exact tool lists from orchestrator.py:158-232.
+    # These are the exact tool lists from the template.
     expected_tools = {
         "implementer": [
             "Read", "Write", "Edit", "MultiEdit",
             "Bash", "Grep", "Glob",
             "WebSearch", "WebFetch",
         ],
-        "assessor": [
-            "Read", "Write", "Bash", "Grep", "Glob",
+        "brutalist": [
+            "Read", "Write", "Grep", "Glob",
             "mcp__brutalist__roast_codebase",
             "mcp__brutalist__roast_architecture",
             "mcp__brutalist__roast_security",
@@ -223,6 +224,11 @@ def test_software_template_tools_match_orchestrator() -> None:
             "mcp__brutalist__roast_file_structure",
             "mcp__brutalist__roast_dependencies",
             "mcp__brutalist__roast_test_coverage",
+            "mcp__brutalist__roast_cli_debate",
+            "mcp__brutalist__brutalist_discover",
+        ],
+        "assess-evaluator": [
+            "Read", "Write", "Grep", "Glob",
         ],
         "verifier": [
             "Read", "Write", "Bash", "Grep", "Glob",
@@ -247,7 +253,7 @@ def test_software_template_tools_match_orchestrator() -> None:
 def test_software_template_models_match_orchestrator() -> None:
     from clou.harnesses.software_construction import template
 
-    for agent_name in ("implementer", "assessor", "verifier"):
+    for agent_name in ("implementer", "brutalist", "assess-evaluator", "verifier"):
         assert template.agents[agent_name].model == "opus", (
             f"{agent_name} model mismatch"
         )

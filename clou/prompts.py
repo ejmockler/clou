@@ -97,7 +97,7 @@ def build_cycle_prompt(
     """
     milestone_prefix = f".clou/milestones/{milestone}"
     file_list = "\n".join(
-        f"- .clou/{f}" if f == "project.md" else f"- {milestone_prefix}/{f}"
+        f"- .clou/{f}" if f in ("project.md", "memory.md") else f"- {milestone_prefix}/{f}"
         for f in read_set
     )
     protocol_file = str(_BUNDLED_PROMPTS / f"coordinator-{cycle_type.lower()}.md")

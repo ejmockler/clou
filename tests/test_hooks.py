@@ -552,12 +552,12 @@ def test_active_coordinator_md_root_denied() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Assessor write boundaries
+# Brutalist write boundaries
 # ---------------------------------------------------------------------------
 
 
-def test_assessor_allowed_assessment_md(tmp_path: Path) -> None:
-    """Assessor subagent can write assessment.md."""
+def test_brutalist_allowed_assessment_md(tmp_path: Path) -> None:
+    """Brutalist subagent can write assessment.md."""
     hook = _get_pre_hook("coordinator", tmp_path)
     path = tmp_path / ".clou" / "milestones" / "m1" / "assessment.md"
     result = _run(
@@ -565,7 +565,7 @@ def test_assessor_allowed_assessment_md(tmp_path: Path) -> None:
             {
                 "tool_name": "Write",
                 "tool_input": {"file_path": str(path)},
-                "agent_type": "assessor",
+                "agent_type": "brutalist",
             },
             "tool-1",
             {},
@@ -574,8 +574,8 @@ def test_assessor_allowed_assessment_md(tmp_path: Path) -> None:
     assert _is_allowed(result)
 
 
-def test_assessor_blocked_from_execution_md(tmp_path: Path) -> None:
-    """Assessor subagent cannot write execution.md."""
+def test_brutalist_blocked_from_execution_md(tmp_path: Path) -> None:
+    """Brutalist subagent cannot write execution.md."""
     hook = _get_pre_hook("coordinator", tmp_path)
     path = tmp_path / ".clou" / "milestones" / "m1" / "phases" / "p1" / "execution.md"
     result = _run(
@@ -583,18 +583,18 @@ def test_assessor_blocked_from_execution_md(tmp_path: Path) -> None:
             {
                 "tool_name": "Write",
                 "tool_input": {"file_path": str(path)},
-                "agent_type": "assessor",
+                "agent_type": "brutalist",
             },
             "tool-1",
             {},
         )
     )
     assert _is_denied(result)
-    assert "assessor" in _deny_reason(result)
+    assert "brutalist" in _deny_reason(result)
 
 
-def test_assessor_blocked_from_decisions_md(tmp_path: Path) -> None:
-    """Assessor subagent cannot write decisions.md."""
+def test_brutalist_blocked_from_decisions_md(tmp_path: Path) -> None:
+    """Brutalist subagent cannot write decisions.md."""
     hook = _get_pre_hook("coordinator", tmp_path)
     path = tmp_path / ".clou" / "milestones" / "m1" / "decisions.md"
     result = _run(
@@ -602,7 +602,7 @@ def test_assessor_blocked_from_decisions_md(tmp_path: Path) -> None:
             {
                 "tool_name": "Write",
                 "tool_input": {"file_path": str(path)},
-                "agent_type": "assessor",
+                "agent_type": "brutalist",
             },
             "tool-1",
             {},
@@ -611,8 +611,8 @@ def test_assessor_blocked_from_decisions_md(tmp_path: Path) -> None:
     assert _is_denied(result)
 
 
-def test_assessor_blocked_from_compose_py(tmp_path: Path) -> None:
-    """Assessor subagent cannot write compose.py."""
+def test_brutalist_blocked_from_compose_py(tmp_path: Path) -> None:
+    """Brutalist subagent cannot write compose.py."""
     hook = _get_pre_hook("coordinator", tmp_path)
     path = tmp_path / ".clou" / "milestones" / "m1" / "compose.py"
     result = _run(
@@ -620,7 +620,84 @@ def test_assessor_blocked_from_compose_py(tmp_path: Path) -> None:
             {
                 "tool_name": "Write",
                 "tool_input": {"file_path": str(path)},
-                "agent_type": "assessor",
+                "agent_type": "brutalist",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    assert _is_denied(result)
+
+
+# ---------------------------------------------------------------------------
+# Assess-evaluator write boundaries
+# ---------------------------------------------------------------------------
+
+
+def test_assess_evaluator_allowed_assessment_md(tmp_path: Path) -> None:
+    """Assess-evaluator subagent can write assessment.md."""
+    hook = _get_pre_hook("coordinator", tmp_path)
+    path = tmp_path / ".clou" / "milestones" / "m1" / "assessment.md"
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(path)},
+                "agent_type": "assess-evaluator",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    assert _is_allowed(result)
+
+
+def test_assess_evaluator_allowed_decisions_md(tmp_path: Path) -> None:
+    """Assess-evaluator subagent can write decisions.md."""
+    hook = _get_pre_hook("coordinator", tmp_path)
+    path = tmp_path / ".clou" / "milestones" / "m1" / "decisions.md"
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(path)},
+                "agent_type": "assess-evaluator",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    assert _is_allowed(result)
+
+
+def test_assess_evaluator_blocked_from_execution_md(tmp_path: Path) -> None:
+    """Assess-evaluator subagent cannot write execution.md."""
+    hook = _get_pre_hook("coordinator", tmp_path)
+    path = tmp_path / ".clou" / "milestones" / "m1" / "phases" / "p1" / "execution.md"
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(path)},
+                "agent_type": "assess-evaluator",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    assert _is_denied(result)
+
+
+def test_assess_evaluator_blocked_from_compose_py(tmp_path: Path) -> None:
+    """Assess-evaluator subagent cannot write compose.py."""
+    hook = _get_pre_hook("coordinator", tmp_path)
+    path = tmp_path / ".clou" / "milestones" / "m1" / "compose.py"
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(path)},
+                "agent_type": "assess-evaluator",
             },
             "tool-1",
             {},
@@ -1475,7 +1552,8 @@ def test_agent_tier_map_covers_all_agent_definitions() -> None:
         assert AGENT_TIER_MAP == {
             "implementer": "worker",
             "verifier": "verifier",
-            "assessor": "assessor",
+            "brutalist": "brutalist",
+            "assess-evaluator": "assess-evaluator",
         }
         return
 

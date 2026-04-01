@@ -16,11 +16,12 @@ Public API:
 
 from __future__ import annotations
 
+import ast as _ast
 import asyncio
 import fnmatch
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -183,14 +184,23 @@ def determine_next_cycle(
     ASSESS cycles had zero accepted findings, rework is skipped and the
     cycle advances to VERIFY.
     """
+    # PLAN read set includes memory.md when it exists (DB-18 D4).
+    # checkpoint_path: .clou/milestones/{ms}/active/coordinator.md
+    # memory.md: .clou/memory.md
+    _plan_set = ["milestone.md", "intents.md", "requirements.md", "project.md"]
+    # active/ -> ms/ -> milestones/ -> .clou/
+    _clou_dir = checkpoint_path.parent.parent.parent.parent
+    if (_clou_dir / "memory.md").exists():
+        _plan_set.append("memory.md")
+
     if not checkpoint_path.exists():
-        return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
+        return "PLAN", _plan_set
 
     checkpoint = parse_checkpoint(checkpoint_path.read_text())
 
     match checkpoint.next_step:
         case "PLAN":
-            return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
+            return "PLAN", _plan_set
         case "EXECUTE" | "EXECUTE (rework)" | "EXECUTE (additional verification)":
             # Defense-in-depth: reject path traversal in current_phase.
             if ".." in checkpoint.current_phase or "/" in checkpoint.current_phase:
@@ -1079,3 +1089,629 @@ def compact_decisions(
     result = preamble + "".join(recent) + "\n".join(compacted_lines)
     path.write_text(result, encoding="utf-8")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Memory consolidation (DB-18)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MemoryPattern:
+    """A single pattern entry in memory.md."""
+
+    name: str
+    type: str  # decomposition | quality-gate | cost-calibration | escalation | debt
+    observed: list[str] = field(default_factory=list)
+    reinforced: int = 1
+    last_active: str = ""
+    invalidated: str = ""
+    invalidation_reason: str = ""
+    status: str = "active"  # active | fading | archived
+    description: str = ""
+
+
+#: Known metadata field names in memory.md pattern entries.
+_MEMORY_FIELDS = frozenset({
+    "type", "observed", "reinforced", "last_active",
+    "invalidated", "invalidation_reason", "status",
+})
+
+
+def _parse_memory(content: str) -> list[MemoryPattern]:
+    """Parse memory.md into structured pattern entries."""
+    patterns: list[MemoryPattern] = []
+    # Split on ### headers (pattern entries).
+    sections = re.split(r"(?m)^### ", content)
+    for section in sections[1:]:  # skip preamble
+        lines = section.strip().split("\n")
+        if not lines:
+            continue
+        name = lines[0].strip()
+        fields: dict[str, str] = {}
+        desc_lines: list[str] = []
+        for line in lines[1:]:
+            # Stop at section headers (## Archived, ## Patterns, etc.)
+            if line.startswith("## "):
+                break
+            m = re.match(r"^(\w[\w_]*):\s*(.+)$", line)
+            # Only treat as a field if the key is in the known set.
+            if m and m.group(1) in _MEMORY_FIELDS:
+                fields[m.group(1)] = m.group(2).strip()
+            elif line.strip():
+                desc_lines.append(line.strip())
+
+        observed_raw = fields.get("observed", "")
+        observed = [o.strip() for o in observed_raw.split(",") if o.strip()]
+
+        patterns.append(MemoryPattern(
+            name=name,
+            type=fields.get("type", ""),
+            observed=observed,
+            reinforced=_safe_int(fields.get("reinforced", "1"), 1),
+            last_active=fields.get("last_active", ""),
+            invalidated=fields.get("invalidated", ""),
+            invalidation_reason=fields.get("invalidation_reason", ""),
+            status=fields.get("status", "active"),
+            description=" ".join(desc_lines),
+        ))
+    return patterns
+
+
+def _render_memory(patterns: list[MemoryPattern]) -> str:
+    """Render pattern entries back to memory.md format."""
+    lines = ["# Operational Memory", "", "## Patterns", ""]
+
+    active = [p for p in patterns if p.status == "active"]
+    fading = [p for p in patterns if p.status == "fading"]
+    archived = [p for p in patterns if p.status == "archived"]
+
+    for p in active + fading:
+        lines.append(f"### {p.name}")
+        lines.append(f"type: {p.type}")
+        lines.append(f"observed: {', '.join(p.observed)}")
+        lines.append(f"reinforced: {p.reinforced}")
+        lines.append(f"last_active: {p.last_active}")
+        if p.invalidated:
+            lines.append(f"invalidated: {p.invalidated}")
+            if p.invalidation_reason:
+                lines.append(f"invalidation_reason: {p.invalidation_reason}")
+        if p.status == "fading":
+            lines.append(f"status: fading")
+        lines.append("")
+        if p.description:
+            lines.append(p.description)
+        lines.append("")
+
+    if archived:
+        lines.append("## Archived")
+        lines.append("")
+        for p in archived:
+            lines.append(f"### {p.name}")
+            lines.append(f"type: {p.type}")
+            lines.append(f"observed: {', '.join(p.observed)}")
+            lines.append(f"reinforced: {p.reinforced}")
+            lines.append(f"last_active: {p.last_active}")
+            if p.invalidated:
+                lines.append(f"invalidated: {p.invalidated}")
+                if p.invalidation_reason:
+                    lines.append(f"invalidation_reason: {p.invalidation_reason}")
+            lines.append(f"status: archived")
+            lines.append("")
+            if p.description:
+                lines.append(p.description)
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def _parse_metrics_header(content: str) -> dict[str, str]:
+    """Extract key: value pairs from the metrics.md header."""
+    fields: dict[str, str] = {}
+    for line in content.split("\n"):
+        if line.startswith("#"):
+            continue
+        m = re.match(r"^(\w[\w_]*):\s*(.+)$", line)
+        if m:
+            fields[m.group(1)] = m.group(2).strip()
+        elif line.strip() == "":
+            # Stop at first blank line after header block.
+            if fields:
+                break
+    return fields
+
+
+def _count_metrics_section_rows(content: str, section_header: str) -> int:
+    """Count data rows in a metrics.md table section.
+
+    Skips the header row and separator row. Returns 0 if section is absent.
+    """
+    count = 0
+    in_section = False
+    for line in content.split("\n"):
+        if line.strip() == section_header:
+            in_section = True
+            continue
+        if in_section and line.startswith("##"):
+            break
+        if in_section and line.startswith("|") and not line.startswith("|--"):
+            # Skip the column header row (contains letters).
+            cells = [c.strip() for c in line.split("|") if c.strip()]
+            if cells and not all(c.replace(" ", "").isalpha() for c in cells):
+                count += 1
+    return count
+
+
+def _count_qg_unavailable(content: str) -> int:
+    """Count quality gate tool unavailability events from ## Quality Gate table.
+
+    The table has columns: Cycle | Tools Invoked | Tools Unavailable | Tool Count.
+    Returns the number of rows where Tools Unavailable is not 'none'.
+    """
+    count = 0
+    in_section = False
+    header_skipped = False
+    for line in content.split("\n"):
+        if line.strip() == "## Quality Gate":
+            in_section = True
+            continue
+        if in_section and line.startswith("##"):
+            break
+        if in_section and line.startswith("|") and not line.startswith("|--"):
+            if not header_skipped:
+                header_skipped = True
+                continue
+            cells = [c.strip() for c in line.split("|")]
+            # Tools Unavailable is the 4th column (index 3 after split).
+            if len(cells) >= 4 and cells[3] != "none":
+                count += 1
+    return count
+
+
+def _parse_cycle_types(content: str) -> list[str]:
+    """Extract cycle type sequence from the metrics.md Cycles table."""
+    types: list[str] = []
+    in_table = False
+    for line in content.split("\n"):
+        if "## Cycles" in line:
+            in_table = True
+            continue
+        if in_table and line.startswith("##"):
+            break
+        if in_table and line.startswith("|") and not line.startswith("|--") and "Type" not in line:
+            cells = [c.strip() for c in line.split("|")]
+            if len(cells) >= 3:
+                types.append(cells[2])  # Type column
+    return types
+
+
+def _analyze_compose(compose_path: Path) -> tuple[int, bool]:
+    """Analyze compose.py topology via graph.py's existing AST infrastructure.
+
+    Returns (phase_count, has_gather). Uses extract_dag_data() from
+    clou.graph (the canonical AST analysis, already validated by DB-02).
+    """
+    if not compose_path.exists():
+        return 0, False
+
+    try:
+        from clou.graph import extract_dag_data
+
+        source = compose_path.read_text(encoding="utf-8")
+        tasks, deps = extract_dag_data(source)
+    except (OSError, SyntaxError, Exception):
+        return 0, False
+
+    # Phase count: extract_dag_data excludes execute/execute_milestone
+    # but includes verify. Filter it out — it's infrastructure, not a phase.
+    phase_count = sum(1 for t in tasks if t["name"] != "verify")
+
+    # Detect gather: look for tasks with shared dependencies (parallel).
+    # If multiple tasks have the same set of deps (or no deps), they
+    # were likely in a gather() group.  Cross-check via AST for gather().
+    has_gather = False
+    try:
+        tree = _ast.parse(source)
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.AsyncFunctionDef) and node.name in (
+                "execute", "execute_milestone",
+            ):
+                for child in _ast.walk(node):
+                    if isinstance(child, _ast.Call):
+                        func = child.func
+                        if (
+                            isinstance(func, _ast.Name) and func.id == "gather"
+                        ) or (
+                            isinstance(func, _ast.Attribute) and func.attr == "gather"
+                        ):
+                            has_gather = True
+                            break
+                break
+    except (SyntaxError, Exception):
+        pass
+
+    return phase_count, has_gather
+
+
+def _reinforce_or_create(
+    patterns: list[MemoryPattern],
+    name: str,
+    type_: str,
+    milestone: str,
+    description: str,
+) -> None:
+    """Reinforce an existing pattern or create a new one.
+
+    Idempotent per milestone: calling twice with the same milestone
+    does not double-count reinforcement.
+    """
+    for p in patterns:
+        if p.name == name:
+            if milestone not in p.observed:
+                p.observed.append(milestone)
+                p.reinforced += 1
+            p.last_active = milestone
+            p.description = description
+            # Un-invalidate if re-confirmed.
+            if p.invalidated:
+                p.invalidated = ""
+                p.invalidation_reason = ""
+            if p.status != "active":
+                p.status = "active"
+            return
+    patterns.append(MemoryPattern(
+        name=name,
+        type=type_,
+        observed=[milestone],
+        reinforced=1,
+        last_active=milestone,
+        description=description,
+    ))
+
+
+def _apply_decay(
+    patterns: list[MemoryPattern],
+    current_milestone: str,
+    all_milestones: list[str],
+    *,
+    fading_threshold: int = 5,
+    archive_threshold: int = 10,
+) -> None:
+    """Apply milestone-distance decay to patterns (DB-18 D3).
+
+    Patterns with reinforced >= 5 are durable and exempt from decay.
+    """
+    if not all_milestones:
+        return
+
+    milestone_index: dict[str, int] = {
+        m: i for i, m in enumerate(all_milestones)
+    }
+    current_idx = milestone_index.get(current_milestone)
+    if current_idx is None:
+        return
+
+    for p in patterns:
+        # High-confidence patterns don't decay.
+        if p.reinforced >= 5:
+            continue
+        # Already invalidated patterns stay archived.
+        if p.invalidated:
+            p.status = "archived"
+            continue
+
+        last_idx = milestone_index.get(p.last_active)
+        if last_idx is None:
+            continue
+
+        distance = current_idx - last_idx
+        if distance >= archive_threshold:
+            p.status = "archived"
+        elif distance >= fading_threshold and p.reinforced < 3:
+            p.status = "fading"
+
+
+_NUMERIC_PREFIX_RE = re.compile(r"^(\d+)")
+
+
+def _milestone_sort_key(name: str) -> tuple[int, str]:
+    """Sort key for milestone names: numeric prefix first, then lexicographic."""
+    m = _NUMERIC_PREFIX_RE.match(name)
+    if m:
+        return (int(m.group(1)), name)
+    return (0, name)
+
+
+def _consolidated_milestones(memory_path: Path) -> set[str]:
+    """Return the set of milestones structurally consolidated into memory.md.
+
+    Only considers orchestrator-authored patterns (cost-calibration) to
+    avoid false positives from supervisor annotations that mention a
+    milestone before structural consolidation ran for it.
+    """
+    if not memory_path.exists():
+        return set()
+    patterns = _parse_memory(memory_path.read_text(encoding="utf-8"))
+    seen: set[str] = set()
+    for p in patterns:
+        if p.type == "cost-calibration":
+            seen.update(p.observed)
+    return seen
+
+
+def consolidate_pending(project_dir: Path) -> int:
+    """Consolidate any completed milestones not yet in memory.md (DB-18).
+
+    Compares milestone directories (those with metrics.md) against the
+    milestones already recorded in memory.md's ``observed`` fields.
+    Consolidates the difference in chronological order.
+
+    This is the self-healing path: handles first-time bootstrap, crash
+    recovery, and code deployment across existing projects. Called at
+    supervisor startup before the SDK session reads memory.md.
+
+    Non-destructive — does not archive episodic files. Archival only
+    runs at the moment of completion (orchestrator finally block).
+
+    Returns count of milestones consolidated.
+    """
+    clou_dir = project_dir / ".clou"
+    milestones_dir = clou_dir / "milestones"
+    if not milestones_dir.exists():
+        return 0
+
+    memory_path = clou_dir / "memory.md"
+    already_consolidated = _consolidated_milestones(memory_path)
+
+    # Find milestones with metrics.md that aren't in memory.md yet.
+    pending: list[str] = []
+    for ms_dir in milestones_dir.iterdir():
+        if not ms_dir.is_dir():
+            continue
+        if (ms_dir / "metrics.md").exists() and ms_dir.name not in already_consolidated:
+            pending.append(ms_dir.name)
+
+    if not pending:
+        return 0
+
+    # Consolidate in chronological order so decay is correct.
+    pending.sort(key=_milestone_sort_key)
+
+    count = 0
+    for ms_name in pending:
+        try:
+            if consolidate_milestone(project_dir, ms_name):
+                count += 1
+                _log.info("Pending consolidation: %s", ms_name)
+        except Exception:
+            _log.warning(
+                "Pending consolidation failed for %r", ms_name, exc_info=True,
+            )
+
+    return count
+
+
+def consolidate_milestone(
+    project_dir: Path,
+    milestone: str,
+) -> bool:
+    """Consolidate a completed milestone into operational memory (DB-18).
+
+    Reads metrics.md (orchestrator-written) and compose.py (AST-parsed)
+    to extract structural patterns. Updates .clou/memory.md with new or
+    reinforced patterns. Applies milestone-distance decay.
+
+    Archival of episodic files is handled separately by
+    ``archive_milestone_episodic()``.
+
+    Returns True if consolidation was performed.
+    """
+    _validate_milestone(milestone)
+
+    clou_dir = project_dir / ".clou"
+    ms_dir = clou_dir / "milestones" / milestone
+
+    # Read metrics.md — the primary data source (orchestrator-written).
+    metrics_path = ms_dir / "metrics.md"
+    if not metrics_path.exists():
+        _log.warning("consolidate_milestone: no metrics.md for %r", milestone)
+        return False
+
+    metrics_content = metrics_path.read_text(encoding="utf-8")
+    header = _parse_metrics_header(metrics_content)
+
+    # Read compose.py via AST — decomposition topology.
+    compose_path = ms_dir / "compose.py"
+    phase_count, has_gather = _analyze_compose(compose_path)
+
+    # Read existing memory.md (or start fresh).
+    memory_path = clou_dir / "memory.md"
+    if memory_path.exists():
+        patterns = _parse_memory(memory_path.read_text(encoding="utf-8"))
+    else:
+        patterns = []
+
+    # Build ordered milestone list for decay calculation.
+    # Sort by numeric prefix (milestones are named "N-slug").
+    all_milestones = sorted(
+        [d.name for d in (clou_dir / "milestones").iterdir() if d.is_dir()],
+        key=_milestone_sort_key,
+    )
+
+    # --- Extract patterns from deterministic data sources ---
+
+    # 1. Cost calibration: cycles, tokens, duration.
+    cycles = _safe_int(header.get("cycles", "0"))
+    tokens_out = _safe_int(header.get("tokens_out", "0"))
+    duration = header.get("duration", "unknown")
+    _reinforce_or_create(
+        patterns,
+        name="cycle-count-distribution",
+        type_="cost-calibration",
+        milestone=milestone,
+        description=(
+            f"{cycles} cycles, ~{tokens_out:,} output tokens, {duration}."
+        ),
+    )
+
+    # 2. Decomposition topology from compose.py AST.
+    if phase_count > 0:
+        topology = "parallel (gather)" if has_gather else "sequential"
+        _reinforce_or_create(
+            patterns,
+            name="decomposition-topology",
+            type_="decomposition",
+            milestone=milestone,
+            description=(
+                f"{phase_count} phases, {topology} execution."
+            ),
+        )
+
+    # 3. Escalation patterns from metrics header.
+    validation_failures = _safe_int(header.get("validation_failures", "0"))
+    crash_retries = _safe_int(header.get("crash_retries", "0"))
+    if validation_failures > 0 or crash_retries > 0:
+        _reinforce_or_create(
+            patterns,
+            name="validation-noise",
+            type_="debt",
+            milestone=milestone,
+            description=(
+                f"{validation_failures} validation failures, "
+                f"{crash_retries} crash retries."
+            ),
+        )
+
+    # 4. Rework — read from ## Rework section (DB-18 telemetry extension).
+    rework_count = _count_metrics_section_rows(metrics_content, "## Rework")
+    if rework_count > 0:
+        _reinforce_or_create(
+            patterns,
+            name="rework-frequency",
+            type_="escalation",
+            milestone=milestone,
+            description=f"{rework_count} rework cycle(s) triggered.",
+        )
+
+    # 5. Quality gate — read from ## Quality Gate section (DB-18).
+    qg_rows = _count_metrics_section_rows(metrics_content, "## Quality Gate")
+    if qg_rows > 0:
+        # Parse the quality gate table for tool unavailability.
+        unavail_count = _count_qg_unavailable(metrics_content)
+        if unavail_count > 0:
+            _reinforce_or_create(
+                patterns,
+                name="quality-gate-availability",
+                type_="quality-gate",
+                milestone=milestone,
+                description=(
+                    f"Quality gate had {unavail_count} unavailable tool(s) "
+                    f"across {qg_rows} invocation(s)."
+                ),
+            )
+
+    # 6. Escalation — read from ## Escalations section (DB-18).
+    esc_rows = _count_metrics_section_rows(metrics_content, "## Escalations")
+    if esc_rows > 0:
+        _reinforce_or_create(
+            patterns,
+            name="escalation-frequency",
+            type_="escalation",
+            milestone=milestone,
+            description=f"{esc_rows} escalation(s) created.",
+        )
+
+    # 7. Outcome pattern.
+    outcome = header.get("outcome", "unknown")
+    if outcome.startswith("escalated"):
+        _reinforce_or_create(
+            patterns,
+            name="escalation-outcome",
+            type_="escalation",
+            milestone=milestone,
+            description=f"Milestone ended with outcome: {outcome}.",
+        )
+
+    # --- Apply decay ---
+    _apply_decay(patterns, milestone, all_milestones)
+
+    # --- Write memory.md ---
+    memory_path.write_text(_render_memory(patterns), encoding="utf-8")
+    _log.info("Consolidated %r into memory.md (%d patterns)", milestone, len(patterns))
+
+    return True
+
+
+async def archive_milestone_episodic(
+    project_dir: Path,
+    milestone: str,
+) -> list[str]:
+    """Archive episodic files for a completed milestone (DB-18).
+
+    Removes decisions.md, assessment.md, execution.md, escalations/,
+    and active/coordinator.md from the working tree. Git history
+    preserves full episodic detail.
+
+    Returns list of archived file paths (relative to project_dir).
+    """
+    _validate_milestone(milestone)
+
+    ms_prefix = f".clou/milestones/{milestone}"
+    archivable = [
+        f"{ms_prefix}/decisions.md",
+        f"{ms_prefix}/assessment.md",
+        f"{ms_prefix}/active/coordinator.md",
+    ]
+
+    # Add phase execution.md files.
+    phases_dir = project_dir / ".clou" / "milestones" / milestone / "phases"
+    if phases_dir.exists():
+        for phase_dir in phases_dir.iterdir():
+            if phase_dir.is_dir():
+                exec_file = phase_dir / "execution.md"
+                if exec_file.exists():
+                    archivable.append(
+                        f"{ms_prefix}/phases/{phase_dir.name}/execution.md"
+                    )
+
+    # Add escalation files.
+    esc_dir = project_dir / ".clou" / "milestones" / milestone / "escalations"
+    if esc_dir.exists():
+        for esc_file in esc_dir.iterdir():
+            if esc_file.is_file() and esc_file.suffix == ".md":
+                archivable.append(
+                    f"{ms_prefix}/escalations/{esc_file.name}"
+                )
+
+    # Filter to files that actually exist.
+    existing = [
+        f for f in archivable
+        if (project_dir / f).exists()
+    ]
+
+    if not existing:
+        return []
+
+    # git rm the files (preserves in history).
+    # --ignore-unmatch: don't fail if a file isn't in the index
+    # (e.g., uncommitted new files from a failed cycle).
+    proc = await asyncio.create_subprocess_exec(
+        "git", "rm", "--quiet", "--ignore-unmatch", "--", *existing,
+        cwd=project_dir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise RuntimeError("git rm timed out after 30s") from None
+
+    if proc.returncode != 0:
+        stderr_text = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+        _log.warning("git rm failed for %r: %s", milestone, stderr_text.strip())
+        return []
+
+    _log.info("Archived %d episodic files for %r", len(existing), milestone)
+    return existing
