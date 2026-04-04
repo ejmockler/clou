@@ -32,11 +32,15 @@ _log = logging.getLogger(__name__)
 _MILESTONE_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
-def _validate_milestone(name: str) -> None:
+def validate_milestone_name(name: str) -> None:
     """Raise ValueError if *name* is not a valid milestone slug."""
     if not _MILESTONE_RE.match(name):
         msg = f"Invalid milestone name: {name!r} (must match [a-z0-9][a-z0-9-]*)"
         raise ValueError(msg)
+
+
+# Keep the old private name for internal callers.
+_validate_milestone = validate_milestone_name
 
 
 #: Consecutive zero-accept ASSESS cycles required to declare convergence.
@@ -242,7 +246,7 @@ def determine_next_cycle(
                     checkpoint.current_phase,
                 )
                 return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
-            return "ASSESS", [
+            assess_read = [
                 "status.md",
                 "compose.py",
                 f"phases/{checkpoint.current_phase}/execution.md",
@@ -250,6 +254,16 @@ def determine_next_cycle(
                 "decisions.md",
                 "assessment.md",
             ]
+            # Include execution shard files when they exist (gather()
+            # groups produce execution-{task}.md alongside execution.md).
+            milestone_dir = checkpoint_path.parent.parent
+            phase_dir = milestone_dir / "phases" / checkpoint.current_phase
+            if phase_dir.is_dir():
+                for shard in sorted(phase_dir.glob("execution-*.md")):
+                    rel = f"phases/{checkpoint.current_phase}/{shard.name}"
+                    if rel not in assess_read:
+                        assess_read.append(rel)
+            return "ASSESS", assess_read
         case "VERIFY":
             return "VERIFY", [
                 "status.md",
@@ -917,10 +931,14 @@ async def git_commit_phase(project_dir: Path, milestone: str, phase: str) -> Non
     changed |= set(stdout2_bytes.decode(errors="replace").splitlines())
     changed.discard("")
 
-    # Filter out excluded patterns.
+    # Scope .clou/ staging to this milestone's paths only (prevents
+    # committing another milestone's golden context or shared metadata
+    # that the coordinator doesn't own).
+    milestone_prefix = f".clou/milestones/{milestone}/"
     to_stage = [
         f for f in changed
         if not any(fnmatch.fnmatch(f, pat) for pat in _STAGING_EXCLUDE_PATTERNS)
+        and (not f.startswith(".clou/") or f.startswith(milestone_prefix))
     ]
 
     if not to_stage:

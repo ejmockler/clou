@@ -388,3 +388,109 @@ class TestBuildCyclePromptDagContext:
         assert "## DAG Context" in result
         assert "WARNING: Previous cycle produced malformed golden context." in result
         assert "missing ## Summary" in result
+
+
+# ---------------------------------------------------------------------------
+# Shard-aware path generation (M17 — protocol integration)
+# ---------------------------------------------------------------------------
+
+
+class TestShardAwarePaths:
+    """EXECUTE prompts include shard write paths for gather() layers."""
+
+    def test_execute_prompt_shard_paths(self, tmp_path: Path) -> None:
+        """gather() layers include shard paths in write section."""
+        tasks = [
+            {"name": "build_a", "status": "pending"},
+            {"name": "build_b", "status": "pending"},
+            {"name": "integrate", "status": "pending"},
+        ]
+        deps: dict[str, list[str]] = {
+            "build_a": [],
+            "build_b": [],
+            "integrate": ["build_a", "build_b"],
+        }
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m01",
+            cycle_type="EXECUTE",
+            read_set=["status.md", "compose.py"],
+            dag_data=(tasks, deps),
+            current_phase="infra",
+        )
+        # Standard execution.md write path is always present.
+        assert "phases/infra/execution.md" in result
+        # Shard pattern for gather() layers is present.
+        assert "execution-{task}.md" in result
+        assert "per-task shards for gather() groups" in result
+
+    def test_execute_prompt_serial_no_shards(self, tmp_path: Path) -> None:
+        """Serial layers (all single-task) produce no shard write paths."""
+        tasks = [
+            {"name": "step_a", "status": "pending"},
+            {"name": "step_b", "status": "pending"},
+        ]
+        deps: dict[str, list[str]] = {"step_a": [], "step_b": ["step_a"]}
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m01",
+            cycle_type="EXECUTE",
+            read_set=["status.md", "compose.py"],
+            dag_data=(tasks, deps),
+            current_phase="design",
+        )
+        # Standard execution.md present.
+        assert "phases/design/execution.md" in result
+        # No shard pattern -- all layers have exactly 1 task.
+        assert "execution-{task}.md" not in result
+
+    def test_execute_prompt_no_dag_data_no_shards(self, tmp_path: Path) -> None:
+        """Without dag_data (narrow/legacy), no shard paths appear."""
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m01",
+            cycle_type="EXECUTE",
+            read_set=["status.md"],
+            current_phase="impl",
+        )
+        assert "execution.md" in result
+        assert "execution-{task}.md" not in result
+
+    def test_assess_prompt_with_shards(self, tmp_path: Path) -> None:
+        """ASSESS read set includes shard files when present on disk.
+
+        This tests the full pipeline: recovery.determine_next_cycle
+        discovers shards, and the read_set flows into build_cycle_prompt.
+        """
+        from clou.recovery import determine_next_cycle
+
+        # Set up milestone directory structure with checkpoint and shards.
+        ms_dir = tmp_path / "milestones" / "m01"
+        cp_path = ms_dir / "active" / "coordinator.md"
+        phase_dir = ms_dir / "phases" / "impl"
+        phase_dir.mkdir(parents=True)
+        cp_path.parent.mkdir(parents=True)
+        cp_path.write_text(
+            "cycle: 3\nstep: EXECUTE\nnext_step: ASSESS\ncurrent_phase: impl\n"
+        )
+        # Write execution.md (merged) and two shard files.
+        (phase_dir / "execution.md").write_text("## Summary\nstatus: completed\n")
+        (phase_dir / "execution-build-a.md").write_text("## Summary\nstatus: completed\n")
+        (phase_dir / "execution-build-b.md").write_text("## Summary\nstatus: completed\n")
+
+        cycle_type, read_set = determine_next_cycle(cp_path, "m01")
+        assert cycle_type == "ASSESS"
+        assert "phases/impl/execution.md" in read_set
+        assert "phases/impl/execution-build-a.md" in read_set
+        assert "phases/impl/execution-build-b.md" in read_set
+
+        # Now feed into build_cycle_prompt and verify the prompt text.
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m01",
+            cycle_type="ASSESS",
+            read_set=read_set,
+            current_phase="impl",
+        )
+        assert "execution-build-a.md" in result
+        assert "execution-build-b.md" in result

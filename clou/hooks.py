@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,7 @@ WRITE_PERMISSIONS: dict[str, list[str]] = {
     ],
     "worker": [
         "milestones/*/phases/*/execution.md",
+        "milestones/*/phases/*/execution-*.md",
     ],
     "verifier": [
         "milestones/*/phases/verification/execution.md",
@@ -66,6 +68,19 @@ WRITE_PERMISSIONS: dict[str, list[str]] = {
 }
 
 _WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit"})
+
+# Heuristic patterns for detecting Bash commands that write to .clou/ paths.
+# These close the gap where shell redirects bypass Write/Edit hook enforcement.
+_BASH_CLOU_WRITE_RE = re.compile(
+    r">{1,2}\s*\S*\.clou/"                    # redirect to .clou/
+    r"|\b(?:tee|mv|rm|cp|chmod|touch|install|dd)\b.*\.clou/"  # file-mutating commands
+    r"|\bsed\b.*-i.*\.clou/",                 # sed in-place
+)
+
+
+def _bash_targets_clou(command: str) -> bool:
+    """Heuristic: does this Bash command appear to write to .clou/ paths?"""
+    return bool(_BASH_CLOU_WRITE_RE.search(command))
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,10 +146,32 @@ def _make_pre_hook(
         context: dict[str, Any],
     ) -> dict[str, Any]:
         tool_name: object = input_data.get("tool_name")
-        if not isinstance(tool_name, str) or tool_name not in _WRITE_TOOLS:
+        if not isinstance(tool_name, str):
             return _ALLOW
 
-        tool_input: object = input_data.get("tool_input")
+        # Bash commands that write to .clou/ bypass Write/Edit hooks.
+        # Deny them so the agent uses the proper gated tools instead.
+        if tool_name == "Bash":
+            tool_input: object = input_data.get("tool_input")
+            if isinstance(tool_input, dict):
+                cmd = tool_input.get("command", "")
+                if isinstance(cmd, str) and _bash_targets_clou(cmd):
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": (
+                                "Shell commands that write to .clou/ are not "
+                                "allowed. Use the Write or Edit tool instead."
+                            ),
+                        },
+                    }
+            return _ALLOW
+
+        if tool_name not in _WRITE_TOOLS:
+            return _ALLOW
+
+        tool_input = input_data.get("tool_input")
         if not isinstance(tool_input, dict):
             return _ALLOW
 
@@ -371,11 +408,12 @@ def build_hooks(
         permissions = None  # use WRITE_PERMISSIONS default
         agent_map = AGENT_TIER_MAP if tier == "coordinator" else None
 
-    matcher = "Write|Edit|MultiEdit"
+    pre_matcher = "Write|Edit|MultiEdit|Bash"
+    post_matcher = "Write|Edit|MultiEdit"
     hooks: dict[str, list[HookConfig]] = {
         "PreToolUse": [
             HookConfig(
-                matcher=matcher,
+                matcher=pre_matcher,
                 hooks=[
                     _make_pre_hook(
                         tier,
@@ -392,10 +430,32 @@ def build_hooks(
         # (narrative, DB-14).  Immediate feedback in the agent's session.
         "PostToolUse": [
             HookConfig(
-                matcher=matcher,
+                matcher=post_matcher,
                 hooks=[_make_post_hook(project_dir, template=template)],
             ),
         ],
     }
 
     return hooks
+
+
+def to_sdk_hooks(
+    hook_configs: dict[str, list[HookConfig]],
+) -> Any:
+    """Convert internal HookConfig to SDK HookMatcher.
+
+    Returns a hooks dict compatible with ClaudeAgentOptions.hooks.
+    Uses Any return because our HookCallback type is intentionally
+    broader than the SDK's union type for testability.
+    """
+    from typing import cast
+
+    from claude_agent_sdk import HookMatcher
+
+    return {
+        event: [
+            HookMatcher(matcher=cfg.matcher, hooks=cast(Any, cfg.hooks))
+            for cfg in configs
+        ]
+        for event, configs in hook_configs.items()
+    }

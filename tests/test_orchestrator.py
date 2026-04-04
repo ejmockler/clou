@@ -24,16 +24,17 @@ from claude_agent_sdk import (
     TaskNotificationMessage,
 )
 
-from clou.hooks import HookConfig
-from clou.orchestrator import (
+from clou.coordinator import (
     _MAX_CRASH_RETRIES,
     _context_exhausted,
-    _display,
     _run_single_cycle,
-    _to_sdk_hooks,
     run_coordinator,
-    run_supervisor,
     validate_milestone_name,
+)
+from clou.hooks import HookConfig, to_sdk_hooks as _to_sdk_hooks
+from clou.orchestrator import (
+    _display,
+    run_supervisor,
 )
 from clou.validation import Severity, ValidationFinding
 
@@ -103,8 +104,9 @@ def _mock_sdk_client(messages: list[object] | None = None) -> MagicMock:
     return client
 
 
-# Patch targets — all in clou.orchestrator namespace
-_P = "clou.orchestrator"
+# Patch targets
+_P = "clou.orchestrator"   # supervisor-resident names
+_PC = "clou.coordinator"   # coordinator-resident names
 
 
 # ---------------------------------------------------------------------------
@@ -229,9 +231,9 @@ class TestRunSingleCycle:
     def _patch_prompt_io(self) -> Any:
         """Patch file-I/O functions that aren't under test."""
         with (
-            patch(f"{_P}.load_prompt", return_value="<system/>"),
-            patch(f"{_P}._build_agents", return_value={}),
-            patch(f"{_P}.build_hooks", return_value={"PreToolUse": []}),
+            patch(f"{_PC}.load_prompt", return_value="<system/>"),
+            patch(f"{_PC}._build_agents", return_value={}),
+            patch(f"{_PC}.build_hooks", return_value={"PreToolUse": []}),
         ):
             yield
 
@@ -245,8 +247,8 @@ class TestRunSingleCycle:
         client = _mock_sdk_client([_make_result(usage={"input_tokens": 1000})])
 
         with (
-            patch(f"{_P}.ClaudeSDKClient", return_value=client),
-            patch(f"{_P}.read_cycle_outcome", return_value="EXECUTE"),
+            patch(f"{_PC}.ClaudeSDKClient", return_value=client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="EXECUTE"),
         ):
             result = await _run_single_cycle(project_dir, "auth", "PLAN", "do the plan")
 
@@ -261,7 +263,7 @@ class TestRunSingleCycle:
         exhausted_msg = _make_result(usage={"input_tokens": 200_000})
         client = _mock_sdk_client([exhausted_msg])
 
-        with patch(f"{_P}.ClaudeSDKClient", return_value=client):
+        with patch(f"{_PC}.ClaudeSDKClient", return_value=client):
             result = await _run_single_cycle(project_dir, "auth", "EXECUTE", "do work")
 
         assert result == "exhausted"
@@ -276,7 +278,7 @@ class TestRunSingleCycle:
         crash_msg = _make_task_notification(status="failed", summary="OOM killed")
         client = _mock_sdk_client([crash_msg])
 
-        with patch(f"{_P}.ClaudeSDKClient", return_value=client):
+        with patch(f"{_PC}.ClaudeSDKClient", return_value=client):
             result = await _run_single_cycle(project_dir, "auth", "EXECUTE", "do work")
 
         assert result == "agent_team_crash"
@@ -292,8 +294,8 @@ class TestRunSingleCycle:
         client = _mock_sdk_client([ok_msg, final])
 
         with (
-            patch(f"{_P}.ClaudeSDKClient", return_value=client),
-            patch(f"{_P}.read_cycle_outcome", return_value="ASSESS"),
+            patch(f"{_PC}.ClaudeSDKClient", return_value=client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="ASSESS"),
         ):
             result = await _run_single_cycle(project_dir, "auth", "EXECUTE", "do work")
 
@@ -306,7 +308,7 @@ class TestRunSingleCycle:
         client.__aenter__ = AsyncMock(side_effect=RuntimeError("connection lost"))
         client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch(f"{_P}.ClaudeSDKClient", return_value=client):
+        with patch(f"{_PC}.ClaudeSDKClient", return_value=client):
             result = await _run_single_cycle(project_dir, "auth", "PLAN", "plan it")
 
         assert result == "failed"
@@ -322,8 +324,8 @@ class TestRunSingleCycle:
             return client
 
         with (
-            patch(f"{_P}.ClaudeSDKClient", side_effect=capture_client),
-            patch(f"{_P}.read_cycle_outcome", return_value="VERIFY"),
+            patch(f"{_PC}.ClaudeSDKClient", side_effect=capture_client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="VERIFY"),
         ):
             await _run_single_cycle(project_dir, "auth", "ASSESS", "assess it")
 
@@ -340,8 +342,8 @@ class TestRunSingleCycle:
             return client
 
         with (
-            patch(f"{_P}.ClaudeSDKClient", side_effect=capture_client),
-            patch(f"{_P}.read_cycle_outcome", return_value="COMPLETE"),
+            patch(f"{_PC}.ClaudeSDKClient", side_effect=capture_client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="COMPLETE"),
         ):
             await _run_single_cycle(project_dir, "auth", "VERIFY", "verify it")
 
@@ -358,8 +360,8 @@ class TestRunSingleCycle:
             return client
 
         with (
-            patch(f"{_P}.ClaudeSDKClient", side_effect=capture_client),
-            patch(f"{_P}.read_cycle_outcome", return_value="ASSESS"),
+            patch(f"{_PC}.ClaudeSDKClient", side_effect=capture_client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="ASSESS"),
         ):
             await _run_single_cycle(project_dir, "auth", "EXECUTE", "do it")
 
@@ -378,8 +380,8 @@ class TestRunSingleCycle:
             return client
 
         with (
-            patch(f"{_P}.ClaudeSDKClient", side_effect=capture_client),
-            patch(f"{_P}.read_cycle_outcome", return_value="PLAN"),
+            patch(f"{_PC}.ClaudeSDKClient", side_effect=capture_client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="PLAN"),
         ):
             await _run_single_cycle(project_dir, "auth", "PLAN", "plan it")
 
@@ -400,8 +402,8 @@ class TestRunSingleCycle:
             return client
 
         with (
-            patch(f"{_P}.ClaudeSDKClient", side_effect=capture_client),
-            patch(f"{_P}.read_cycle_outcome", return_value="PLAN"),
+            patch(f"{_PC}.ClaudeSDKClient", side_effect=capture_client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="PLAN"),
         ):
             await _run_single_cycle(project_dir, "auth", "PLAN", "plan it")
 
@@ -413,9 +415,9 @@ class TestRunSingleCycle:
         client = _mock_sdk_client([_make_result()])
 
         with (
-            patch(f"{_P}.ClaudeSDKClient", return_value=client),
-            patch(f"{_P}.read_cycle_outcome", return_value="PLAN"),
-            patch(f"{_P}.build_hooks", wraps=None) as mock_hooks,
+            patch(f"{_PC}.ClaudeSDKClient", return_value=client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="PLAN"),
+            patch(f"{_PC}.build_hooks", wraps=None) as mock_hooks,
         ):
             mock_hooks.return_value = {"PreToolUse": []}
             await _run_single_cycle(project_dir, "auth", "PLAN", "plan it")
@@ -450,7 +452,7 @@ class TestRunCoordinator:
     @pytest.mark.asyncio
     async def test_immediate_completion(self, project_dir: Path) -> None:
         """COMPLETE cycle type → return 'completed' without running."""
-        with patch(f"{_P}.determine_next_cycle", return_value=("COMPLETE", [])):
+        with patch(f"{_PC}.determine_next_cycle", return_value=("COMPLETE", [])):
             result = await run_coordinator(project_dir, "auth")
 
         assert result == "completed"
@@ -460,12 +462,12 @@ class TestRunCoordinator:
         """20-cycle limit → write escalation and return."""
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 return_value=("PLAN", ["milestone.md"]),
             ),
-            patch(f"{_P}.read_cycle_count", return_value=20),
+            patch(f"{_PC}.read_cycle_count", return_value=20),
             patch(
-                f"{_P}.write_cycle_limit_escalation", new_callable=AsyncMock
+                f"{_PC}.write_cycle_limit_escalation", new_callable=AsyncMock
             ) as mock_esc,
         ):
             result = await run_coordinator(project_dir, "auth")
@@ -478,13 +480,14 @@ class TestRunCoordinator:
         """Agent team crash → write escalation and return."""
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 return_value=("EXECUTE", ["status.md"]),
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", return_value="agent_team_crash"),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", return_value="agent_team_crash"),
             patch(
-                f"{_P}.write_agent_crash_escalation", new_callable=AsyncMock
+                f"{_PC}.write_agent_crash_escalation", new_callable=AsyncMock
             ) as mock_esc,
         ):
             result = await run_coordinator(project_dir, "auth")
@@ -504,16 +507,18 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -541,24 +546,26 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
             patch(
-                f"{_P}.validate_golden_context",
-                side_effect=lambda *a: next(validation_results),
+                f"{_PC}.validate_golden_context",
+                side_effect=lambda *a, **kw: next(validation_results),
             ),
-            patch(f"{_P}.attempt_self_heal", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.attempt_self_heal", return_value=[]),
             patch(
-                f"{_P}.git_revert_golden_context", new_callable=AsyncMock
+                f"{_PC}.git_revert_golden_context", new_callable=AsyncMock
             ) as mock_revert,
-            patch(f"{_P}.build_cycle_prompt", return_value="retry prompt"),
+            patch(f"{_PC}.build_cycle_prompt", return_value="retry prompt"),
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -575,20 +582,22 @@ class TestRunCoordinator:
         bad_finding = _vf("bad structure")
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 return_value=("EXECUTE", ["status.md"]),
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", return_value="ok"),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", return_value="ok"),
             patch(
-                f"{_P}.validate_golden_context",
+                f"{_PC}.validate_golden_context",
                 return_value=[bad_finding],
             ),
-            patch(f"{_P}.attempt_self_heal", return_value=[]),
-            patch(f"{_P}.git_revert_golden_context", new_callable=AsyncMock),
-            patch(f"{_P}.build_cycle_prompt", return_value="retry"),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.attempt_self_heal", return_value=[]),
+            patch(f"{_PC}.git_revert_golden_context", new_callable=AsyncMock),
+            patch(f"{_PC}.build_cycle_prompt", return_value="retry"),
             patch(
-                f"{_P}.write_validation_escalation", new_callable=AsyncMock
+                f"{_PC}.write_validation_escalation", new_callable=AsyncMock
             ) as mock_esc,
         ):
             result = await run_coordinator(project_dir, "auth")
@@ -600,6 +609,7 @@ class TestRunCoordinator:
         assert call_args.args[2] == [bad_finding]
 
     @pytest.mark.asyncio
+    @patch(f"{_PC}._STALENESS_THRESHOLD", 100)
     async def test_validation_retries_reset_on_success(self, project_dir: Path) -> None:
         """Validation retry counter resets when a cycle passes validation."""
         validation_sequence = iter(
@@ -621,7 +631,7 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["s"]),  # cycle 1
                     ("EXECUTE", ["s"]),  # cycle 1 retry
@@ -631,15 +641,17 @@ class TestRunCoordinator:
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
             patch(
-                f"{_P}.validate_golden_context",
-                side_effect=lambda *a: next(validation_sequence),
+                f"{_PC}.validate_golden_context",
+                side_effect=lambda *a, **kw: next(validation_sequence),
             ),
-            patch(f"{_P}.attempt_self_heal", return_value=[]),
-            patch(f"{_P}.git_revert_golden_context", new_callable=AsyncMock),
-            patch(f"{_P}.build_cycle_prompt", return_value="p"),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.attempt_self_heal", return_value=[]),
+            patch(f"{_PC}.git_revert_golden_context", new_callable=AsyncMock),
+            patch(f"{_PC}.build_cycle_prompt", return_value="p"),
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -653,26 +665,28 @@ class TestRunCoordinator:
         """Git revert failure is logged but loop continues."""
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["s"]),
                     ("EXECUTE", ["s"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", return_value="ok"),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", return_value="ok"),
             patch(
-                f"{_P}.validate_golden_context",
+                f"{_PC}.validate_golden_context",
                 side_effect=[[_vf("bad")], []],
             ),
-            patch(f"{_P}.attempt_self_heal", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.attempt_self_heal", return_value=[]),
             patch(
-                f"{_P}.git_revert_golden_context",
+                f"{_PC}.git_revert_golden_context",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("git broken"),
             ),
-            patch(f"{_P}.build_cycle_prompt", return_value="p"),
+            patch(f"{_PC}.build_cycle_prompt", return_value="p"),
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -692,7 +706,7 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("PLAN", ["milestone.md"]),
                     ("EXECUTE", ["status.md"]),
@@ -700,9 +714,11 @@ class TestRunCoordinator:
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -714,13 +730,14 @@ class TestRunCoordinator:
         """3 consecutive crash failures → escalate crash loop."""
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 return_value=("EXECUTE", ["status.md"]),
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", return_value="failed"),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", return_value="failed"),
             patch(
-                f"{_P}.write_agent_crash_escalation", new_callable=AsyncMock
+                f"{_PC}.write_agent_crash_escalation", new_callable=AsyncMock
             ) as mock_esc,
         ):
             result = await run_coordinator(project_dir, "auth")
@@ -729,6 +746,7 @@ class TestRunCoordinator:
         mock_esc.assert_called_once_with(project_dir, "auth")
 
     @pytest.mark.asyncio
+    @patch(f"{_PC}._STALENESS_THRESHOLD", 100)
     async def test_crash_retries_reset_on_success(self, project_dir: Path) -> None:
         """Crash retry counter resets after a successful cycle."""
         call_count = 0
@@ -743,7 +761,7 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["s"]),  # call 1: failed
                     ("EXECUTE", ["s"]),  # call 2: failed
@@ -754,9 +772,11 @@ class TestRunCoordinator:
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -783,16 +803,18 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -822,22 +844,24 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
             patch(
-                f"{_P}.validate_golden_context",
-                side_effect=lambda *a: next(validation_results),
+                f"{_PC}.validate_golden_context",
+                side_effect=lambda *a, **kw: next(validation_results),
             ),
-            patch(f"{_P}.attempt_self_heal", return_value=[]),
-            patch(f"{_P}.git_revert_golden_context", new_callable=AsyncMock),
-            patch(f"{_P}.build_cycle_prompt", return_value="p") as mock_bcp,
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.attempt_self_heal", return_value=[]),
+            patch(f"{_PC}.git_revert_golden_context", new_callable=AsyncMock),
+            patch(f"{_PC}.build_cycle_prompt", return_value="p") as mock_bcp,
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -860,7 +884,8 @@ class TestRunCoordinator:
         """After a successful EXECUTE cycle, git_commit_phase is called."""
         # Write a checkpoint so parse_checkpoint can extract current_phase.
         # Must also write milestone marker to prevent stale-checkpoint clearing.
-        cp_path = project_dir / ".clou" / "active" / "coordinator.md"
+        cp_path = project_dir / ".clou" / "milestones" / "auth" / "active" / "coordinator.md"
+        cp_path.parent.mkdir(parents=True, exist_ok=True)
         cp_path.write_text(
             "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
             "current_phase: design\nphases_completed: 0\nphases_total: 1\n"
@@ -873,17 +898,19 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
             patch(
-                f"{_P}.git_commit_phase", new_callable=AsyncMock
+                f"{_PC}.git_commit_phase", new_callable=AsyncMock
             ) as mock_commit,
         ):
             result = await run_coordinator(project_dir, "auth")
@@ -896,7 +923,8 @@ class TestRunCoordinator:
         self, project_dir: Path
     ) -> None:
         """Git commit failure is logged but loop continues."""
-        cp_path = project_dir / ".clou" / "active" / "coordinator.md"
+        cp_path = project_dir / ".clou" / "milestones" / "auth" / "active" / "coordinator.md"
+        cp_path.parent.mkdir(parents=True, exist_ok=True)
         cp_path.write_text("cycle: 2\ncurrent_phase: impl\nnext_step: ASSESS\n")
 
         async def _cycle(*args: Any, **kwargs: Any) -> str:
@@ -904,17 +932,19 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
             patch(
-                f"{_P}.git_commit_phase",
+                f"{_PC}.git_commit_phase",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("git broken"),
             ),
@@ -931,17 +961,19 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("PLAN", ["milestone.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
             patch(
-                f"{_P}.git_commit_phase", new_callable=AsyncMock
+                f"{_PC}.git_commit_phase", new_callable=AsyncMock
             ) as mock_commit,
         ):
             result = await run_coordinator(project_dir, "auth")
@@ -952,7 +984,7 @@ class TestRunCoordinator:
     @pytest.mark.asyncio
     async def test_fatal_escalation_posts_to_ui(self, project_dir: Path) -> None:
         """Fatal escalation paths post ClouEscalationArrived before returning."""
-        import clou.orchestrator as orch
+        import clou.coordinator as coord
 
         mock_app = MagicMock()
         posted: list[Any] = []
@@ -971,14 +1003,14 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 return_value=("PLAN", ["milestone.md"]),
             ),
-            patch(f"{_P}.read_cycle_count", return_value=20),
+            patch(f"{_PC}.read_cycle_count", return_value=20),
             patch(
-                f"{_P}.write_cycle_limit_escalation", new_callable=AsyncMock
+                f"{_PC}.write_cycle_limit_escalation", new_callable=AsyncMock
             ),
-            patch.object(orch, "_active_app", mock_app),
+            patch.object(coord, "_active_app", mock_app),
         ):
             result = await run_coordinator(project_dir, "auth", app=mock_app)
 
@@ -1005,20 +1037,20 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
             patch(
-                f"{_P}.validate_golden_context",
+                f"{_PC}.validate_golden_context",
                 return_value=[warning_finding],
             ),
             patch(
-                f"{_P}.git_revert_golden_context", new_callable=AsyncMock
+                f"{_PC}.git_revert_golden_context", new_callable=AsyncMock
             ) as mock_revert,
         ):
             result = await run_coordinator(project_dir, "auth")
@@ -1046,22 +1078,24 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
             patch(
-                f"{_P}.validate_golden_context",
-                side_effect=lambda *a: next(validation_results),
+                f"{_PC}.validate_golden_context",
+                side_effect=lambda *a, **kw: next(validation_results),
             ),
-            patch(f"{_P}.attempt_self_heal", return_value=[]),
-            patch(f"{_P}.git_revert_golden_context", new_callable=AsyncMock),
-            patch(f"{_P}.build_cycle_prompt", return_value="p"),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.attempt_self_heal", return_value=[]),
+            patch(f"{_PC}.git_revert_golden_context", new_callable=AsyncMock),
+            patch(f"{_PC}.build_cycle_prompt", return_value="p"),
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -1091,24 +1125,26 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
             patch(
-                f"{_P}.validate_golden_context",
-                side_effect=lambda *a: next(validation_results),
+                f"{_PC}.validate_golden_context",
+                side_effect=lambda *a, **kw: next(validation_results),
             ),
-            patch(f"{_P}.attempt_self_heal", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.attempt_self_heal", return_value=[]),
             patch(
-                f"{_P}.git_revert_golden_context", new_callable=AsyncMock
+                f"{_PC}.git_revert_golden_context", new_callable=AsyncMock
             ) as mock_revert,
-            patch(f"{_P}.build_cycle_prompt", return_value="p"),
+            patch(f"{_PC}.build_cycle_prompt", return_value="p"),
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -1134,12 +1170,13 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 return_value=("EXECUTE", ["status.md"]),
             ),
-            patch(f"{_P}.read_cycle_count", return_value=3),
+            patch(f"{_PC}.read_cycle_count", return_value=3),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
             patch(
-                f"{_P}.write_staleness_escalation", new_callable=AsyncMock
+                f"{_PC}.write_staleness_escalation", new_callable=AsyncMock
             ) as mock_esc,
         ):
             result = await run_coordinator(project_dir, "auth")
@@ -1183,7 +1220,7 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("EXECUTE", ["status.md"]),
@@ -1191,11 +1228,12 @@ class TestRunCoordinator:
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_update_checkpoint_side_effect),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
-            patch(f"{_P}.validate_readiness", return_value=[]),
-            patch(f"{_P}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}._run_single_cycle", side_effect=_update_checkpoint_side_effect),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -1221,7 +1259,7 @@ class TestRunCoordinator:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("ASSESS", ["status.md"]),
@@ -1229,11 +1267,12 @@ class TestRunCoordinator:
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=1),
-            patch(f"{_P}._run_single_cycle", side_effect=_cycle),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
-            patch(f"{_P}.validate_readiness", return_value=[]),
-            patch(f"{_P}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
         ):
             result = await run_coordinator(project_dir, "auth")
 
@@ -1298,20 +1337,20 @@ class TestCycleBoundaryPauseFlag:
     ) -> None:
         """With pause_on_user_message=False (default), pending user messages
         do NOT pause the coordinator — it continues to COMPLETE."""
-        import clou.orchestrator as orch
+        import clou.coordinator as coord
 
         mock_app = self._make_app_with_queue()
 
         with (
             patch(
-                f"{_P}.load_template",
+                f"{_PC}.load_template",
                 return_value=self._make_template(pause=False),
             ),
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 return_value=("COMPLETE", []),
             ),
-            patch.object(orch, "_active_app", mock_app),
+            patch.object(coord, "_active_app", mock_app),
         ):
             result = await run_coordinator(
                 project_dir, "auth", app=mock_app,
@@ -1325,20 +1364,20 @@ class TestCycleBoundaryPauseFlag:
     ) -> None:
         """With pause_on_user_message=True, pending user messages
         pause the coordinator at the cycle boundary."""
-        import clou.orchestrator as orch
+        import clou.coordinator as coord
 
         mock_app = self._make_app_with_queue()
 
         with (
             patch(
-                f"{_P}.load_template",
+                f"{_PC}.load_template",
                 return_value=self._make_template(pause=True),
             ),
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 return_value=("EXECUTE", ["status.md"]),
             ),
-            patch.object(orch, "_active_app", mock_app),
+            patch.object(coord, "_active_app", mock_app),
         ):
             result = await run_coordinator(
                 project_dir, "auth", app=mock_app,
@@ -1353,7 +1392,7 @@ class TestCycleBoundaryPauseFlag:
         """The /stop check fires even when pause_on_user_message=False."""
         import asyncio
 
-        import clou.orchestrator as orch
+        import clou.coordinator as coord
 
         mock_app = MagicMock()
         mock_app._stop_requested = asyncio.Event()
@@ -1362,10 +1401,10 @@ class TestCycleBoundaryPauseFlag:
 
         with (
             patch(
-                f"{_P}.load_template",
+                f"{_PC}.load_template",
                 return_value=self._make_template(pause=False),
             ),
-            patch.object(orch, "_active_app", mock_app),
+            patch.object(coord, "_active_app", mock_app),
         ):
             result = await run_coordinator(
                 project_dir, "auth", app=mock_app,
@@ -1378,32 +1417,32 @@ class TestCycleBoundaryPauseFlag:
         self, project_dir: Path,
     ) -> None:
         """Budget exhaustion fires even when pause_on_user_message=False."""
-        import clou.orchestrator as orch
+        import clou.coordinator as coord
 
         mock_app = self._make_app_with_queue()
         # Set cumulative cost to exceed budget.
-        orch._cumulative_cost_usd["auth"] = 10.0
+        coord._cumulative_cost_usd["auth"] = 10.0
 
         try:
             with (
                 patch(
-                    f"{_P}.load_template",
+                    f"{_PC}.load_template",
                     return_value=self._make_template(
                         pause=False, budget_usd=5.0,
                     ),
                 ),
                 patch(
-                    f"{_P}.determine_next_cycle",
+                    f"{_PC}.determine_next_cycle",
                     return_value=("EXECUTE", ["status.md"]),
                 ),
-                patch(f"{_P}.read_cycle_count", return_value=1),
-                patch.object(orch, "_active_app", mock_app),
+                patch(f"{_PC}.read_cycle_count", return_value=1),
+                patch.object(coord, "_active_app", mock_app),
             ):
                 result = await run_coordinator(
                     project_dir, "auth", app=mock_app,
                 )
         finally:
-            orch._cumulative_cost_usd.pop("auth", None)
+            coord._cumulative_cost_usd.pop("auth", None)
 
         assert result == "escalated_budget"
 
@@ -1414,16 +1453,16 @@ class TestCycleBoundaryPauseFlag:
         """Cycle limit fires even when pause_on_user_message=False."""
         with (
             patch(
-                f"{_P}.load_template",
+                f"{_PC}.load_template",
                 return_value=self._make_template(pause=False),
             ),
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 return_value=("PLAN", ["milestone.md"]),
             ),
-            patch(f"{_P}.read_cycle_count", return_value=20),
+            patch(f"{_PC}.read_cycle_count", return_value=20),
             patch(
-                f"{_P}.write_cycle_limit_escalation",
+                f"{_PC}.write_cycle_limit_escalation",
                 new_callable=AsyncMock,
             ),
         ):
@@ -1460,7 +1499,8 @@ class TestRunSupervisorResumeFeedback:
         # Provide real asyncio primitives so _feed_user_input doesn't crash
         # on ensure_future(). The queue.get() blocks forever, which is fine
         # because the task is cancelled once receive_messages exhausts.
-        mock_app._compact_requested = asyncio.Event()
+        mock_app._compact = MagicMock()
+        mock_app._compact.requested = asyncio.Event()
         mock_app._user_input_queue = asyncio.Queue()
 
         # SDK client — query returns normally (no exception for control flow).
@@ -1483,7 +1523,6 @@ class TestRunSupervisorResumeFeedback:
             patch(f"{_P}._build_mcp_server", return_value={}),
             patch(f"{_P}.read_template_name", return_value="software-construction"),
             patch(f"{_P}.load_template", return_value=MagicMock(quality_gates=[])),
-            patch(f"{_P}.template_mcp_servers", return_value={}),
             patch(
                 "clou.resume.build_resumption_context",
                 return_value="",
@@ -1693,66 +1732,34 @@ class TestFeedUserInputRace:
 
 
 # ---------------------------------------------------------------------------
-# can_use_tool — AskUserQuestion blocked
+# can_use_tool — all tools auto-approved
 # ---------------------------------------------------------------------------
 
 
 class TestCanUseTool:
-    """The supervisor's can_use_tool callback blocks AskUserQuestion."""
+    """The supervisor's can_use_tool auto-approves everything."""
 
     @pytest.mark.asyncio
-    async def test_blocks_ask_user_question(self) -> None:
-        """AskUserQuestion is denied — model should use ask_user MCP tool."""
-        from claude_agent_sdk import (
-            PermissionResultDeny,
-            ToolPermissionContext,
-        )
-
-        # Reconstruct the callback as defined in run_supervisor.
-        async def _can_use_tool(
-            name: str,
-            tool_input: dict[str, Any],
-            ctx: ToolPermissionContext,
-        ) -> Any:
-            if name == "AskUserQuestion":
-                return PermissionResultDeny(
-                    message="Use ask_user instead. It pauses for user input.",
-                )
-            from claude_agent_sdk import PermissionResultAllow
-
-            return PermissionResultAllow()
-
-        result = await _can_use_tool(
-            "AskUserQuestion", {}, ToolPermissionContext(signal=None, suggestions=[]),
-        )
-        assert result.behavior == "deny"
-        assert "ask_user" in result.message
-
-    @pytest.mark.asyncio
-    async def test_allows_other_tools(self) -> None:
-        """Non-AskUserQuestion tools are allowed."""
+    async def test_approves_all_tools(self) -> None:
+        """All tools are auto-approved (questions go through ask_user MCP tool)."""
         from claude_agent_sdk import (
             PermissionResultAllow,
             ToolPermissionContext,
         )
 
+        # Matches the simplified callback in run_supervisor.
         async def _can_use_tool(
             name: str,
             tool_input: dict[str, Any],
             ctx: ToolPermissionContext,
         ) -> Any:
-            if name == "AskUserQuestion":
-                from claude_agent_sdk import PermissionResultDeny
-
-                return PermissionResultDeny(message="Use ask_user instead.")
             return PermissionResultAllow()
 
-        result = await _can_use_tool(
-            "Read",
-            {"file_path": "/tmp/f"},
-            ToolPermissionContext(signal=None, suggestions=[]),
-        )
-        assert result.behavior == "allow"
+        for tool_name in ("Read", "AskUserQuestion", "Bash"):
+            result = await _can_use_tool(
+                tool_name, {}, ToolPermissionContext(signal=None, suggestions=[]),
+            )
+            assert result.behavior == "allow"
 
 
 # ---------------------------------------------------------------------------

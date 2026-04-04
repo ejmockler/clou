@@ -35,6 +35,13 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from clou.golden_context import (
+    PHASE_STATUSES as _PHASE_STATUSES,
+    TASK_STATUSES as _TASK_STATUSES,
+    VALID_NEXT_STEPS as _VALID_NEXT_STEPS,
+    VALID_STEPS as _VALID_STEPS,
+)
+
 if TYPE_CHECKING:
     from clou.harness import ArtifactForm, HarnessTemplate
 
@@ -81,36 +88,21 @@ def warnings_only(findings: list[ValidationFinding]) -> list[ValidationFinding]:
 
 
 # Valid status values per file type.
-_TASK_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
-_MILESTONE_STATUSES = frozenset({"pending", "in_progress", "completed", "blocked"})
-_PHASE_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
+# _TASK_STATUSES, _PHASE_STATUSES, _VALID_STEPS, _VALID_NEXT_STEPS are
+# imported from golden_context.py (single source of truth).
+_MILESTONE_STATUSES = frozenset({
+    "pending", "in_progress", "completed", "blocked",
+    # Inline heading variants: "### N. Name — current/sketch"
+    "current", "sketch",
+})
 _TERMINAL_STATUSES = frozenset({"completed", "failed"})
 
 # --- Checkpoint-tier validation (DB-12) ---
-# Only `cycle` and `next_step` are required — these drive the
-# orchestrator's control flow via determine_next_cycle().  Other keys
-# are validated when present but have safe defaults in parse_checkpoint(),
-# so their absence is a WARNING, not an ERROR.
 _CHECKPOINT_REQUIRED_KEYS = frozenset({"cycle", "next_step"})
 _CHECKPOINT_OPTIONAL_KEYS = frozenset(
     {"step", "current_phase", "phase", "phases_completed", "phases_total"}
 )
-#: Agents sometimes write ``phase:`` instead of ``current_phase:``.
 _CHECKPOINT_ALIASES: dict[str, str] = {"phase": "current_phase"}
-_VALID_STEPS = frozenset({"PLAN", "EXECUTE", "ASSESS", "VERIFY", "EXIT"})
-_VALID_NEXT_STEPS = frozenset(
-    {
-        "PLAN",
-        "EXECUTE",
-        "EXECUTE (rework)",
-        "EXECUTE (additional verification)",
-        "ASSESS",
-        "VERIFY",
-        "EXIT",
-        "COMPLETE",
-        "none",
-    }
-)
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +202,19 @@ def validate_delivery(
                     f"{ms_prefix}/active/coordinator.md",
                 ))
 
-        # current phase
+        # current phase — when checkpoint has the default empty value the
+        # field was absent, not intentionally blank.  Downgrade to WARNING
+        # (the absent key is already warned about by validate_checkpoint);
+        # only ERROR when both sides have real values that disagree.
         status_phase = _status_field("phase")
-        if status_phase and status_phase != cp.current_phase:
+        if status_phase and not cp.current_phase:
+            findings.append(ValidationFinding(
+                Severity.WARNING,
+                f"status.md has phase '{status_phase}' but checkpoint "
+                f"current_phase is absent",
+                f"{ms_prefix}/active/coordinator.md",
+            ))
+        elif status_phase and cp.current_phase and status_phase != cp.current_phase:
             findings.append(ValidationFinding(
                 Severity.ERROR,
                 f"status.md phase '{status_phase}' diverges from checkpoint "
@@ -525,16 +527,22 @@ def validate_checkpoint(content: str) -> list[ValidationFinding]:
 
 
 def _validate_execution(path: Path) -> list[ValidationFinding]:
-    """Validate execution.md per-phase file structure."""
+    """Validate execution.md per-phase file structure.
+
+    Protocol tools (clou_write_execution) guarantee correct structure.
+    These checks are defense-in-depth for files written outside tools
+    (e.g. worker agents, legacy paths).  Severity is WARNING — format
+    issues in execution.md should not block milestone progression.
+    """
     rel = _rel(path)
     findings: list[ValidationFinding] = []
     content = path.read_text()
 
-    # Must have ## Summary with status: field — ERROR (structural)
+    # ## Summary with status: field — WARNING (defense-in-depth)
     if "## Summary" not in content:
         findings.append(
             ValidationFinding(
-                severity=Severity.ERROR,
+                severity=Severity.WARNING,
                 message="missing '## Summary'",
                 path=rel,
             )
@@ -544,28 +552,34 @@ def _validate_execution(path: Path) -> list[ValidationFinding]:
         if not re.search(r"(?m)^status:", summary_block):
             findings.append(
                 ValidationFinding(
-                    severity=Severity.ERROR,
+                    severity=Severity.WARNING,
                     message="'## Summary' missing 'status:' field",
                     path=rel,
                 )
             )
 
-    # Must have ## Tasks with at least one ### T<N>: entry — ERROR (structural)
-    if "## Tasks" not in content:
+    # ## Tasks with at least one ### T<N>: entry — WARNING (defense-in-depth).
+    # Task entries may appear under ## Summary (common LLM variant) or
+    # under ## Tasks (tool-written format).  Check for ### T<N>: anywhere
+    # as a fallback if ## Tasks is missing.
+    has_tasks_section = "## Tasks" in content
+    has_task_entries = bool(re.search(r"(?m)^### T\d+:", content))
+
+    if not has_tasks_section and not has_task_entries:
         findings.append(
             ValidationFinding(
-                severity=Severity.ERROR,
-                message="missing '## Tasks'",
+                severity=Severity.WARNING,
+                message="missing '## Tasks' section and no '### T<N>:' entries found",
                 path=rel,
             )
         )
-    else:
+    elif has_tasks_section:
         tasks_block = _section_text(content, "## Tasks")
         task_headers = re.findall(r"(?m)^### T\d+:", tasks_block)
         if not task_headers:
             findings.append(
                 ValidationFinding(
-                    severity=Severity.ERROR,
+                    severity=Severity.WARNING,
                     message="'## Tasks' has no '### T<N>:' entries",
                     path=rel,
                 )
@@ -844,25 +858,46 @@ def _validate_roadmap(path: Path) -> list[ValidationFinding]:
         )
         return findings
 
-    # Each milestone entry: **Status:** and valid value — WARNING (formatting)
+    # Each milestone entry needs a status — either **Status:** in body or
+    # inline "— status" in the heading (e.g. "### 1. Name — completed").
+    # Both are WARNING-severity (formatting, not structural).
     entry_blocks = _split_sections(milestones_block, r"### \d+\.")
+    # Extract the heading from each split boundary rather than a separate
+    # regex, so heading and block indices always align.
+    heading_starts = list(re.finditer(r"(?m)^### \d+\.", milestones_block))
     for j, block in enumerate(entry_blocks, 1):
+        # Try **Status:** in body first.
         match = re.search(r"\*\*Status:\*\*\s*(\S+)", block)
-        if not match:
+        if match:
+            status_val = match.group(1)
+        else:
+            # Try inline "— status" in heading.  Only match em-dash (—)
+            # or en-dash (–), not plain hyphen (-) which appears in names.
+            heading_match = heading_starts[j - 1] if j - 1 < len(heading_starts) else None
+            if heading_match:
+                heading_end = heading_match.end()
+                heading_line = milestones_block[heading_match.start():].split("\n", 1)[0]
+            else:
+                heading_line = ""
+            inline = re.search(r"[—–]\s+(\S+)\s*$", heading_line)
+            status_val = inline.group(1) if inline else None
+
+        if not status_val:
             findings.append(
                 ValidationFinding(
                     severity=Severity.WARNING,
-                    message=f"milestone entry {j} missing '**Status:**'",
+                    message=f"milestone entry {j} missing status "
+                    f"(expected '**Status:**' or inline '— status')",
                     path=rel,
                 )
             )
-        elif match.group(1) not in _MILESTONE_STATUSES:
+        elif status_val not in _MILESTONE_STATUSES:
             findings.append(
                 ValidationFinding(
                     severity=Severity.WARNING,
                     message=(
                         f"milestone entry {j} has invalid status "
-                        f"'{match.group(1)}' "
+                        f"'{status_val}' "
                         f"(expected one of: {', '.join(sorted(_MILESTONE_STATUSES))})"
                     ),
                     path=rel,
@@ -1021,7 +1056,10 @@ def _check_task_statuses(
 #: the corresponding regex is used.  This keeps forms declarative
 #: (string descriptions) while enforcement is mechanical.
 _ANTI_PATTERN_MATCHERS: list[tuple[str, re.Pattern[str], str]] = [
-    ("file path", re.compile(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_/.-]+\.(py|ts|tsx|js|jsx|md|css|html|json|yaml|yml|toml|go|rs|sh)\b"), "file path in criterion"),
+    # Only fire when a file path is the *subject* of the criterion (appears
+    # right after the bullet/When prefix), not when a behavioural criterion
+    # incidentally mentions a path as a location.
+    ("file path", re.compile(r"^[-*]?\s*(?:[Ww]hen\s+)?[a-zA-Z0-9_.-]+/[a-zA-Z0-9_/.-]+\.(py|ts|tsx|js|jsx|md|css|html|json|yaml|yml|toml|go|rs|sh)\b"), "file path in criterion"),
     ("implementation", re.compile(r"\b(class|module|function|method|widget)\s+[A-Z]"), "implementation artifact name in criterion"),
     ("implementation", re.compile(r"\b(extract|refactor|build|implement|create|add)\s+(a\s+|the\s+)?\w+", re.IGNORECASE), "implementation verb as criterion action"),
     ("file inspection", re.compile(r"\b(file|module|class|directory|folder)\s+(exists?|contains?|has)\b", re.IGNORECASE), "criterion verifiable by file inspection"),

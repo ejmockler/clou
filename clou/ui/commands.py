@@ -449,21 +449,21 @@ async def _cmd_compact(app: ClouApp, args: str) -> None:
             )
 
     # Signal the orchestrator.
-    app._compact_complete.clear()
-    app._compact_instructions = args.strip()
-    app._compact_requested.set()
+    app._compact.complete.clear()
+    app._compact.instructions = args.strip()
+    app._compact.requested.set()
 
     render_command_output(app, Text("  compacting...", style=f"italic {_DIM_HEX}"))
 
     # Wait for completion (with timeout).
     try:
-        await asyncio.wait_for(app._compact_complete.wait(), timeout=30.0)
+        await asyncio.wait_for(app._compact.complete.wait(), timeout=120.0)
     except TimeoutError:
-        _render_error(app, "compaction timed out")
+        _render_error(app, "compaction timed out — supervisor may be unresponsive")
         return
 
     # Show confirmation.
-    count = app._compaction_count
+    count = app._compact.count
     result = Text()
     result.append("  compacted", style=f"bold {_GOLD_HEX}")
     result.append(f"  (compaction #{count})", style=_DIM_HEX)
@@ -630,6 +630,12 @@ async def _cmd_stop(app: ClouApp, args: str) -> None:
         render_command_output(
             app,
             Text("No coordinator running", style=_MUTED_HEX),
+        )
+        return
+    if app._stop_requested.is_set():
+        render_command_output(
+            app,
+            Text("Stop already pending — waiting for cycle boundary", style=_MUTED_HEX),
         )
         return
     app._stop_requested.set()

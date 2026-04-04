@@ -327,3 +327,29 @@ class TestToolCallRecording:
         model = _make_model()
         # Should not raise.
         model.add_tool_call("nonexistent", "Read", "Read file.py")
+
+
+# ---------------------------------------------------------------------------
+# T11: Aborted status
+# ---------------------------------------------------------------------------
+
+
+class TestAbortedStatus:
+    def test_complete_task_aborted(self) -> None:
+        """Task transitions to aborted status via complete_task."""
+        model = _make_model()
+        model.activate_task("build_model", "agent-1")
+        model.complete_task("build_model", "aborted", "Dependency failed")
+        assert model.task_states["build_model"].status == "aborted"
+        assert model.task_states["build_model"].summary == "Dependency failed"
+
+    def test_aborted_distinct_from_failed(self) -> None:
+        """Aborted and failed are separate terminal states."""
+        model = _make_model()
+        model.activate_task("build_model", "agent-1")
+        model.activate_task("build_widget", "agent-2")
+        model.complete_task("build_model", "failed", "Crash")
+        model.complete_task("build_widget", "aborted", "Sibling failed")
+        assert model.task_states["build_model"].status == "failed"
+        assert model.task_states["build_widget"].status == "aborted"
+        assert model.task_states["build_model"].status != model.task_states["build_widget"].status

@@ -76,29 +76,3 @@ def tool_summary(name: str, tool_input: dict[str, object]) -> str:
     return name
 
 
-def format_ask_user_question(tool_input: dict[str, object]) -> str:
-    """Format an AskUserQuestion tool call as readable markdown."""
-    questions = tool_input.get("questions")
-    if not isinstance(questions, list) or not questions:
-        return ""
-    parts: list[str] = []
-    for q in questions:
-        if not isinstance(q, dict):
-            continue
-        text = str(q.get("question", ""))
-        if not text:
-            continue
-        parts.append(f"**{text}**")
-        options = q.get("options")
-        if isinstance(options, list):
-            for i, opt in enumerate(options, 1):
-                if not isinstance(opt, dict):
-                    continue
-                label = str(opt.get("label", ""))
-                desc = str(opt.get("description", ""))
-                line = f"{i}. **{label}**"
-                if desc:
-                    line += f" — {desc}"
-                parts.append(line)
-        parts.append("")  # blank line between questions
-    return "\n".join(parts).strip()

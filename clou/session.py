@@ -80,6 +80,10 @@ def sessions_dir(project_dir: Path) -> Path:
     """Return the sessions directory, creating it if needed."""
     d = project_dir / ".clou" / "sessions"
     d.mkdir(parents=True, exist_ok=True)
+    # Keep transcripts out of git — they may contain secrets from tool output.
+    gitignore = d / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text("*\n!.gitignore\n")
     return d
 
 

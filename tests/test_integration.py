@@ -276,7 +276,7 @@ class TestOrchestratorIntegration:
     async def test_build_hooks_output_accepted(self, integration_project: Path) -> None:
         """Hooks built by build_hooks() are accepted by SDK."""
         from clou.hooks import build_hooks
-        from clou.orchestrator import _to_sdk_hooks
+        from clou.hooks import to_sdk_hooks as _to_sdk_hooks
 
         hook_configs = build_hooks(
             "coordinator", integration_project, milestone="test-milestone"
@@ -299,7 +299,7 @@ class TestOrchestratorIntegration:
     async def test_full_coordinator_options(self, integration_project: Path) -> None:
         """The full ClaudeAgentOptions we build for coordinators is valid."""
         from clou.hooks import build_hooks
-        from clou.orchestrator import _to_sdk_hooks
+        from clou.hooks import to_sdk_hooks as _to_sdk_hooks
 
         hook_configs = build_hooks(
             "coordinator", integration_project, milestone="test-milestone"

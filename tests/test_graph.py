@@ -5,7 +5,7 @@ Tests go through the public validate() API only — no implementation
 details are tested directly.
 """
 
-from clou.graph import extract_dag_data, validate
+from clou.graph import ResourceBounds, extract_dag_data, validate
 
 # ---------------------------------------------------------------------------
 # The canonical example from DB-02 — the golden test
@@ -772,3 +772,170 @@ async def execute():
 """
     errors = validate(code)
     assert not any("Under-decomposed" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# @resource_bounds decorator
+# ---------------------------------------------------------------------------
+
+
+def test_resource_bounds_extraction() -> None:
+    """@resource_bounds decorator is parsed into Sig.resource_bounds."""
+    import ast
+    from clou.graph import _extract_sigs
+
+    code = """\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def heavy_task() -> Result:
+    \"\"\"A resource-intensive task.\"\"\"
+
+async def light_task() -> Other:
+    \"\"\"A lightweight task.\"\"\"
+"""
+    tree = ast.parse(code)
+    sigs = _extract_sigs(tree)
+    assert sigs["heavy_task"].resource_bounds == ResourceBounds(
+        tokens=50000, timeout_seconds=300
+    )
+    assert sigs["light_task"].resource_bounds is None
+
+
+def test_resource_bounds_optional() -> None:
+    """Functions without @resource_bounds produce no resource_bounds key in DAG data."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c(b: B) -> C:
+    \"\"\"Do C.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b(a)
+    c = await task_c(b)
+"""
+    tasks, _ = extract_dag_data(code)
+    for task in tasks:
+        assert "resource_bounds" not in task
+
+
+def test_resource_bounds_partial() -> None:
+    """Only tokens or only timeout_seconds can be specified."""
+    import ast
+    from clou.graph import _extract_sigs
+
+    code_tokens_only = """\
+@resource_bounds(tokens=80000)
+async def tokens_task() -> A:
+    \"\"\"Tokens only.\"\"\"
+"""
+    tree = ast.parse(code_tokens_only)
+    sigs = _extract_sigs(tree)
+    assert sigs["tokens_task"].resource_bounds == ResourceBounds(
+        tokens=80000, timeout_seconds=None
+    )
+
+    code_timeout_only = """\
+@resource_bounds(timeout_seconds=600)
+async def timeout_task() -> B:
+    \"\"\"Timeout only.\"\"\"
+"""
+    tree = ast.parse(code_timeout_only)
+    sigs = _extract_sigs(tree)
+    assert sigs["timeout_task"].resource_bounds == ResourceBounds(
+        tokens=None, timeout_seconds=600
+    )
+
+
+def test_resource_bounds_validation() -> None:
+    """Negative values produce a validation error."""
+    code = """\
+@resource_bounds(tokens=-100, timeout_seconds=300)
+async def bad_task() -> A:
+    \"\"\"Negative tokens.\"\"\"
+
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c(b: B) -> C:
+    \"\"\"Do C.\"\"\"
+
+async def execute():
+    a = await bad_task()
+    b = await task_b(a)
+    c = await task_c(b)
+"""
+    errors = validate(code)
+    assert any("tokens must be positive" in e for e in errors)
+
+    code2 = """\
+@resource_bounds(tokens=100, timeout_seconds=-10)
+async def bad_task2() -> A:
+    \"\"\"Negative timeout.\"\"\"
+
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c(b: B) -> C:
+    \"\"\"Do C.\"\"\"
+
+async def execute():
+    a = await bad_task2()
+    b = await task_b(a)
+    c = await task_c(b)
+"""
+    errors2 = validate(code2)
+    assert any("timeout_seconds must be positive" in e for e in errors2)
+
+
+def test_resource_bounds_in_dag_data() -> None:
+    """extract_dag_data includes bounds in task dicts when present."""
+    code = """\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def heavy_task() -> A:
+    \"\"\"Heavy.\"\"\"
+
+async def light_task(a: A) -> B:
+    \"\"\"Light.\"\"\"
+
+async def final_task(b: B) -> C:
+    \"\"\"Final.\"\"\"
+
+async def execute():
+    a = await heavy_task()
+    b = await light_task(a)
+    c = await final_task(b)
+"""
+    tasks, _ = extract_dag_data(code)
+    task_map = {t["name"]: t for t in tasks}
+    assert task_map["heavy_task"]["resource_bounds"] == {
+        "tokens": 50000,
+        "timeout_seconds": 300,
+    }
+    assert "resource_bounds" not in task_map["light_task"]
+    assert "resource_bounds" not in task_map["final_task"]
+
+
+def test_resource_bounds_no_validation_error() -> None:
+    """Valid @resource_bounds does not produce validation errors."""
+    code = """\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def heavy_task() -> A:
+    \"\"\"Heavy.\"\"\"
+
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c(b: B) -> C:
+    \"\"\"Do C.\"\"\"
+
+async def execute():
+    a = await heavy_task()
+    b = await task_b(a)
+    c = await task_c(b)
+"""
+    errors = validate(code)
+    assert not any("resource_bounds" in e for e in errors)

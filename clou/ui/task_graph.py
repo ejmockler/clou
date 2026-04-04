@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 class TaskState:
     """Mutable state for a single compose.py task."""
 
-    status: str = "pending"  # pending | active | complete | failed
+    status: str = "pending"  # pending | active | complete | failed | aborted
     agent_id: str | None = None
     tool_count: int = 0
     last_tool: str | None = None
@@ -208,7 +208,7 @@ class TaskGraphModel:
         status: str,
         summary: str,
     ) -> None:
-        """Mark a task as complete or failed."""
+        """Mark a task as complete, failed, or aborted."""
         state = self.task_states.get(task_name)
         if state is None:
             return

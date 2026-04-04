@@ -12,7 +12,8 @@ the filesystem — the codebase is the communication channel.
 2. Read phase.md — understand the phase context and domain.
 3. Read project.md — coding conventions, tech stack, existing patterns.
 
-4. Write execution.md summary FIRST, before any implementation:
+4. Write execution.md (or your assigned shard file) summary FIRST,
+   before any implementation:
    ```
    ## Summary
    status: in_progress
@@ -24,6 +25,9 @@ the filesystem — the codebase is the communication channel.
    ```
    The coordinator's circuit breaker reads this summary line between
    task completions. Front-load status.
+
+   Note: If your briefing specifies a shard path (execution-{task}.md),
+   write to that path instead of execution.md. The format is identical.
 
 5. Implement your function's scope:
    - Follow project.md conventions exactly.

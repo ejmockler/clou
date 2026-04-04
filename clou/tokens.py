@@ -8,9 +8,17 @@ into the golden context ``metrics.md``.
 
 Public API:
     TokenTracker — tracks input/output token counts per tier and milestone.
+    tracker / cumulative_cost_usd — module-level singletons shared by
+        supervisor and coordinator.
+    track() / context_exhausted() — convenience functions wrapping the
+        singleton tracker.
 """
 
 from __future__ import annotations
+
+# Model and context window configuration — single source of truth.
+MODEL = "opus"
+CONTEXT_WINDOW = 200_000  # Opus context window in tokens
 
 
 class TokenTracker:
@@ -71,13 +79,13 @@ class TokenTracker:
 
         Args:
             usage: The ``usage`` dict from the latest SDK message.
-            threshold: Fraction of the 200K-token Opus context window.
+            threshold: Fraction of the context window.
 
         Returns:
-            ``True`` when ``input_tokens`` exceeds ``200_000 * threshold``.
+            ``True`` when ``input_tokens`` exceeds ``CONTEXT_WINDOW * threshold``.
         """
         input_tokens: int = usage.get("input_tokens", 0)
-        return input_tokens > 200_000 * threshold
+        return input_tokens > CONTEXT_WINDOW * threshold
 
     @property
     def total(self) -> dict[str, int]:
@@ -93,3 +101,35 @@ class TokenTracker:
         """Input/output token counts for a single coordinator milestone."""
         bucket = self._coordinators.get(milestone)
         return dict(bucket) if bucket else {"input": 0, "output": 0}
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton — shared by supervisor and coordinator
+# ---------------------------------------------------------------------------
+
+tracker = TokenTracker()
+cumulative_cost_usd: dict[str, float] = {}  # milestone → cumulative USD
+
+
+def track(msg: object, tier: str = "supervisor", milestone: str | None = None) -> None:
+    """Extract and track token usage and cost from an SDK message."""
+    # Lazy import to avoid circular dependency at module load time.
+    from claude_agent_sdk import ResultMessage
+
+    if isinstance(msg, ResultMessage) and msg.usage:
+        tracker.track(msg.usage, tier=tier, milestone=milestone)
+    if isinstance(msg, ResultMessage) and milestone:
+        cost = getattr(msg, "total_cost_usd", None)
+        if cost is not None:
+            cumulative_cost_usd[milestone] = (
+                cumulative_cost_usd.get(milestone, 0.0) + cost
+            )
+
+
+def context_exhausted(msg: object) -> bool:
+    """Check if a message indicates context exhaustion."""
+    from claude_agent_sdk import ResultMessage
+
+    if isinstance(msg, ResultMessage) and msg.usage:
+        return tracker.is_context_exhausted(msg.usage)
+    return False

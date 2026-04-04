@@ -592,7 +592,7 @@ No status.
     _write(tmp_path / ".clou" / "roadmap.md", content)
     findings = validate_golden_context(tmp_path, "m1")
     msgs = _messages(findings)
-    assert any("milestone entry 1 missing '**Status:**'" in m for m in msgs)
+    assert any("milestone entry 1 missing status" in m for m in msgs)
 
 
 def test_roadmap_entry_invalid_status(tmp_path: Path) -> None:
@@ -628,6 +628,55 @@ def test_roadmap_all_valid_statuses(tmp_path: Path) -> None:
 """
     _write(tmp_path / ".clou" / "roadmap.md", content)
     assert validate_golden_context(tmp_path, "m1") == []
+
+
+def test_roadmap_inline_status_format(tmp_path: Path) -> None:
+    """Roadmap entries with inline '— status' in heading are valid."""
+    content = """\
+# Roadmap
+
+## Milestones
+### 1. Auth — completed
+### 2. Dashboard — current
+### 3. Billing — sketch
+### 4. Analytics — pending
+"""
+    _write(tmp_path / ".clou" / "roadmap.md", content)
+    assert validate_golden_context(tmp_path, "m1") == []
+
+
+def test_roadmap_mixed_status_formats(tmp_path: Path) -> None:
+    """Mix of inline and **Status:** formats both pass."""
+    content = """\
+# Roadmap
+
+## Milestones
+### 1. Auth — completed
+
+### 2. Dashboard
+**Status:** in_progress
+"""
+    _write(tmp_path / ".clou" / "roadmap.md", content)
+    assert validate_golden_context(tmp_path, "m1") == []
+
+
+def test_roadmap_hyphenated_name_not_false_status(tmp_path: Path) -> None:
+    """Hyphenated milestone names should not be parsed as inline status.
+
+    '### 5. End-to-end tests' has a plain hyphen, not an em/en-dash,
+    so the '-end' part must NOT be treated as status.
+    """
+    content = """\
+# Roadmap
+
+## Milestones
+### 1. End-to-end tests
+**Status:** completed
+"""
+    _write(tmp_path / ".clou" / "roadmap.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    # Should pass — **Status:** is present, no false warning from hyphen
+    assert findings == []
 
 
 # ---------------------------------------------------------------------------
@@ -1002,18 +1051,21 @@ def test_status_errors_are_errors(tmp_path: Path) -> None:
     assert any("Current State" in m for m in msgs)
 
 
-def test_execution_structural_errors_are_errors(tmp_path: Path) -> None:
-    """Missing ## Summary and ## Tasks in execution.md produce ERROR severity."""
+def test_execution_structural_issues_are_warnings(tmp_path: Path) -> None:
+    """Missing ## Summary and ## Tasks in execution.md produce WARNING severity.
+
+    Protocol tools guarantee correct format; these are defense-in-depth
+    for files written outside tools.
+    """
     _write(
         tmp_path / ".clou" / "milestones" / "m1" / "execution.md",
         "Nothing useful.\n",
     )
     findings = validate_golden_context(tmp_path, "m1")
-    errs = errors_only(findings)
-    assert len(errs) >= 2
-    msgs = _messages(errs)
+    warns = warnings_only(findings)
+    msgs = _messages(warns)
     assert any("## Summary" in m for m in msgs)
-    assert any("## Tasks" in m for m in msgs)
+    assert any("## Tasks" in m or "T<N>" in m for m in msgs)
 
 
 def test_formatting_issues_are_warnings(tmp_path: Path) -> None:
@@ -1199,7 +1251,8 @@ last_updated: 2026-03-28
 | impl | in_progress | --- |
 """
 
-# An execution.md that is missing the ## Tasks heading — normally produces ERROR.
+# An execution.md missing ## Tasks — produces WARNING (defense-in-depth;
+# protocol tools guarantee correct format when used).
 _BAD_EXECUTION_NO_TASKS = """\
 ## Summary
 status: completed
@@ -1227,8 +1280,8 @@ def test_completed_phase_errors_downgraded_to_warning(tmp_path: Path) -> None:
     assert any("missing '## Tasks'" in f.message for f in setup_warns)
 
 
-def test_pending_phase_errors_not_downgraded(tmp_path: Path) -> None:
-    """Pending phase with missing '## Tasks' still produces ERROR — not exempt."""
+def test_pending_phase_missing_tasks_is_warning(tmp_path: Path) -> None:
+    """Pending phase with missing '## Tasks' produces WARNING (defense-in-depth)."""
     status_md = """\
 # Status
 
@@ -1245,9 +1298,9 @@ cycle: 1
     _write(ms_dir / "status.md", status_md)
     _write(ms_dir / "phases" / "impl" / "execution.md", _BAD_EXECUTION_NO_TASKS)
     findings = validate_golden_context(tmp_path, "m1")
-    errs = errors_only(findings)
-    impl_errors = [f for f in errs if "impl" in f.path]
-    assert any("missing '## Tasks'" in f.message for f in impl_errors)
+    warns = warnings_only(findings)
+    impl_warns = [f for f in warns if "impl" in f.path]
+    assert any("Tasks" in f.message or "T<N>" in f.message for f in impl_warns)
 
 
 def test_failed_phase_errors_downgraded_to_warning(tmp_path: Path) -> None:
@@ -1277,10 +1330,7 @@ cycle: 2
 
 
 def test_mixed_completed_and_pending_phases(tmp_path: Path) -> None:
-    """Mixed: completed phase bad execution.md -> WARNING.
-
-    Pending phase bad execution.md -> ERROR.
-    """
+    """Both completed and pending phases produce WARNINGs for bad execution.md."""
     status_md = """\
 # Status
 
@@ -1296,33 +1346,31 @@ cycle: 3
 """
     ms_dir = tmp_path / ".clou" / "milestones" / "m1"
     _write(ms_dir / "status.md", status_md)
-    # Both phases have bad execution.md (missing ## Tasks).
     _write(ms_dir / "phases" / "setup" / "execution.md", _BAD_EXECUTION_NO_TASKS)
     _write(ms_dir / "phases" / "impl" / "execution.md", _BAD_EXECUTION_NO_TASKS)
     findings = validate_golden_context(tmp_path, "m1")
+    # No ERRORs from execution.md structural checks.
     errs = errors_only(findings)
-    # Only the pending/in_progress phase should have ERROR findings.
-    error_paths = [f.path for f in errs]
-    assert any("impl" in p for p in error_paths)
-    assert not any("setup" in p for p in error_paths)
-    # The completed phase should have its findings as WARNING.
+    exec_errors = [f for f in errs if "execution" in f.path]
+    assert exec_errors == []
+    # Both phases should have WARNING findings.
     warns = warnings_only(findings)
     warn_paths = [f.path for f in warns]
     assert any("setup" in p for p in warn_paths)
+    assert any("impl" in p for p in warn_paths)
 
 
-def test_no_status_md_no_downgrade(tmp_path: Path) -> None:
-    """Without status.md, no phase exemptions apply — all errors remain as ERROR."""
+def test_no_status_md_execution_still_warns(tmp_path: Path) -> None:
+    """Without status.md, execution.md structural issues are still WARNINGs."""
     ms_dir = tmp_path / ".clou" / "milestones" / "m1"
-    # No status.md written.
     _write(ms_dir / "phases" / "setup" / "execution.md", _BAD_EXECUTION_NO_TASKS)
     findings = validate_golden_context(tmp_path, "m1")
-    errs = errors_only(findings)
-    assert any("missing '## Tasks'" in f.message for f in errs)
+    warns = warnings_only(findings)
+    assert any("Tasks" in f.message or "T<N>" in f.message for f in warns)
 
 
-def test_flat_execution_not_exempt(tmp_path: Path) -> None:
-    """The flat milestone-level execution.md is never subject to phase exemption."""
+def test_flat_execution_warns(tmp_path: Path) -> None:
+    """The flat milestone-level execution.md produces WARNINGs for missing structure."""
     status_md = """\
 # Status
 
@@ -1339,8 +1387,8 @@ cycle: 1
     _write(ms_dir / "status.md", status_md)
     _write(ms_dir / "execution.md", _BAD_EXECUTION_NO_TASKS)
     findings = validate_golden_context(tmp_path, "m1")
-    errs = errors_only(findings)
-    assert any("missing '## Tasks'" in f.message for f in errs)
+    warns = warnings_only(findings)
+    assert any("Tasks" in f.message or "T<N>" in f.message for f in warns)
 
 
 def test_mixed_errors_and_warnings_across_files(tmp_path: Path) -> None:
@@ -1440,9 +1488,16 @@ class TestValidateArtifactForm:
         assert len(findings) == 0
 
     def test_file_path_anti_pattern(self) -> None:
-        content = "- When user edits clou/ui/app.py, changes are reflected\n"
+        # Path at subject position — should fire
+        content = "- When clou/ui/app.py is modified, changes are reflected\n"
         findings = validate_artifact_form(content, _INTENTS_FORM, "intents.md")
         assert any("file path" in f.message for f in findings)
+
+    def test_file_path_incidental_not_flagged(self) -> None:
+        # Path as incidental location in a behavioral criterion — should not fire
+        content = "- When the user saves, the system writes to .clou/understanding.md\n"
+        findings = validate_artifact_form(content, _INTENTS_FORM, "intents.md")
+        assert not any("file path" in f.message for f in findings)
 
     def test_implementation_artifact_anti_pattern(self) -> None:
         content = "- When widget TaskGraph renders, it shows status\n"
@@ -1739,6 +1794,35 @@ class TestValidateDelivery:
 
         findings = validate_delivery(milestone_dir, cp, "m1")
         assert findings == []
+
+    def test_delivery_default_checkpoint_phase_warns_not_errors(
+        self, tmp_path: Path
+    ) -> None:
+        """When checkpoint current_phase is the default empty string, phase
+        cross-validation produces a WARNING (not ERROR) divergence."""
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        # No current_phase key -> parse_checkpoint defaults to ""
+        cp.write_text("cycle: 1\nnext_step: EXECUTE\n")
+        _write(
+            milestone_dir / "status.md",
+            "## Current State\nphase: impl\ncycle: 1\nnext_step: EXECUTE\n"
+            "## Phase Progress\n| Phase | Status |\n|---|---|\n| impl | in_progress |\n",
+        )
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        # Should NOT produce a phase-divergence ERROR.
+        assert not any(
+            f.severity == Severity.ERROR and "phase" in f.message
+            for f in findings
+        )
+        # Should produce a WARNING noting the absence.
+        assert any(
+            f.severity == Severity.WARNING and "absent" in f.message
+            for f in findings
+        )
 
 
 class TestValidateReadiness:

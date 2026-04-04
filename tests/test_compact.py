@@ -42,11 +42,15 @@ class TestCompact:
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
 
-            # Simulate the orchestrator completing compaction promptly.
+            # Simulate the orchestrator and receive_messages loop:
+            # _feed_user_input sets _compact_pending, then the
+            # receive_messages loop signals completion on ResultMessage.
             async def _fake_orchestrator() -> None:
-                await app._compact_requested.wait()
-                app._compaction_count += 1
-                app._compact_complete.set()
+                await app._compact.requested.wait()
+                app._compact.pending = True
+                # Simulate the receive_messages loop seeing a ResultMessage
+                app._compact.count += 1
+                app._compact.complete.set()
 
             task = asyncio.create_task(_fake_orchestrator())
             await dispatch(app, "/compact")
@@ -63,37 +67,37 @@ class TestCompact:
             app: ClouApp = pilot.app  # type: ignore[assignment]
 
             async def _fake_orchestrator() -> None:
-                await app._compact_requested.wait()
-                app._compaction_count += 1
-                app._compact_complete.set()
+                await app._compact.requested.wait()
+                app._compact.pending = True
+                app._compact.count += 1
+                app._compact.complete.set()
 
             task = asyncio.create_task(_fake_orchestrator())
             await dispatch(app, "/compact keep the auth discussion")
             task.cancel()
 
-            assert app._compact_instructions == "keep the auth discussion"
+            assert app._compact.instructions == "keep the auth discussion"
 
     @pytest.mark.asyncio
     async def test_compaction_count_increments(self) -> None:
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
-            assert app._compaction_count == 0
+            assert app._compact.count == 0
 
             async def _fake_orchestrator() -> None:
-                await app._compact_requested.wait()
-                app._compaction_count += 1
-                app._compact_complete.set()
+                await app._compact.requested.wait()
+                app._compact.pending = True
+                app._compact.count += 1
+                app._compact.complete.set()
 
             task = asyncio.create_task(_fake_orchestrator())
             await dispatch(app, "/compact")
             task.cancel()
 
-            assert app._compaction_count == 1
+            assert app._compact.count == 1
 
     @pytest.mark.asyncio
     async def test_compact_persists_history(self, tmp_path, monkeypatch) -> None:
-        from pathlib import Path
-
         from clou.ui.history import ConversationEntry
 
         monkeypatch.chdir(tmp_path)
@@ -104,9 +108,10 @@ class TestCompact:
             )
 
             async def _fake_orchestrator() -> None:
-                await app._compact_requested.wait()
-                app._compaction_count += 1
-                app._compact_complete.set()
+                await app._compact.requested.wait()
+                app._compact.pending = True
+                app._compact.count += 1
+                app._compact.complete.set()
 
             task = asyncio.create_task(_fake_orchestrator())
             await dispatch(app, "/compact")
@@ -116,3 +121,26 @@ class TestCompact:
             assert history_file.exists()
             content = history_file.read_text()
             assert "hello" in content
+
+    @pytest.mark.asyncio
+    async def test_compact_skips_prior_result(self) -> None:
+        """When a user query is in flight, compact waits for the right ResultMessage."""
+        async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+
+            # Simulate: user query was in flight when compact was sent
+            app._compact.pending = True
+            app._compact.results_to_skip = 1  # one prior query pending
+
+            # First ResultMessage — belongs to the prior user query
+            assert app._compact.pending is True
+            # Simulate receive_messages handling:
+            app._compact.results_to_skip -= 1
+            assert app._compact.results_to_skip == 0
+            assert app._compact.pending is True  # still pending
+
+            # Second ResultMessage — belongs to the compact
+            app._compact.pending = False
+            app._compact.count += 1
+            app._compact.complete.set()
+            assert app._compact.count == 1

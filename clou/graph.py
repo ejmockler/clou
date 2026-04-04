@@ -30,12 +30,21 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
+class ResourceBounds:
+    """Per-task resource limits from @resource_bounds decorator."""
+
+    tokens: int | None = None
+    timeout_seconds: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Sig:
     """A task function's signature extracted from compose.py."""
 
     name: str
     params: tuple[tuple[str, str | None], ...]
     return_type: str | None
+    resource_bounds: ResourceBounds | None = None
 
 
 # (func_name, [(position, variable_name)], [target_variable])
@@ -74,7 +83,17 @@ def extract_dag_data(
     sigs = _extract_sigs(tree)
     entry = _find_entry(tree)
 
-    tasks = [{"name": name, "status": "pending"} for name in sigs]
+    tasks: list[dict[str, str]] = []
+    for name, sig in sigs.items():
+        task: dict[str, str] = {"name": name, "status": "pending"}
+        if sig.resource_bounds is not None:
+            bounds_dict: dict[str, int] = {}
+            if sig.resource_bounds.tokens is not None:
+                bounds_dict["tokens"] = sig.resource_bounds.tokens
+            if sig.resource_bounds.timeout_seconds is not None:
+                bounds_dict["timeout_seconds"] = sig.resource_bounds.timeout_seconds
+            task["resource_bounds"] = bounds_dict  # type: ignore[assignment]
+        tasks.append(task)
 
     deps: dict[str, list[str]] = {name: [] for name in sigs}
     if entry is not None:
@@ -189,6 +208,9 @@ def validate(source: str) -> list[str]:
     # Parse decorator edges (validates without erroring on their presence)
     _extract_decorator_edges(tree)
 
+    # Resource bounds: values must be positive integers when present
+    errors += _check_resource_bounds(sigs, sig_linenos)
+
     # Width: multi-task graphs should use gather() for concurrency
     errors += _check_width(sigs, entry, calls)
 
@@ -216,8 +238,47 @@ def _extract_sigs(tree: ast.Module) -> dict[str, Sig]:
                 for a in node.args.args
             )
             ret = ast.unparse(node.returns) if node.returns else None
-            sigs[node.name] = Sig(node.name, params, ret)
+            bounds = _extract_resource_bounds(node)
+            sigs[node.name] = Sig(node.name, params, ret, bounds)
     return sigs
+
+
+def _extract_resource_bounds(
+    node: ast.AsyncFunctionDef,
+) -> ResourceBounds | None:
+    """Extract @resource_bounds(...) decorator kwargs from a function def."""
+    for dec in node.decorator_list:
+        if not isinstance(dec, ast.Call):
+            continue
+        if _call_name(dec) != "resource_bounds":
+            continue
+        tokens: int | None = None
+        timeout_seconds: int | None = None
+        for kw in dec.keywords:
+            val = _const_int(kw.value)
+            if val is None:
+                continue
+            if kw.arg == "tokens":
+                tokens = val
+            elif kw.arg == "timeout_seconds":
+                timeout_seconds = val
+        if tokens is not None or timeout_seconds is not None:
+            return ResourceBounds(tokens=tokens, timeout_seconds=timeout_seconds)
+    return None
+
+
+def _const_int(node: ast.expr) -> int | None:
+    """Extract an integer constant from an AST node, handling unary minus."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.USub)
+        and isinstance(node.operand, ast.Constant)
+        and isinstance(node.operand.value, int)
+    ):
+        return -node.operand.value
+    return None
 
 
 def _extract_decorator_edges(
@@ -303,6 +364,32 @@ def _check_min_decomposition(sigs: dict[str, Sig]) -> list[str]:
             "\u2014 identify at least 3 substantive phases"
         ]
     return []
+
+
+def _check_resource_bounds(
+    sigs: dict[str, Sig],
+    sig_linenos: dict[str, int],
+) -> list[str]:
+    """Validate @resource_bounds values are positive when present."""
+    errors: list[str] = []
+    for sig in sigs.values():
+        if sig.resource_bounds is None:
+            continue
+        ln = sig_linenos.get(sig.name, 0)
+        if sig.resource_bounds.tokens is not None and sig.resource_bounds.tokens <= 0:
+            errors.append(
+                f"Invalid resource_bounds on {sig.name}: "
+                f"tokens must be positive (line {ln})"
+            )
+        if (
+            sig.resource_bounds.timeout_seconds is not None
+            and sig.resource_bounds.timeout_seconds <= 0
+        ):
+            errors.append(
+                f"Invalid resource_bounds on {sig.name}: "
+                f"timeout_seconds must be positive (line {ln})"
+            )
+    return errors
 
 
 def _find_entry(tree: ast.Module) -> ast.AsyncFunctionDef | None:

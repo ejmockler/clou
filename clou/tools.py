@@ -72,6 +72,9 @@ async def clou_create_milestone(
     )
 
 
+_STATUS_MAX_CHARS = 8_000  # cap total output to avoid bloating context
+
+
 async def clou_status(project_dir: Path) -> str:
     """Read current Clou status: active milestones, open escalations."""
     clou_dir = project_dir / ".clou"
@@ -102,7 +105,10 @@ async def clou_status(project_dir: Path) -> str:
     if not sections:
         return "No status information available."
 
-    return "\n\n".join(sections)
+    result = "\n\n".join(sections)
+    if len(result) > _STATUS_MAX_CHARS:
+        return result[:_STATUS_MAX_CHARS] + "\n\n… (truncated)"
+    return result
 
 
 async def clou_init(

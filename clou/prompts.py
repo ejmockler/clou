@@ -119,6 +119,17 @@ def build_cycle_prompt(
         write_paths += [
             f"- {milestone_prefix}/phases/{phase_name}/execution.md  (agent results)",
         ]
+        # For gather() layers, also list shard write paths so the
+        # coordinator knows which files workers will produce.
+        if dag_data is not None:
+            tasks_list_wr, deps_dict_wr = dag_data
+            layers_wr = _compute_layers(tasks_list_wr, deps_dict_wr)
+            gather_layers = [layer for layer in layers_wr if len(layer) > 1]
+            if gather_layers:
+                write_paths.append(
+                    f"- {milestone_prefix}/phases/{phase_name}/"
+                    f"execution-{{task}}.md  (per-task shards for gather() groups)"
+                )
     elif cycle_type in ("ASSESS", "VERIFY"):
         write_paths += [
             f"- {milestone_prefix}/decisions.md  (judgment log)",

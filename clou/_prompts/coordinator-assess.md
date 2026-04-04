@@ -8,6 +8,17 @@ Determine: rework needed, phase complete, or escalation required.
 
 <procedure>
 1. Read execution.md for the current phase — summary first, then tasks.
+1b. If execution.md shows partial gather() completion (some tasks
+    succeeded, some failed/aborted):
+    - Identify which tasks succeeded and evaluate their output normally.
+    - For failed tasks: read the failure record (failure type, error,
+      dependency impact). Assess whether the failure is recoverable
+      (rework) or structural (escalation).
+    - For aborted tasks: these were stopped because a dependency failed.
+      They are not evaluated — they will re-execute after the dependency
+      is fixed.
+    - The rework plan should address root causes (failed tasks) not
+      symptoms (aborted tasks).
 2. Compare each task's results against its criteria in compose.py.
 
 3. Dispatch the brutalist (read-only agent). The brutalist discovers
@@ -95,7 +106,7 @@ Determine: rework needed, phase complete, or escalation required.
    Cross-model agreement strengthens the case. Single-model findings
    deserve more scrutiny.
 
-8. Write checkpoint (path in cycle prompt):
+8. Call clou_write_checkpoint:
      cycle: {current cycle number}
      step: ASSESS
      next_step: {see routing below}
@@ -110,7 +121,7 @@ Determine: rework needed, phase complete, or escalation required.
    - If all phases complete: next_step: VERIFY
    - If blocked: write escalation, next_step depends on severity.
 
-9. Update status.md with phase progress.
+9. Call clou_update_status with phase progress.
 </procedure>
 
 <schemas>

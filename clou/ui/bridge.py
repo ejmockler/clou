@@ -58,6 +58,44 @@ _ANSI_ESCAPE_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# SDK message classification helpers
+# ---------------------------------------------------------------------------
+# The SDK exposes ResultMessage and TaskNotificationMessage as named types,
+# but task lifecycle events (started, progress) are distinguished only by
+# attributes.  These helpers centralise the duck-typing so callers don't
+# repeat the attribute-sniffing dance.
+
+
+def is_task_started(msg: object) -> bool:
+    """True if *msg* is a task-started event (has task_id + description, no status/progress)."""
+    return (
+        hasattr(msg, "task_id")
+        and hasattr(msg, "description")
+        and not hasattr(msg, "status")
+        and not hasattr(msg, "last_tool_name")
+    )
+
+
+def is_task_progress(msg: object) -> bool:
+    """True if *msg* is a task-progress event (has task_id + last_tool_name)."""
+    return hasattr(msg, "task_id") and hasattr(msg, "last_tool_name")
+
+
+def is_task_complete(msg: object) -> bool:
+    """True if *msg* is a task-completion event (has task_id + status + summary)."""
+    return (
+        hasattr(msg, "task_id")
+        and hasattr(msg, "status")
+        and hasattr(msg, "summary")
+    )
+
+
+# ---------------------------------------------------------------------------
+# ANSI stripping
+# ---------------------------------------------------------------------------
+
+
 def _strip_ansi(text: str | None) -> str:
     """Strip ANSI escape sequences from text."""
     if text is None:
@@ -414,17 +452,12 @@ def route_coordinator_message(
         return
 
     # TaskStartedMessage — has .task_id + .description (no .status, no .last_tool_name)
-    if (
-        hasattr(msg, "task_id")
-        and hasattr(msg, "description")
-        and not hasattr(msg, "status")
-        and not hasattr(msg, "last_tool_name")
-    ):
+    if is_task_started(msg):
         post(ClouAgentSpawned(task_id=_strip_ansi(msg.task_id), description=_strip_ansi(msg.description)))
         return
 
     # TaskProgressMessage — has .task_id + .last_tool_name
-    if hasattr(msg, "task_id") and hasattr(msg, "last_tool_name"):
+    if is_task_progress(msg):
         usage = getattr(msg, "usage", {}) or {}
         post(
             ClouAgentProgress(
@@ -437,7 +470,7 @@ def route_coordinator_message(
         return
 
     # TaskNotificationMessage — has .task_id + .status + .summary
-    if hasattr(msg, "task_id") and hasattr(msg, "status") and hasattr(msg, "summary"):
+    if is_task_complete(msg):
         post(
             ClouAgentComplete(
                 task_id=_strip_ansi(msg.task_id),

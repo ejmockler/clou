@@ -30,7 +30,6 @@ from clou.ui.messages import (
 )
 from clou.ui.rendering.breathing import BREATH_FPS, breathing_text
 from clou.ui.rendering.tool_summary import (
-    format_ask_user_question,
     tool_glyph,
     tool_summary,
 )
@@ -384,27 +383,27 @@ class ConversationWidget(DragScrollMixin, Widget):
         summary = tool_summary(msg.name, msg.tool_input)
         if not self._tc.working:
             self._start_working()
-        if msg.name == "AskUserQuestion":
-            self._stop_working()
-            md = format_ask_user_question(msg.tool_input)
-            if md:
-                self._append_markdown(md)
-                self._clear_tail()
-            return
         if msg.name in ("ask_user", "mcp__clou__ask_user"):
             self._stop_working()
-            question = msg.tool_input.get("question", "")
-            choices = msg.tool_input.get("choices")
+            question = str(msg.tool_input.get("question", ""))
+            raw_choices = msg.tool_input.get("choices")
+            choices: list[str] | None = (
+                [str(c) for c in raw_choices] if isinstance(raw_choices, list) else None
+            )
             parts: list[str] = []
             if question:
                 parts.append(f"**{question}**")
-            if isinstance(choices, list):
+            if choices:
                 for i, c in enumerate(choices, 1):
                     parts.append(f"{i}. {c}")
             md = "\n".join(parts).strip()
             if md:
                 self._append_markdown(md)
             self._clear_tail()
+            # Notify the app that the gate is waiting for input.
+            from clou.ui.messages import ClouAskUser
+
+            self.post_message(ClouAskUser(question=question, choices=choices))
             return
         if msg.name == "Agent":
             desc = str(msg.tool_input.get("description", "agent"))

@@ -106,6 +106,15 @@ class ClouProcessingStarted(Message):
         super().__init__()
 
 
+class ClouAskUser(Message):
+    """The supervisor is waiting for the user to answer a question."""
+
+    def __init__(self, question: str, choices: list[str] | None) -> None:
+        self.question = question
+        self.choices = choices
+        super().__init__()
+
+
 class ClouRateLimit(Message):
     """Rate limit state change."""
 

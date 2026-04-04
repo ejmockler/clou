@@ -38,10 +38,8 @@ _had_sdk = "claude_agent_sdk" in sys.modules
 if not _had_sdk:
     sys.modules["claude_agent_sdk"] = _mock_sdk
 
-from clou.orchestrator import (  # noqa: E402
-    _build_mcp_server,
-    run_coordinator,
-)
+from clou.coordinator import run_coordinator  # noqa: E402
+from clou.orchestrator import _build_mcp_server  # noqa: E402
 from clou.ui.messages import (  # noqa: E402
     ClouCoordinatorComplete,
     ClouCycleComplete,
@@ -54,8 +52,9 @@ from clou.ui.messages import (  # noqa: E402
 if not _had_sdk:
     del sys.modules["claude_agent_sdk"]
 
-# Patch target prefix
-_P = "clou.orchestrator"
+# Patch target prefixes
+_P = "clou.orchestrator"   # supervisor-resident names
+_PC = "clou.coordinator"   # coordinator-resident names
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +116,13 @@ class TestStatusUpdateEmitted:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[("PLAN", ["milestone.md"]), ("COMPLETE", [])],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=0),
-            patch(f"{_P}._run_single_cycle", return_value="ok"),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
-            patch(f"{_P}.build_cycle_prompt", return_value="prompt"),
+            patch(f"{_PC}.read_cycle_count", return_value=0),
+            patch(f"{_PC}._run_single_cycle", return_value="ok"),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.build_cycle_prompt", return_value="prompt"),
         ):
             result = await run_coordinator(tmp_path, "test-ms", app=app)
 
@@ -143,16 +142,16 @@ class TestCycleCompleteEmitted:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=2),
-            patch(f"{_P}._run_single_cycle", return_value="ok"),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
-            patch(f"{_P}.build_cycle_prompt", return_value="prompt"),
+            patch(f"{_PC}.read_cycle_count", return_value=2),
+            patch(f"{_PC}._run_single_cycle", return_value="ok"),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.build_cycle_prompt", return_value="prompt"),
         ):
             result = await run_coordinator(tmp_path, "test-ms", app=app)
 
@@ -181,13 +180,13 @@ class TestDagUpdateAfterCycle:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[("PLAN", ["milestone.md"]), ("COMPLETE", [])],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=0),
-            patch(f"{_P}._run_single_cycle", return_value="ok"),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
-            patch(f"{_P}.build_cycle_prompt", return_value="prompt"),
+            patch(f"{_PC}.read_cycle_count", return_value=0),
+            patch(f"{_PC}._run_single_cycle", return_value="ok"),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.build_cycle_prompt", return_value="prompt"),
         ):
             result = await run_coordinator(tmp_path, "test-ms", app=app)
 
@@ -217,16 +216,16 @@ class TestEscalationDetected:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=0),
-            patch(f"{_P}._run_single_cycle", return_value="ok"),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
-            patch(f"{_P}.build_cycle_prompt", return_value="prompt"),
+            patch(f"{_PC}.read_cycle_count", return_value=0),
+            patch(f"{_PC}._run_single_cycle", return_value="ok"),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.build_cycle_prompt", return_value="prompt"),
         ):
             result = await run_coordinator(tmp_path, "test-ms", app=app)
 
@@ -264,16 +263,16 @@ class TestSeenEscalationsPersisted:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=0),
-            patch(f"{_P}._run_single_cycle", return_value="ok"),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
-            patch(f"{_P}.build_cycle_prompt", return_value="prompt"),
+            patch(f"{_PC}.read_cycle_count", return_value=0),
+            patch(f"{_PC}._run_single_cycle", return_value="ok"),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.build_cycle_prompt", return_value="prompt"),
         ):
             result = await run_coordinator(tmp_path, "test-ms", app=app)
 
@@ -300,7 +299,7 @@ class TestSeenEscalationsPersisted:
 
         with (
             patch(
-                f"{_P}.determine_next_cycle",
+                f"{_PC}.determine_next_cycle",
                 side_effect=[
                     ("EXECUTE", ["status.md"]),
                     # Don't COMPLETE — escalation_cycle_limit so we can
@@ -309,10 +308,10 @@ class TestSeenEscalationsPersisted:
                     ("COMPLETE", []),
                 ],
             ),
-            patch(f"{_P}.read_cycle_count", return_value=0),
-            patch(f"{_P}._run_single_cycle", return_value="ok"),
-            patch(f"{_P}.validate_golden_context", return_value=[]),
-            patch(f"{_P}.build_cycle_prompt", return_value="prompt"),
+            patch(f"{_PC}.read_cycle_count", return_value=0),
+            patch(f"{_PC}._run_single_cycle", return_value="ok"),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.build_cycle_prompt", return_value="prompt"),
         ):
             result = await run_coordinator(tmp_path, "test-ms", app=app)
 
@@ -330,7 +329,7 @@ class TestSeenEscalationsPersisted:
         seen_path.write_text("old-escalation.md\n")
 
         with patch(
-            f"{_P}.determine_next_cycle",
+            f"{_PC}.determine_next_cycle",
             return_value=("COMPLETE", []),
         ):
             result = await run_coordinator(tmp_path, "test-ms")

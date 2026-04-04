@@ -435,6 +435,7 @@ _INLINE_FALLBACK = HarnessTemplate(
         ],
         "worker": [
             "milestones/*/phases/*/execution.md",
+            "milestones/*/phases/*/execution-*.md",
         ],
         "verifier": [
             "milestones/*/phases/verification/execution.md",

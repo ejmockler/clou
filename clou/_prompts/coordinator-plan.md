@@ -108,17 +108,25 @@ phase specifications and initial status.
    for each phase. Include: scope, relevant context, what the agent
    needs to know about the domain.
 
-9. Write initial status.md with all phases listed as pending.
+9. Call clou_update_status to write initial status.md:
+   - phase: {first phase name}
+   - cycle: 1
+   - next_step: EXECUTE
+   - phase_progress: {all phases mapped to "pending"}
 
 10. Write decisions.md entry for PLAN cycle with decomposition reasoning.
 
-11. Write checkpoint (path in cycle prompt above):
+11. Call clou_write_checkpoint:
    - cycle: 1
    - step: PLAN
    - next_step: EXECUTE
    - current_phase: {first phase name}
    - phases_completed: 0
    - phases_total: {count}
+
+Protocol tools: Use clou_write_checkpoint and clou_update_status for
+checkpoint and status files. These tools guarantee correct format.
+Use Write/Edit only for narrative files (decisions.md, phase specs).
 </procedure>
 
 <schemas>
@@ -126,21 +134,6 @@ phase specifications and initial status.
 compose.py: typed async functions + execute() entry point.
 Validated by orchestrator via AST parsing (graph.py). Checks:
 well-formedness, completeness, acyclicity, type compatibility.
-
-status.md:
-```
-# Status: {milestone}
-## Current State
-phase: {name}
-cycle: 1
-last_updated: {ISO timestamp}
-## Phase Progress
-| Phase | Status | Summary |
-|---|---|---|
-| {name} | pending | — |
-## Notes
-- Plan created cycle 1
-```
 
 </schemas>
 

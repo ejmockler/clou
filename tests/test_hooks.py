@@ -68,7 +68,7 @@ def test_build_hooks_returns_hook_configs() -> None:
     hooks = build_hooks("worker", Path("/tmp/project"))
     pre = hooks["PreToolUse"][0]
     assert isinstance(pre, HookConfig)
-    assert pre.matcher == "Write|Edit|MultiEdit"
+    assert pre.matcher == "Write|Edit|MultiEdit|Bash"
     assert len(pre.hooks) == 1
 
 
@@ -92,6 +92,61 @@ def test_write_outside_clou_allowed() -> None:
                 "tool_name": "Write",
                 "tool_input": {"file_path": "/tmp/project/src/main.py"},
             },
+            "tool-1",
+            {},
+        )
+    )
+    assert _is_allowed(result)
+
+
+def test_bash_redirect_to_clou_denied() -> None:
+    """Bash commands that redirect to .clou/ paths are denied."""
+    hook = _get_pre_hook("coordinator")
+    for cmd in [
+        "echo bad > .clou/milestones/m1/compose.py",
+        "echo bad >> .clou/milestones/m1/status.md",
+        "cat foo | tee .clou/milestones/m1/status.md",
+        "mv tmp.py .clou/milestones/m1/compose.py",
+        "rm .clou/milestones/m1/compose.py",
+        "sed -i 's/old/new/' .clou/milestones/m1/compose.py",
+        "cp malicious.py .clou/milestones/m1/compose.py",
+        "touch .clou/milestones/m1/compose.py",
+    ]:
+        result = _run(
+            hook(
+                {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                "tool-1",
+                {},
+            )
+        )
+        assert not _is_allowed(result), f"Should deny: {cmd}"
+
+
+def test_bash_reading_clou_allowed() -> None:
+    """Bash commands that only read .clou/ paths are allowed."""
+    hook = _get_pre_hook("coordinator")
+    for cmd in [
+        "cat .clou/milestones/m1/compose.py",
+        "ls .clou/milestones/m1/",
+        "grep -r pattern .clou/",
+        "head -20 .clou/milestones/m1/status.md",
+    ]:
+        result = _run(
+            hook(
+                {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                "tool-1",
+                {},
+            )
+        )
+        assert _is_allowed(result), f"Should allow: {cmd}"
+
+
+def test_bash_outside_clou_allowed() -> None:
+    """Bash commands writing outside .clou/ are allowed."""
+    hook = _get_pre_hook("coordinator")
+    result = _run(
+        hook(
+            {"tool_name": "Bash", "tool_input": {"command": "echo hello > src/main.py"}},
             "tool-1",
             {},
         )
@@ -1545,7 +1600,7 @@ def test_agent_tier_map_covers_all_agent_definitions() -> None:
     from that agent. This test catches the mismatch early.
     """
     try:
-        from clou.orchestrator import _build_agents
+        from clou.coordinator import _build_agents
     except (ImportError, ModuleNotFoundError):
         # SDK not installed — can't import orchestrator.
         # Fall back to verifying the map has the expected entries.
@@ -1645,13 +1700,13 @@ def test_post_hook_form_validation_warns_bad_intents(tmp_path: Path) -> None:
 
 
 def test_post_hook_form_validation_catches_file_paths(tmp_path: Path) -> None:
-    """File paths in intents trigger anti-pattern warnings."""
+    """File paths at subject position in intents trigger anti-pattern warnings."""
     clou_dir = tmp_path / ".clou" / "milestones" / "m1"
     intents = clou_dir / "intents.md"
     result = _run_post_hook_with_template(
         tmp_path,
         str(intents),
-        "- When user edits clou/ui/app.py, changes are reflected\n",
+        "- When clou/ui/app.py is edited, changes are reflected\n",
     )
     ctx = result.get("hookSpecificOutput", {}).get("additionalContext", "")
     assert "file path" in ctx

@@ -223,6 +223,78 @@ def test_determine_next_cycle_unknown_falls_back(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# determine_next_cycle — shard-aware ASSESS read set (M17)
+# ---------------------------------------------------------------------------
+
+
+def test_assess_read_set_with_shards(tmp_path: Path) -> None:
+    """ASSESS includes execution-*.md shard files when they exist on disk."""
+    # Build a directory structure that matches the checkpoint path layout:
+    # checkpoint lives at {ms}/active/coordinator.md
+    # shards live at {ms}/phases/{phase}/execution-{task}.md
+    ms_dir = tmp_path / "milestones" / "m1"
+    cp_path = ms_dir / "active" / "coordinator.md"
+    phase_dir = ms_dir / "phases" / "building"
+    phase_dir.mkdir(parents=True)
+    cp_path.parent.mkdir(parents=True)
+    cp_path.write_text(
+        "cycle: 4\nstep: EXECUTE\nnext_step: ASSESS\ncurrent_phase: building\n"
+    )
+    # Create the merged execution.md and two shard files.
+    (phase_dir / "execution.md").write_text("## Summary\nstatus: completed\n")
+    (phase_dir / "execution-alpha.md").write_text("## Summary\nstatus: completed\n")
+    (phase_dir / "execution-beta.md").write_text("## Summary\nstatus: completed\n")
+
+    cycle_type, read_set = determine_next_cycle(cp_path, "m1")
+    assert cycle_type == "ASSESS"
+    # Standard entries always present.
+    assert "phases/building/execution.md" in read_set
+    assert "requirements.md" in read_set
+    assert "decisions.md" in read_set
+    assert "assessment.md" in read_set
+    # Shard files appended.
+    assert "phases/building/execution-alpha.md" in read_set
+    assert "phases/building/execution-beta.md" in read_set
+
+
+def test_assess_read_set_without_shards(tmp_path: Path) -> None:
+    """No shard files present -- standard execution.md only, no extras."""
+    ms_dir = tmp_path / "milestones" / "m1"
+    cp_path = ms_dir / "active" / "coordinator.md"
+    phase_dir = ms_dir / "phases" / "testing"
+    phase_dir.mkdir(parents=True)
+    cp_path.parent.mkdir(parents=True)
+    cp_path.write_text(
+        "cycle: 4\nstep: EXECUTE\nnext_step: ASSESS\ncurrent_phase: testing\n"
+    )
+    (phase_dir / "execution.md").write_text("## Summary\nstatus: completed\n")
+
+    cycle_type, read_set = determine_next_cycle(cp_path, "m1")
+    assert cycle_type == "ASSESS"
+    assert "phases/testing/execution.md" in read_set
+    # No shard entries.
+    shard_entries = [f for f in read_set if "execution-" in f]
+    assert shard_entries == []
+
+
+def test_assess_read_set_no_phase_dir(tmp_path: Path) -> None:
+    """Phase dir does not exist yet -- graceful, no shards added."""
+    ms_dir = tmp_path / "milestones" / "m1"
+    cp_path = ms_dir / "active" / "coordinator.md"
+    cp_path.parent.mkdir(parents=True)
+    cp_path.write_text(
+        "cycle: 4\nstep: EXECUTE\nnext_step: ASSESS\ncurrent_phase: missing\n"
+    )
+
+    cycle_type, read_set = determine_next_cycle(cp_path, "m1")
+    assert cycle_type == "ASSESS"
+    assert "phases/missing/execution.md" in read_set
+    # No crash, no shard entries.
+    shard_entries = [f for f in read_set if "execution-" in f]
+    assert shard_entries == []
+
+
+# ---------------------------------------------------------------------------
 # read_cycle_count
 # ---------------------------------------------------------------------------
 
@@ -1538,6 +1610,33 @@ def test_staging_exclude_patterns() -> None:
         assert not any(
             fnmatch.fnmatch(f, pat) for pat in _STAGING_EXCLUDE_PATTERNS
         ), f"Should include {f}"
+
+
+def test_staging_scopes_clou_to_active_milestone() -> None:
+    """git_commit_phase only stages .clou/ files for the active milestone."""
+    import fnmatch  # noqa: F811
+
+    from clou.recovery import _STAGING_EXCLUDE_PATTERNS  # noqa: F811
+
+    milestone = "my-ms"
+    milestone_prefix = f".clou/milestones/{milestone}/"
+    changed = [
+        ".clou/milestones/my-ms/compose.py",       # should include
+        ".clou/milestones/my-ms/status.md",         # should include
+        ".clou/milestones/other-ms/compose.py",     # different milestone — exclude
+        ".clou/memory.md",                          # shared .clou/ metadata — exclude
+        "src/main.py",                              # workspace file — include
+    ]
+    to_stage = [
+        f for f in changed
+        if not any(fnmatch.fnmatch(f, pat) for pat in _STAGING_EXCLUDE_PATTERNS)
+        and (not f.startswith(".clou/") or f.startswith(milestone_prefix))
+    ]
+    assert ".clou/milestones/my-ms/compose.py" in to_stage
+    assert ".clou/milestones/my-ms/status.md" in to_stage
+    assert "src/main.py" in to_stage
+    assert ".clou/milestones/other-ms/compose.py" not in to_stage
+    assert ".clou/memory.md" not in to_stage
 
 
 # ---------------------------------------------------------------------------

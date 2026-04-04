@@ -11,6 +11,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
@@ -32,6 +33,7 @@ from clou.ui.messages import (
     ClouAgentComplete,
     ClouAgentProgress,
     ClouAgentSpawned,
+    ClouAskUser,
     ClouCoordinatorComplete,
     ClouCoordinatorSpawned,
     ClouDagUpdate,
@@ -62,6 +64,33 @@ _log = logging.getLogger(__name__)
 #: Animation frame rate (frames per second).
 _FPS: int = 24
 _FRAME_DURATION: float = 1.0 / _FPS
+
+
+@dataclass
+class CompactionState:
+    """State machine for context compaction.
+
+    Groups the 6 coordinating variables that were previously scattered
+    across ClouApp instance vars.  Manipulated by the orchestrator's
+    ``_feed_user_input`` coroutine (request side) and the supervisor
+    receive loop (completion side).
+    """
+
+    requested: asyncio.Event = field(default_factory=asyncio.Event)
+    complete: asyncio.Event = field(default_factory=asyncio.Event)
+    instructions: str = ""
+    pending: bool = False
+    results_to_skip: int = 0
+    count: int = 0
+
+    def reset(self) -> None:
+        """Reset to initial state (e.g., on new supervisor session)."""
+        self.requested.clear()
+        self.complete.clear()
+        self.instructions = ""
+        self.pending = False
+        self.results_to_skip = 0
+        self.count = 0
 
 
 class ClouApp(App[None]):
@@ -112,11 +141,8 @@ class ClouApp(App[None]):
         self._agent_task_map: dict[str, str] = {}  # task_id → task_name
         self._session_start_time: float = time.monotonic()
         self._conversation_history: list[ConversationEntry] = []
-        # Compact signaling: handler sets the event; orchestrator checks it.
-        self._compact_requested: asyncio.Event = asyncio.Event()
-        self._compact_instructions: str = ""
-        self._compact_complete: asyncio.Event = asyncio.Event()
-        self._compaction_count: int = 0
+        # Compact state machine (request/completion handshake with orchestrator).
+        self._compact = CompactionState()
         # Stop signaling: /stop command sets event; orchestrator checks
         # at cycle boundary (DB-15 Tension 1).
         self._stop_requested: asyncio.Event = asyncio.Event()
@@ -554,6 +580,12 @@ class ClouApp(App[None]):
         self._user_input_ready.set()
         conversation.update_queue_count(self._queue_count)
 
+        # Reset placeholder in case we were answering an ask_user question.
+        try:
+            self.query_one("#user-input ChatInput").placeholder = "Talk to clou..."
+        except LookupError:
+            pass
+
     @work(exclusive=False)
     async def _dispatch_command(self, text: str) -> None:
         """Run slash command dispatch as an async worker."""
@@ -631,10 +663,7 @@ class ClouApp(App[None]):
 
         # Reset app-level state.
         self._session_start_time = time.monotonic()
-        self._compact_requested.clear()
-        self._compact_complete.clear()
-        self._compaction_count = 0
-        self._compact_instructions = ""
+        self._compact.reset()
         self._escalation_queue.clear()
         self._dag_tasks = []
         self._dag_deps = {}
@@ -740,6 +769,18 @@ class ClouApp(App[None]):
         try:
             conv = self.query_one(ConversationWidget)
             conv.update_queue_count(self._queue_count)
+        except LookupError:
+            pass
+
+    def on_clou_ask_user(self, msg: ClouAskUser) -> None:
+        """Gate opened — update placeholder so the user knows a response is expected."""
+        try:
+            chat_input = self.query_one("#user-input ChatInput")
+            if msg.choices:
+                chat_input.placeholder = "Pick a number or type your answer..."
+            else:
+                chat_input.placeholder = "Type your answer..."
+            chat_input.focus()
         except LookupError:
             pass
 
