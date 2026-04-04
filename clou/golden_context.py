@@ -39,6 +39,14 @@ VALID_NEXT_STEPS = frozenset({
 TASK_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
 PHASE_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
 
+# Protocol artifact glob patterns — files written via MCP tools, not Write.
+# Used by hooks.py (to exclude from Write permissions) and recovery.py
+# (to include in self-heal scope).  Single source of truth.
+PROTOCOL_ARTIFACT_PATTERNS = (
+    "milestones/*/status.md",
+    "milestones/*/active/coordinator.md",
+)
+
 # Phase name pattern — alphanumeric, hyphens, underscores only.
 _PHASE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 

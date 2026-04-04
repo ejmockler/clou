@@ -302,7 +302,8 @@ def test_coordinator_allowed_compose() -> None:
     assert _is_allowed(result)
 
 
-def test_coordinator_allowed_status() -> None:
+def test_coordinator_denied_status_via_write() -> None:
+    """Protocol artifact: status.md must go through clou_update_status tool."""
     hook = _get_pre_hook("coordinator")
     result = _run(
         hook(
@@ -316,7 +317,7 @@ def test_coordinator_allowed_status() -> None:
             {},
         )
     )
-    assert _is_allowed(result)
+    assert not _is_allowed(result)
 
 
 def test_coordinator_allowed_phase_md() -> None:
@@ -968,14 +969,14 @@ def _get_scoped_pre_hook(
 
 
 def test_scoped_coordinator_allowed_own_milestone() -> None:
-    """Coordinator scoped to 'auth' can write to auth milestone."""
+    """Coordinator scoped to 'auth' can write to narrative files in auth milestone."""
     hook = _get_scoped_pre_hook("coordinator", "auth")
     result = _run(
         hook(
             {
                 "tool_name": "Write",
                 "tool_input": {
-                    "file_path": "/tmp/project/.clou/milestones/auth/status.md"
+                    "file_path": "/tmp/project/.clou/milestones/auth/decisions.md"
                 },
             },
             "tool-1",
@@ -993,7 +994,7 @@ def test_scoped_coordinator_blocked_other_milestone() -> None:
             {
                 "tool_name": "Write",
                 "tool_input": {
-                    "file_path": "/tmp/project/.clou/milestones/payments/status.md"
+                    "file_path": "/tmp/project/.clou/milestones/payments/decisions.md"
                 },
             },
             "tool-1",
@@ -1084,11 +1085,14 @@ def test_coordinator_pattern_matches_milestone_scoped_checkpoint() -> None:
     assert not fnmatch.fnmatch("active/coordinator.md", pattern)
 
 
-def test_scoped_permissions_contains_milestone_coordinator_checkpoint() -> None:
-    """_scoped_permissions for coordinator with a milestone returns a list
-    containing milestones/{ms}/active/coordinator.md."""
+def test_scoped_permissions_no_protocol_artifacts_for_coordinator() -> None:
+    """Coordinator write permissions exclude protocol artifacts (checkpoint,
+    status.md) — these are written via MCP tools, not Write."""
     patterns = _scoped_permissions("coordinator", "proxy-removal")
-    assert "milestones/proxy-removal/active/coordinator.md" in patterns
+    assert "milestones/proxy-removal/active/coordinator.md" not in patterns
+    assert "milestones/proxy-removal/status.md" not in patterns
+    # Narrative files are still allowed.
+    assert "milestones/proxy-removal/decisions.md" in patterns
 
 
 def test_scoped_permissions_coordinator_no_root_active() -> None:
@@ -1098,9 +1102,9 @@ def test_scoped_permissions_coordinator_no_root_active() -> None:
     assert "active/coordinator.md" not in patterns
 
 
-def test_coordinator_allowed_milestone_scoped_checkpoint() -> None:
-    """Coordinator can write to milestones/{ms}/active/coordinator.md
-    without a template (module-level WRITE_PERMISSIONS)."""
+def test_coordinator_denied_direct_checkpoint_write() -> None:
+    """Coordinator cannot Write directly to active/coordinator.md —
+    must use clou_write_checkpoint MCP tool instead."""
     hook = _get_pre_hook("coordinator")
     result = _run(
         hook(
@@ -1115,14 +1119,14 @@ def test_coordinator_allowed_milestone_scoped_checkpoint() -> None:
             {},
         )
     )
-    assert _is_allowed(result)
+    assert not _is_allowed(result)
 
 
-def test_coordinator_allowed_milestone_checkpoint_with_template(
+def test_coordinator_denied_checkpoint_with_template(
     tmp_path: Path,
 ) -> None:
-    """Coordinator can write to milestones/{ms}/active/coordinator.md
-    when built with the software-construction template."""
+    """Coordinator cannot Write directly to checkpoint with template —
+    protocol artifacts are tool-only."""
     from clou.harnesses.software_construction import (
         template as sc_template,
     )
@@ -1152,7 +1156,7 @@ def test_coordinator_allowed_milestone_checkpoint_with_template(
             {},
         )
     )
-    assert _is_allowed(result)
+    assert not _is_allowed(result)
 
 
 def test_coordinator_blocked_other_milestone_checkpoint_with_template(
@@ -1192,6 +1196,45 @@ def test_coordinator_blocked_other_milestone_checkpoint_with_template(
     assert _is_denied(result)
 
 
+def test_coordinator_denied_direct_status_write() -> None:
+    """Coordinator cannot Write directly to status.md — must use
+    clou_update_status MCP tool instead."""
+    hook = _get_pre_hook("coordinator")
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {
+                    "file_path": "/tmp/project/.clou/milestones"
+                    "/proxy-removal/status.md"
+                },
+            },
+            "tool-1",
+            {},
+        )
+    )
+    assert not _is_allowed(result)
+
+
+def test_coordinator_still_allowed_narrative_writes() -> None:
+    """Coordinator can still Write to narrative files (decisions.md, etc.)."""
+    hook = _get_pre_hook("coordinator")
+    for path_suffix in ("decisions.md", "compose.py", "phases/impl/phase.md"):
+        result = _run(
+            hook(
+                {
+                    "tool_name": "Write",
+                    "tool_input": {
+                        "file_path": f"/tmp/project/.clou/milestones/m1/{path_suffix}"
+                    },
+                },
+                "tool-1",
+                {},
+            )
+        )
+        assert _is_allowed(result), f"Expected allowed for {path_suffix}"
+
+
 def test_supervisor_and_worker_permissions_unaffected() -> None:
     """Supervisor and worker permissions are unchanged by the fix."""
     # Supervisor still has active/supervisor.md (root-level).
@@ -1205,8 +1248,8 @@ def test_supervisor_and_worker_permissions_unaffected() -> None:
 
 
 def test_all_three_permission_dicts_consistent() -> None:
-    """All three permission sources have milestones/*/active/coordinator.md
-    and none have the old root-level active/coordinator.md for coordinator."""
+    """All three permission sources exclude protocol artifacts (checkpoint,
+    status.md) from coordinator — these are written via MCP tools."""
     from clou.harness import _INLINE_FALLBACK
     from clou.harnesses.software_construction import (
         template as sc_template,
@@ -1220,11 +1263,16 @@ def test_all_three_permission_dicts_consistent() -> None:
 
     for name, perms in sources.items():
         coord_perms = perms["coordinator"]
-        assert "milestones/*/active/coordinator.md" in coord_perms, (
-            f"{name} missing 'milestones/*/active/coordinator.md'"
+        # Protocol artifacts must NOT be in coordinator write permissions.
+        assert "milestones/*/active/coordinator.md" not in coord_perms, (
+            f"{name} still has protocol artifact 'milestones/*/active/coordinator.md'"
         )
-        assert "active/coordinator.md" not in coord_perms, (
-            f"{name} still has old root-level 'active/coordinator.md'"
+        assert "milestones/*/status.md" not in coord_perms, (
+            f"{name} still has protocol artifact 'milestones/*/status.md'"
+        )
+        # Narrative files must still be present.
+        assert "milestones/*/decisions.md" in coord_perms, (
+            f"{name} missing narrative 'milestones/*/decisions.md'"
         )
 
 

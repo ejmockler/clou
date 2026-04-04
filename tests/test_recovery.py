@@ -1433,7 +1433,7 @@ def test_escalation_with_legacy_strings(tmp_path: Path) -> None:
 
 
 def test_self_heal_normalises_checkpoint_alias(tmp_path: Path) -> None:
-    """Self-heal renames 'phase' to 'current_phase' in coordinator.md."""
+    """Self-heal re-renders checkpoint, resolving 'phase' alias to 'current_phase'."""
     checkpoint = "cycle: 3\nnext_step: VERIFY\nphase: impl\n"
     cp_path = tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md"
     _write(cp_path, checkpoint)
@@ -1445,12 +1445,13 @@ def test_self_heal_normalises_checkpoint_alias(tmp_path: Path) -> None:
         ),
     ]
     fixes = attempt_self_heal(tmp_path, "m1", errors)
-    assert any("renamed" in f and "phase" in f for f in fixes)
+    assert len(fixes) >= 1
 
     content = cp_path.read_text()
-    assert "current_phase:" in content
-    # The alias should no longer exist as a standalone key.
-    assert not re.search(r"(?m)^phase:", content)
+    assert "current_phase: impl" in content
+    # Re-rendered via serializer: all fields present, canonical format.
+    assert "cycle: 3" in content
+    assert "next_step: VERIFY" in content
 
 
 def test_self_heal_adds_missing_checkpoint_fields(tmp_path: Path) -> None:

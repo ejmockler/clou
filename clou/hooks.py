@@ -43,11 +43,13 @@ WRITE_PERMISSIONS: dict[str, list[str]] = {
     ],
     "coordinator": [
         "milestones/*/compose.py",
-        "milestones/*/status.md",
+        # status.md and active/coordinator.md are protocol artifacts —
+        # the coordinator writes them via MCP tools (clou_write_checkpoint,
+        # clou_update_status) which bypass hook enforcement.  Direct Write
+        # is denied to force tool usage.
         "milestones/*/decisions.md",
         "milestones/*/escalations/*.md",
         "milestones/*/phases/*/phase.md",
-        "milestones/*/active/coordinator.md",
     ],
     "worker": [
         "milestones/*/phases/*/execution.md",

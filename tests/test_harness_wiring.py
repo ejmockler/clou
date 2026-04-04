@@ -142,7 +142,7 @@ def test_build_hooks_template_enforces_permissions() -> None:
     pre_hooks = hooks["PreToolUse"]
     assert len(pre_hooks) == 1
 
-    # Write to coordinator-owned path should be allowed
+    # Write to coordinator-owned narrative path should be allowed
     result = _run(
         pre_hooks[0].hooks[0](
             {
@@ -150,7 +150,7 @@ def test_build_hooks_template_enforces_permissions() -> None:
                 "tool_input": {
                     "file_path": str(
                         project_dir / ".clou" / "milestones" / "ms1"
-                        / "status.md"
+                        / "decisions.md"
                     ),
                 },
             },

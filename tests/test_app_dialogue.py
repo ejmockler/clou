@@ -369,6 +369,45 @@ class TestWorkerCrashRecovery:
             assert "Supervisor session ended unexpectedly:" not in new_text
 
     @pytest.mark.asyncio
+    async def test_worker_error_during_decision_returns_to_dialogue(self) -> None:
+        """ERROR while in DECISION must not leave the UI stuck — drop to DIALOGUE."""
+        from textual.worker import WorkerState
+
+        async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+
+            # Drive the app into DECISION via a pending escalation.
+            app.post_message(
+                ClouEscalationArrived(
+                    path=Path("/tmp/test.md"),
+                    classification="info",
+                    issue="test",
+                    options=[{"label": "Ok", "description": "ok"}],
+                )
+            )
+            await pilot.pause()
+            assert app.mode == Mode.DECISION
+
+            fake_worker = type(
+                "FakeWorker",
+                (),
+                {
+                    "name": "run_supervisor_worker",
+                    "error": RuntimeError("crash mid-ask"),
+                },
+            )()
+            fake_event = type(
+                "FakeStateChanged",
+                (),
+                {"worker": fake_worker, "state": WorkerState.ERROR},
+            )()
+            app.on_worker_state_changed(fake_event)  # type: ignore[arg-type]
+            await pilot.pause()
+
+            assert app.mode == Mode.DIALOGUE
+            assert len(app._escalation_queue) == 0
+
+    @pytest.mark.asyncio
     async def test_worker_error_widget_not_mounted(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

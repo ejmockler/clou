@@ -5,7 +5,7 @@ Tests go through the public validate() API only — no implementation
 details are tested directly.
 """
 
-from clou.graph import ResourceBounds, extract_dag_data, validate
+from clou.graph import ResourceBounds, compute_topology, extract_dag_data, validate
 
 # ---------------------------------------------------------------------------
 # The canonical example from DB-02 — the golden test
@@ -939,3 +939,268 @@ async def execute():
 """
     errors = validate(code)
     assert not any("resource_bounds" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# compute_topology
+# ---------------------------------------------------------------------------
+
+
+def test_topology_single_task() -> None:
+    """Single task: width=1, depth=1, one layer."""
+    code = """\
+async def only_task() -> Result:
+    \"\"\"The only task.\"\"\"
+
+async def execute():
+    r = await only_task()
+"""
+    topo = compute_topology(code)
+    assert topo["width"] == 1
+    assert topo["depth"] == 1
+    assert topo["layer_count"] == 1
+    assert topo["gather_groups"] == []
+    assert topo["layers"] == [["only_task"]]
+
+
+def test_topology_linear_chain() -> None:
+    """Linear chain: width=1, depth=3, three layers."""
+    code = """\
+async def step_a() -> A:
+    \"\"\"First.\"\"\"
+
+async def step_b(a: A) -> B:
+    \"\"\"Second.\"\"\"
+
+async def step_c(b: B) -> C:
+    \"\"\"Third.\"\"\"
+
+async def execute():
+    a = await step_a()
+    b = await step_b(a)
+    c = await step_c(b)
+"""
+    topo = compute_topology(code)
+    assert topo["width"] == 1
+    assert topo["depth"] == 3
+    assert topo["layer_count"] == 3
+    assert topo["gather_groups"] == []
+    assert topo["layers"] == [["step_a"], ["step_b"], ["step_c"]]
+
+
+def test_topology_wide_gather() -> None:
+    """Wide gather: width=3, gather_groups=[3]."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"A.\"\"\"
+
+async def task_b() -> B:
+    \"\"\"B.\"\"\"
+
+async def task_c() -> C:
+    \"\"\"C.\"\"\"
+
+async def combine(a: A, b: B, c: C) -> Result:
+    \"\"\"Combine.\"\"\"
+
+async def execute():
+    a, b, c = await gather(task_a(), task_b(), task_c())
+    r = await combine(a, b, c)
+"""
+    topo = compute_topology(code)
+    assert topo["width"] == 3
+    assert topo["depth"] == 2
+    assert topo["layer_count"] == 2
+    assert topo["gather_groups"] == [3]
+    assert topo["layers"] == [["task_a", "task_b", "task_c"], ["combine"]]
+
+
+def test_topology_diamond() -> None:
+    """Diamond: two paths converge -- task with multiple deps in correct layer."""
+    code = """\
+async def start() -> S:
+    \"\"\"Start.\"\"\"
+
+async def left(s: S) -> L:
+    \"\"\"Left path.\"\"\"
+
+async def right(s: S) -> R:
+    \"\"\"Right path.\"\"\"
+
+async def join(l: L, r: R) -> J:
+    \"\"\"Join.\"\"\"
+
+async def execute():
+    s = await start()
+    l, r = await gather(left(s), right(s))
+    j = await join(l, r)
+"""
+    topo = compute_topology(code)
+    assert topo["width"] == 2
+    assert topo["depth"] == 3
+    assert topo["layer_count"] == 3
+    assert topo["gather_groups"] == [2]
+    # start at layer 0, left+right at layer 1, join at layer 2
+    assert topo["layers"] == [["start"], ["left", "right"], ["join"]]
+
+
+def test_topology_mixed_gather_then_serial() -> None:
+    """Mixed: gather followed by serial steps."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"A.\"\"\"
+
+async def task_b() -> B:
+    \"\"\"B.\"\"\"
+
+async def merge(a: A, b: B) -> M:
+    \"\"\"Merge.\"\"\"
+
+async def final(m: M) -> F:
+    \"\"\"Final.\"\"\"
+
+async def execute():
+    a, b = await gather(task_a(), task_b())
+    m = await merge(a, b)
+    f = await final(m)
+"""
+    topo = compute_topology(code)
+    assert topo["width"] == 2
+    assert topo["depth"] == 3
+    assert topo["layer_count"] == 3
+    assert topo["gather_groups"] == [2]
+    assert topo["layers"] == [["task_a", "task_b"], ["merge"], ["final"]]
+
+
+def test_topology_empty_source() -> None:
+    """Empty source returns zeros."""
+    topo = compute_topology("")
+    assert topo["width"] == 0
+    assert topo["depth"] == 0
+    assert topo["layer_count"] == 0
+    assert topo["gather_groups"] == []
+    assert topo["layers"] == []
+
+
+def test_topology_syntax_error() -> None:
+    """Malformed source returns zeros gracefully."""
+    topo = compute_topology("def foo(")
+    assert topo["width"] == 0
+    assert topo["depth"] == 0
+    assert topo["gather_groups"] == []
+    assert topo["layers"] == []
+
+
+def test_topology_alphabetical_within_layers() -> None:
+    """Tasks are sorted alphabetically within each layer."""
+    code = """\
+async def zebra() -> Z:
+    \"\"\"Z.\"\"\"
+
+async def alpha() -> A:
+    \"\"\"A.\"\"\"
+
+async def middle() -> M:
+    \"\"\"M.\"\"\"
+
+async def finish(z: Z, a: A, m: M) -> F:
+    \"\"\"Finish.\"\"\"
+
+async def execute():
+    z, a, m = await gather(zebra(), alpha(), middle())
+    f = await finish(z, a, m)
+"""
+    topo = compute_topology(code)
+    # Layer 0 should be alphabetically sorted
+    assert topo["layers"][0] == ["alpha", "middle", "zebra"]
+    assert topo["layers"][1] == ["finish"]
+
+
+def test_topology_no_entry_point() -> None:
+    """Source without execute() still computes layers from sigs/deps."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+"""
+    topo = compute_topology(code)
+    # Without entry point, extract_dag_data still returns sigs but
+    # deps have no call-graph edges (only @requires edges if present).
+    # Both tasks have no deps resolved from call graph, so both in layer 0.
+    assert topo["width"] == 2
+    assert topo["depth"] == 1
+    assert topo["gather_groups"] == []
+    assert topo["layers"] == [["task_a", "task_b"]]
+
+
+def test_topology_requires_decorator_ordering() -> None:
+    """@requires edges affect layer assignment."""
+    code = """\
+async def setup() -> Schema:
+    \"\"\"Setup.\"\"\"
+
+@requires("setup")
+async def migrate() -> Migrated:
+    \"\"\"Migrate after setup.\"\"\"
+
+async def seed(m: Migrated) -> Seeded:
+    \"\"\"Seed.\"\"\"
+
+async def execute():
+    s = await setup()
+    m = await migrate()
+    d = await seed(m)
+"""
+    topo = compute_topology(code)
+    # setup in layer 0, migrate in layer 1 (due to @requires("setup")),
+    # seed in layer 2 (due to data dep on migrate via call graph)
+    assert "setup" in topo["layers"][0]
+    assert "migrate" in topo["layers"][1]
+
+
+def test_topology_multiple_gather_groups() -> None:
+    """Multiple gather() calls produce multiple group sizes."""
+    code = """\
+async def a1() -> A1:
+    \"\"\"A1.\"\"\"
+
+async def a2() -> A2:
+    \"\"\"A2.\"\"\"
+
+async def b1(x: A1) -> B1:
+    \"\"\"B1.\"\"\"
+
+async def b2(x: A2) -> B2:
+    \"\"\"B2.\"\"\"
+
+async def b3(x: A2) -> B3:
+    \"\"\"B3.\"\"\"
+
+async def final(x: B1, y: B2, z: B3) -> F:
+    \"\"\"Final.\"\"\"
+
+async def execute():
+    x, y = await gather(a1(), a2())
+    p, q, r = await gather(b1(x), b2(y), b3(y))
+    f = await final(p, q, r)
+"""
+    topo = compute_topology(code)
+    assert topo["gather_groups"] == [2, 3]
+
+
+def test_topology_canonical_composition() -> None:
+    """The canonical DB-02 example produces expected topology."""
+    topo = compute_topology(VALID_COMPOSITION)
+    # verify is excluded from _extract_sigs? No -- verify IS a task sig
+    # (it's an async def that's not in _ENTRY_NAMES).
+    # Layer 0: setup_database, scaffold_frontend (no deps)
+    # Layer 1: implement_user_model (deps: setup_database)
+    # Layer 2: implement_auth (deps: implement_user_model)
+    # Layer 3: implement_api (deps: implement_user_model, implement_auth)
+    # Layer 4: wire_frontend (deps: implement_api, scaffold_frontend)
+    # Layer 5: verify (deps: wire_frontend)
+    assert topo["width"] == 2  # scaffold_frontend + setup_database
+    assert topo["depth"] >= 4
+    assert topo["gather_groups"] == [2]  # one gather with 2 args

@@ -21,12 +21,14 @@ Decorator edges:
 
 Public API:
     validate(source: str) -> list[str]
+    compute_topology(source: str) -> dict[str, Any]
 """
 
 from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -605,3 +607,110 @@ def _check_types(
                     f"expects {expected}, got {actual} (from '{var}')"
                 )
     return errors
+
+
+# ---------------------------------------------------------------------------
+# Topology computation
+# ---------------------------------------------------------------------------
+
+
+def compute_topology(source: str) -> dict[str, Any]:
+    """Compute topology metrics from compose.py source.
+
+    Returns dict with keys:
+        width: int -- max tasks at any layer (max parallelism)
+        depth: int -- longest dependency chain (number of layers)
+        layer_count: int -- same as depth (explicit alias)
+        gather_groups: list[int] -- sizes of each gather() call
+        layers: list[list[str]] -- task names grouped by layer
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {
+            "width": 0,
+            "depth": 0,
+            "layer_count": 0,
+            "gather_groups": [],
+            "layers": [],
+        }
+
+    sigs = _extract_sigs(tree)
+    if not sigs:
+        return {
+            "width": 0,
+            "depth": 0,
+            "layer_count": 0,
+            "gather_groups": [],
+            "layers": [],
+        }
+
+    _, deps = extract_dag_data(source)
+    entry = _find_entry(tree)
+
+    layers = _compute_layers(sigs, deps)
+    gather_groups = _extract_gather_groups(entry) if entry is not None else []
+
+    depth = len(layers)
+    width = max(len(layer) for layer in layers) if layers else 0
+
+    return {
+        "width": width,
+        "depth": depth,
+        "layer_count": depth,
+        "gather_groups": gather_groups,
+        "layers": layers,
+    }
+
+
+def _compute_layers(
+    sigs: dict[str, Sig],
+    deps: dict[str, list[str]],
+) -> list[list[str]]:
+    """Compute layers via Kahn's algorithm on the dependency graph.
+
+    Tasks with no dependencies go in layer 0. Each subsequent layer
+    contains tasks whose dependencies are all in prior layers. Tasks
+    are sorted alphabetically within each layer for determinism.
+    """
+    task_names = set(sigs)
+    if not task_names:
+        return []
+
+    # Build in-degree map restricted to task functions
+    remaining_deps: dict[str, set[str]] = {}
+    for name in task_names:
+        # Only count dependencies that are themselves task functions
+        remaining_deps[name] = {d for d in deps.get(name, []) if d in task_names}
+
+    layers: list[list[str]] = []
+    assigned: set[str] = set()
+
+    while len(assigned) < len(task_names):
+        # Find tasks whose remaining dependencies are all satisfied
+        layer = sorted(
+            name
+            for name in task_names - assigned
+            if remaining_deps[name] <= assigned
+        )
+        if not layer:
+            # Remaining tasks form a cycle -- put them all in one layer
+            # to avoid infinite loop. (Cycle detection is validate()'s job.)
+            layer = sorted(task_names - assigned)
+        layers.append(layer)
+        assigned.update(layer)
+
+    return layers
+
+
+def _extract_gather_groups(entry: ast.AsyncFunctionDef) -> list[int]:
+    """Extract gather() group sizes from execute() body.
+
+    Walks the entry function looking for gather() calls and counts
+    the number of arguments in each. Returns a list of ints.
+    """
+    groups: list[int] = []
+    for node in ast.walk(entry):
+        if isinstance(node, ast.Call) and _call_name(node) == "gather":
+            groups.append(len(node.args))
+    return groups

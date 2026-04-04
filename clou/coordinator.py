@@ -41,6 +41,7 @@ from claude_agent_sdk import (
 )
 
 from clou.coordinator_tools import build_coordinator_mcp_server
+from clou.golden_context import render_checkpoint
 from clou.harness import (
     HarnessTemplate,
     load_template,
@@ -325,12 +326,14 @@ async def run_coordinator(
             cp = parse_checkpoint(checkpoint_path.read_text())
             if cp.cycle > 0:
                 checkpoint_path.write_text(
-                    f"cycle: 0\n"
-                    f"step: {cp.step}\n"
-                    f"next_step: {cp.next_step}\n"
-                    f"current_phase: {cp.current_phase}\n"
-                    f"phases_completed: {cp.phases_completed}\n"
-                    f"phases_total: {cp.phases_total}\n"
+                    render_checkpoint(
+                        cycle=0,
+                        step=cp.step,
+                        next_step=cp.next_step,
+                        current_phase=cp.current_phase,
+                        phases_completed=cp.phases_completed,
+                        phases_total=cp.phases_total,
+                    )
                 )
             log.info(
                 "Cycle count reset for %r after resolved escalation",
@@ -650,6 +653,7 @@ async def run_coordinator(
                         log.debug("Could not post DAG to UI", exc_info=True)
 
             _tok_before = _tracker.coordinator(milestone)
+            _tracker.reset_cycle_peak()
             with telemetry.span(
                 "cycle", milestone=milestone, cycle_num=cycle_count + 1,
                 cycle_type=cycle_type,
@@ -662,6 +666,7 @@ async def run_coordinator(
                 _cy["outcome"] = status
                 _cy["input_tokens"] = _tok_after["input"] - _tok_before["input"]
                 _cy["output_tokens"] = _tok_after["output"] - _tok_before["output"]
+                _cy["peak_input_tokens"] = _tracker.cycle_peak_input
 
             if status == "failed":
                 crash_retries += 1
@@ -1052,8 +1057,16 @@ async def _run_single_cycle(
             await coordinator.query(prompt)
 
             try:
-                async with asyncio.timeout(_effective_timeout):
+                # Idle watchdog: the timeout is rescheduled on every
+                # coordinator message, so it only fires when no progress
+                # arrives for _effective_timeout seconds.  Agents actively
+                # working emit TaskProgressMessage on every tool use, so
+                # a long-running dispatch with healthy progress will never
+                # hit this timeout.
+                loop = asyncio.get_event_loop()
+                async with asyncio.timeout(_effective_timeout) as _idle_cm:
                     async for msg in coordinator.receive_response():
+                        _idle_cm.reschedule(loop.time() + _effective_timeout)
                         _track(msg, tier="coordinator", milestone=milestone)
 
                         if app is not None:
@@ -1301,11 +1314,12 @@ async def _run_single_cycle(
                             # The coordinator message loop continues naturally.
 
             except TimeoutError:
-                # asyncio.timeout() fired -- unconditional wall-clock timeout.
-                # Write failure shards for all still-active tasks and return
-                # as agent_team_crash so the outer loop escalates properly.
+                # Idle watchdog fired -- no coordinator message for
+                # _effective_timeout seconds.  Something is stuck; write
+                # failure shards for all still-active tasks and return as
+                # agent_team_crash so the outer loop escalates properly.
                 log.warning(
-                    "asyncio.timeout fired for %r after %.0fs",
+                    "Idle watchdog fired for %r after %.0fs of no progress",
                     milestone, _effective_timeout,
                 )
                 _current_phase = None
@@ -1340,7 +1354,7 @@ async def _run_single_cycle(
                             ms_dir, _current_phase,
                             task_name, "timeout",
                             f"Task terminated after {int(_effective_timeout)}s "
-                            f"(wall-clock timeout)",
+                            f"idle (no coordinator progress)",
                             impact,
                         )
                 return "agent_team_crash"

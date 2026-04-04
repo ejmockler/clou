@@ -144,11 +144,11 @@ template = HarnessTemplate(
         ],
         "coordinator": [
             "milestones/*/compose.py",
-            "milestones/*/status.md",
+            # status.md and active/coordinator.md are protocol artifacts —
+            # written via MCP tools, not direct Write.
             "milestones/*/decisions.md",
             "milestones/*/escalations/*.md",
             "milestones/*/phases/*/phase.md",
-            "milestones/*/active/coordinator.md",
         ],
         "worker": [
             "milestones/*/phases/*/execution.md",

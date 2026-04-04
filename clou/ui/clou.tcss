@@ -53,6 +53,12 @@ Screen {
     scrollbar-size-vertical: 0;
 }
 
+/* === Resize handle — hidden by default, visible in breath/decision === */
+ClouApp.breath #resize-handle,
+ClouApp.decision #resize-handle {
+    display: block;
+}
+
 /* === Task graph — hidden by default, visible in breath/decision === */
 #task-graph {
     display: none;
@@ -198,7 +204,6 @@ ClouApp.breath #conversation {
 
 ClouApp.breath #conversation #history {
     opacity: 0.4;
-    overflow-y: hidden;
 }
 
 ClouApp.breath #user-input {

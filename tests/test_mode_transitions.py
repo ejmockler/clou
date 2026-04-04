@@ -376,19 +376,20 @@ class TestInputDuringBreath:
             assert inp.value == "typing in breath"
 
     @pytest.mark.asyncio
-    async def test_input_triggers_breath_to_dialogue(self) -> None:
+    async def test_input_stays_in_breath(self) -> None:
+        """User input during BREATH queues without leaving BREATH mode."""
         async with ClouApp().run_test() as pilot:
             # Enter breath mode.
             pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
             await pilot.pause()
             assert pilot.app.mode is Mode.BREATH
 
-            # Submit input.
+            # Submit input — should stay in BREATH.
             inp = pilot.app.query_one("#user-input ChatInput")
             inp.value = "hello from breath"  # type: ignore[union-attr]
             await inp.action_submit()  # type: ignore[union-attr]
             await pilot.pause()
-            assert pilot.app.mode is Mode.DIALOGUE
+            assert pilot.app.mode is Mode.BREATH
 
 
 # ---------------------------------------------------------------------------
@@ -398,9 +399,9 @@ class TestInputDuringBreath:
 
 class TestDialogueToHandoff:
     @pytest.mark.asyncio
-    async def test_coordinator_complete_in_dialogue_triggers_handoff(self) -> None:
-        """User types during BREATH (returns to DIALOGUE), then coordinator
-        completes successfully — mode should transition to HANDOFF."""
+    async def test_coordinator_complete_triggers_handoff(self) -> None:
+        """Coordinator completes successfully from BREATH — mode should
+        transition to HANDOFF."""
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
 
@@ -409,21 +410,14 @@ class TestDialogueToHandoff:
             await pilot.pause()
             assert app.mode is Mode.BREATH
 
-            # User types, returning to DIALOGUE.
-            inp = pilot.app.query_one("#user-input ChatInput")
-            inp.value = "hello"  # type: ignore[union-attr]
-            await inp.action_submit()  # type: ignore[union-attr]
-            await pilot.pause()
-            assert app.mode is Mode.DIALOGUE
-
-            # Coordinator completes while still in DIALOGUE.
+            # Coordinator completes successfully.
             pilot.app.post_message(
                 ClouCoordinatorComplete(milestone="test", result="completed")
             )
             await pilot.pause()
             assert app.mode is Mode.HANDOFF
             assert "handoff" in pilot.app.classes
-            assert "dialogue" not in pilot.app.classes
+            assert "breath" not in pilot.app.classes
 
     @pytest.mark.asyncio
     async def test_dialogue_to_handoff_css_class(self) -> None:

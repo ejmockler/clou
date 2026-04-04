@@ -444,15 +444,22 @@ class ConversationWidget(DragScrollMixin, Widget):
 
     # -- Queue indicator -------------------------------------------------
 
-    def update_queue_count(self, count: int) -> None:
+    def update_queue_count(self, count: int, *, breath_mode: bool = False) -> None:
         """Update the queue indicator with the number of pending messages.
 
         Only shown when 2+ messages are pending — for a single in-flight
-        message the user can already see it in the conversation.
+        message the user can already see it in the conversation.  During
+        breath mode (coordinator running), shown for 1+ with a hint that
+        delivery is deferred.
         """
         try:
             indicator = self.query_one("#queue-indicator", Static)
-            if count > 1:
+            if breath_mode and count >= 1:
+                indicator.update(Text(
+                    f"  \u00b7 {count} queued \u2014 will deliver when coordinator finishes",
+                    style=f"italic {_DIM_HEX}",
+                ))
+            elif count > 1:
                 indicator.update(Text(f"  \u00b7 {count} queued", style=f"italic {_DIM_HEX}"))
             else:
                 indicator.update("")

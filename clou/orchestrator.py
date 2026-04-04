@@ -37,7 +37,12 @@ from claude_agent_sdk import (
 
 from clou.coordinator import run_coordinator
 from clou.recovery import validate_milestone_name
-from clou.tokens import MODEL, track as _track
+from clou.tokens import (
+    MODEL,
+    ContextPressure,
+    track as _track,
+    tracker as _tracker,
+)
 from clou.harness import (
     HarnessTemplate,
     load_template,
@@ -354,6 +359,7 @@ async def run_supervisor(
         _input_dead = asyncio.Event()
 
         _dialogue_turns_in_flight = 0  # queries sent but no ResultMessage yet
+        _block_checkpoint_sent = False  # guard against re-triggering BLOCK
 
         async def _feed_user_input() -> None:
             nonlocal _dialogue_turns_in_flight
@@ -373,13 +379,22 @@ async def run_supervisor(
                     if compact_wait in done:
                         app._compact.requested.clear()
                         instructions = app._compact.instructions or (
-                            "Summarize the conversation so far, preserving key "
-                            "decisions, code context, and open tasks."
+                            "Summarize the conversation so far. Preserve: "
+                            "(1) the action chain (user requests → your "
+                            "decisions → coordinator outcomes), "
+                            "(2) key decisions and their rationale, "
+                            "(3) current project state and open tasks. "
+                            "Compress tool outputs to one-line summaries. "
+                            "Compress coordinator spawn results older than "
+                            "3 cycles to their exit status and key decisions."
                         )
-                        await supervisor.query(
+                        compact_prompt = (
                             f"[SYSTEM: Context compaction requested. {instructions}. "
-                            f"Acknowledge briefly and continue.]"
+                            f"After summarizing, re-read {project_md} and "
+                            f"{roadmap_md} to refresh your golden context.]"
                         )
+                        _tracker.add_supervisor_delta(compact_prompt)
+                        await supervisor.query(compact_prompt)
                         # Don't signal _compact_complete yet — the supervisor
                         # hasn't actually processed the compaction.  The
                         # receive_messages loop signals completion when the
@@ -411,6 +426,7 @@ async def run_supervisor(
                         else:
                             # Deliver to the model FIRST — only then tell
                             # the UI the message was picked up.
+                            _tracker.add_supervisor_delta(text)
                             await supervisor.query(text)
                             _dialogue_turns_in_flight += 1
                             telemetry.event(
@@ -568,6 +584,90 @@ async def run_supervisor(
                                 "dialogue.compact",
                                 compaction_num=app._compact.count,
                             )
+
+                    # --- Graduated context pressure ------------------
+                    _pressure = _tracker.supervisor_pressure()
+                    if _pressure == ContextPressure.BLOCK and not _block_checkpoint_sent:
+                        log.critical(
+                            "Supervisor context at BLOCK threshold (%d tokens) "
+                            "— forcing checkpoint",
+                            _tracker.supervisor_context_estimate(),
+                        )
+                        telemetry.event(
+                            "context.block",
+                            estimate=_tracker.supervisor_context_estimate(),
+                        )
+                        # Notify UI of critical pressure.
+                        if app is not None and _post is not None:
+                            from clou.tokens import BLOCK_THRESHOLD
+                            from clou.ui.messages import ClouContextPressure
+
+                            _post(ClouContextPressure(
+                                level="block",
+                                estimate=_tracker.supervisor_context_estimate(),
+                                threshold=BLOCK_THRESHOLD,
+                            ))
+                        # Force the supervisor to write a checkpoint.
+                        _block_checkpoint_sent = True
+                        await supervisor.query(
+                            "[SYSTEM: Context window critically full. "
+                            "Write your current state to "
+                            f"{clou_dir / 'active' / 'supervisor.md'} "
+                            "immediately as a checkpoint, then stop.]"
+                        )
+                        _dialogue_turns_in_flight += 1
+                    elif (
+                        _pressure == ContextPressure.COMPACT
+                        and app is not None
+                        and not app._compact.pending
+                    ):
+                        log.warning(
+                            "Supervisor context at COMPACT threshold (%d tokens) "
+                            "— auto-triggering compaction",
+                            _tracker.supervisor_context_estimate(),
+                        )
+                        telemetry.event(
+                            "context.auto_compact",
+                            estimate=_tracker.supervisor_context_estimate(),
+                        )
+                        # Notify UI of compact-level pressure.
+                        if _post is not None:
+                            from clou.tokens import COMPACT_THRESHOLD
+                            from clou.ui.messages import ClouContextPressure
+
+                            _post(ClouContextPressure(
+                                level="compact",
+                                estimate=_tracker.supervisor_context_estimate(),
+                                threshold=COMPACT_THRESHOLD,
+                            ))
+                        # Reuse the existing compact mechanism.
+                        app._compact.instructions = (
+                            "Context approaching limit. Summarize the "
+                            "conversation, preserving: (1) the action chain "
+                            "(user requests → your decisions → coordinator "
+                            "outcomes), (2) key decisions and their rationale, "
+                            "(3) current project state and open tasks. "
+                            "Compress tool outputs and old coordinator spawn "
+                            "results to one-line summaries. "
+                            "After summarizing, re-read "
+                            f"{project_md} and {roadmap_md} "
+                            "to refresh your golden context."
+                        )
+                        app._compact.requested.set()
+                    elif _pressure == ContextPressure.WARN:
+                        telemetry.event(
+                            "context.warn",
+                            estimate=_tracker.supervisor_context_estimate(),
+                        )
+                        if app is not None and _post is not None:
+                            from clou.tokens import WARN_THRESHOLD
+                            from clou.ui.messages import ClouContextPressure
+
+                            _post(ClouContextPressure(
+                                level="warn",
+                                estimate=_tracker.supervisor_context_estimate(),
+                                threshold=WARN_THRESHOLD,
+                            ))
                 # If the input feeder died (e.g. broken pipe), stop
                 # consuming — the session is unrecoverable.
                 if _input_dead.is_set():

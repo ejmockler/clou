@@ -57,6 +57,7 @@ from clou.ui.widgets.task_graph import TaskGraphWidget
 from clou.ui.widgets.conversation import ConversationWidget
 from clou.ui.widgets.escalation import EscalationModal
 from clou.ui.widgets.handoff import HandoffWidget
+from clou.ui.widgets.resize_handle import ResizeHandle
 from clou.ui.widgets.status_bar import ClouStatusBar
 
 _log = logging.getLogger(__name__)
@@ -151,9 +152,13 @@ class ClouApp(App[None]):
         self._queue_count: int = 0
         # Session persistence — auto-append every turn to JSONL.
         self._session: Session | None = None
+        # User-dragged override for the conversation/task-graph split height.
+        # None means "use CSS default"; set by ResizeHandle during BREATH/DECISION.
+        self._conversation_override_height: int | None = None
 
     def compose(self) -> ComposeResult:
         yield ConversationWidget(id="conversation")
+        yield ResizeHandle(id="resize-handle")
         yield TaskGraphWidget(id="task-graph")
         yield BreathWidget(id="breath-widget")
         yield HandoffWidget(id="handoff-widget")
@@ -202,8 +207,8 @@ class ClouApp(App[None]):
                 self.query_one(ConversationWidget).update_queue_count(0)
             except LookupError:
                 pass
-            # Return to dialogue mode if in an ambient mode.
-            if self.mode in (Mode.BREATH, Mode.HANDOFF):
+            # Return to dialogue mode if in an ambient or paused mode.
+            if self.mode in (Mode.BREATH, Mode.DECISION, Mode.HANDOFF):
                 self.transition_mode(Mode.DIALOGUE)
         elif event.state in (WorkerState.SUCCESS, WorkerState.CANCELLED):
             # Normal exit or cancellation — the input task is dead, so any
@@ -256,6 +261,7 @@ class ClouApp(App[None]):
         """Swap CSS classes and perform atmospheric side-effects."""
         self.remove_class(old.name.lower())
         self.add_class(new.name.lower())
+        self._apply_conversation_height_override(new)
 
         # --- DIALOGUE -> BREATH ---
         if old is Mode.DIALOGUE and new is Mode.BREATH:
@@ -310,6 +316,26 @@ class ClouApp(App[None]):
         elif old is Mode.HANDOFF and new is Mode.DECISION:
             self._pre_decision_mode = Mode.HANDOFF
             self._push_pending_escalation()
+
+    def _apply_conversation_height_override(self, mode: Mode) -> None:
+        """Apply or clear the user-dragged conversation height for *mode*.
+
+        BREATH/DECISION split the screen — a dragged override is re-applied
+        so the user's choice survives mode flips.  Any other mode reverts
+        the conversation to its CSS defaults.
+        """
+        try:
+            conv = self.query_one("#conversation")
+        except LookupError:
+            return
+        if mode in (Mode.BREATH, Mode.DECISION):
+            if self._conversation_override_height is not None:
+                conv.styles.height = self._conversation_override_height
+                conv.styles.max_height = self._conversation_override_height
+        else:
+            self._conversation_override_height = None
+            conv.styles.height = None
+            conv.styles.max_height = None
 
     # ------------------------------------------------------------------
     # Breathing animation
@@ -514,7 +540,9 @@ class ClouApp(App[None]):
         # Remove the corresponding UserMessage from the conversation.
         conversation = self.query_one(ConversationWidget)
         conversation.recall_last_queued()
-        conversation.update_queue_count(self._queue_count)
+        conversation.update_queue_count(
+            self._queue_count, breath_mode=(self.mode is Mode.BREATH),
+        )
 
         # Restore text to the input.
         try:
@@ -565,9 +593,13 @@ class ClouApp(App[None]):
 
         event.input.clear()
 
-        # If in breath or handoff mode, transition back to dialogue first.
-        if self.mode in (Mode.BREATH, Mode.HANDOFF):
+        # In handoff mode, return to dialogue so the supervisor can respond.
+        # In breath mode, stay — the coordinator is running and the supervisor
+        # is blocked.  The message queues until the coordinator completes.
+        if self.mode is Mode.HANDOFF:
             self.transition_mode(Mode.DIALOGUE)
+
+        in_breath = self.mode is Mode.BREATH
 
         # Show user message as queued — it transitions to active when the
         # supervisor picks it up (ClouProcessingStarted).
@@ -578,11 +610,16 @@ class ClouApp(App[None]):
         # Queue for model processing.
         self._user_input_queue.append(text)
         self._user_input_ready.set()
-        conversation.update_queue_count(self._queue_count)
+        conversation.update_queue_count(self._queue_count, breath_mode=in_breath)
 
-        # Reset placeholder in case we were answering an ask_user question.
+        # Update placeholder — during BREATH, hint that the message is queued
+        # and /stop is available.  Otherwise reset from any prior ask_user state.
         try:
-            self.query_one("#user-input ChatInput").placeholder = "Talk to clou..."
+            chat_input = self.query_one("#user-input ChatInput")
+            if in_breath:
+                chat_input.placeholder = "Message queued \u00b7 /stop to halt coordinator"
+            else:
+                chat_input.placeholder = "Talk to clou..."
         except LookupError:
             pass
 
@@ -993,6 +1030,40 @@ class ClouApp(App[None]):
         self._task_graph_model = None
         self._synthetic_dag = False
         self._agent_task_map = {}
+
+        # Clean up stale conversation state from the coordinator period
+        # and recover scroll position.  overflow-y: hidden during BREATH
+        # swallows scroll_end() calls, so we must defer until the CSS
+        # reflow restores overflow-y: auto.
+        try:
+            conv = self.query_one(ConversationWidget)
+            conv._stop_working()
+            conv._clear_tail()
+            conv._stop_timer()
+            # Refresh queue indicator without breath_mode flag so
+            # coordinator-specific text clears.
+            conv.update_queue_count(self._queue_count)
+        except LookupError:
+            pass
+
+        # Reset placeholder from breath-mode hint.
+        try:
+            self.query_one("#user-input ChatInput").placeholder = "Talk to clou..."
+        except LookupError:
+            pass
+
+        def _recover_scroll() -> None:
+            from textual.containers import VerticalScroll
+
+            try:
+                history = self.query_one(
+                    ConversationWidget
+                ).query_one("#history", VerticalScroll)
+                history.scroll_end(animate=False)
+            except LookupError:
+                pass
+
+        self.call_after_refresh(_recover_scroll)
 
     def on_clou_handoff(self, msg: ClouHandoff) -> None:
         """Handoff ready — load content into the handoff widget."""

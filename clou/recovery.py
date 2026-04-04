@@ -545,14 +545,20 @@ async def write_staleness_escalation(
 
 
 def _is_coordinator_writable(rel_path: str, milestone: str) -> bool:
-    """Return True if *rel_path* matches a coordinator write-permission pattern.
+    """Return True if *rel_path* is a coordinator-owned file.
 
     *rel_path* is relative to ``.clou/`` (e.g. ``milestones/my-ms/status.md``).
-    Patterns are imported from ``clou.hooks.WRITE_PERMISSIONS``.
+    Includes both Write-permitted files (from hooks) and protocol artifact
+    files that are written via MCP tools (not Write).  Self-heal needs
+    access to both as defense-in-depth.
     """
+    from clou.golden_context import PROTOCOL_ARTIFACT_PATTERNS
     from clou.hooks import WRITE_PERMISSIONS
 
-    patterns = WRITE_PERMISSIONS.get("coordinator", [])
+    patterns = list(WRITE_PERMISSIONS.get("coordinator", []))
+    # Protocol artifacts are written by MCP tools, not Write, but
+    # self-heal (Python code) still needs to fix them.
+    patterns.extend(PROTOCOL_ARTIFACT_PATTERNS)
     return any(fnmatch.fnmatch(rel_path, p) for p in patterns)
 
 
@@ -574,15 +580,17 @@ _CHECKPOINT_DEFAULTS: dict[str, str] = {
 
 
 def _normalise_checkpoint(content: str) -> tuple[str, list[str]]:
-    """Normalise a coordinator checkpoint, resolving aliases and adding defaults.
+    """Normalise a coordinator checkpoint via parse→re-render.
 
     Returns ``(new_content, list_of_descriptions)``.  Idempotent.
-    Only operates when ``cycle:`` and ``next_step:`` are present (the two
-    required keys).  Never overwrites existing fields.
+    Uses ``parse_checkpoint`` (which handles aliases and defaults)
+    then ``render_checkpoint`` (which guarantees canonical format).
     """
+    from clou.golden_context import render_checkpoint
+
     fixes: list[str] = []
 
-    # Parse existing fields.
+    # Parse existing fields to detect what's present.
     fields: dict[str, str] = {}
     for match in re.finditer(r"(?m)^(\w[\w_]*):\s*(.+)$", content):
         fields[match.group(1)] = match.group(2).strip()
@@ -593,28 +601,21 @@ def _normalise_checkpoint(content: str) -> tuple[str, list[str]]:
     if "next_step" not in fields:
         return content, fixes
 
-    # Resolve aliases: rename alias keys to canonical names in-place.
-    for alias, canonical in _CHECKPOINT_FIELD_ALIASES.items():
-        if alias in fields and canonical not in fields:
-            # Replace the alias line with the canonical key.
-            content = re.sub(
-                rf"(?m)^{re.escape(alias)}:(\s*)",
-                f"{canonical}:\\1",
-                content,
-                count=1,
-            )
-            fields[canonical] = fields.pop(alias)
-            fixes.append(f"renamed '{alias}' -> '{canonical}'")
+    # Parse (handles aliases, defaults) then re-render (canonical format).
+    cp = parse_checkpoint(content)
+    new_content = render_checkpoint(
+        cycle=cp.cycle,
+        step=cp.step,
+        next_step=cp.next_step,
+        current_phase=cp.current_phase,
+        phases_completed=cp.phases_completed,
+        phases_total=cp.phases_total,
+    )
 
-    # Inject missing optional fields with defaults.
-    for key, default in _CHECKPOINT_DEFAULTS.items():
-        if key not in fields:
-            # Append after the last key-value line.
-            content = content.rstrip("\n") + f"\n{key}: {default}\n"
-            fields[key] = default
-            fixes.append(f"added missing '{key}: {default}'")
+    if new_content != content:
+        fixes.append("re-rendered checkpoint via serializer")
 
-    return content, fixes
+    return new_content, fixes
 
 
 #: Common status value misspellings and their canonical forms.

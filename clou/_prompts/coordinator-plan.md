@@ -26,6 +26,12 @@ phase specifications and initial status.
    - Minimum 3 substantive phases (excluding verification) — no
      two-node milestones. If the work looks like two phases, you
      haven't decomposed far enough.
+   - Context budget: each agent dispatch has a 200k token window.
+     If a phase requires reading more than 15 source files or running
+     more than 3 distinct test suites, decompose it further. Large
+     phases risk mid-cycle context exhaustion, forcing a costly
+     checkpoint-and-restart. Prefer two focused phases over one broad
+     phase that reads the entire codebase.
 
    Width-first decomposition — start with "what work is independent?"
    not "what order should things happen?"

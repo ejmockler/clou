@@ -641,11 +641,13 @@ async def execute():
 
     @pytest.mark.asyncio
     async def test_asyncio_timeout_fires_on_hung_task(self, project_dir: Path) -> None:
-        """asyncio.timeout() fires when a task hangs with no progress messages.
+        """Idle watchdog fires when a task hangs with no progress messages.
 
-        This tests the unconditional wall-clock timeout that catches tasks
-        that suppress telemetry entirely -- the progress-based check in the
-        elif branch would never trigger for such tasks.
+        This tests the idle watchdog that catches tasks that suppress
+        telemetry entirely -- the progress-based check in the elif branch
+        would never trigger for such tasks.  The watchdog is rescheduled
+        on every coordinator message, so a genuinely idle stream is
+        required to trip it.
         """
         ms_dir = project_dir / ".clou" / "milestones" / "ms"
         ms_dir.mkdir(parents=True)
@@ -705,7 +707,7 @@ async def execute():
         assert len(shards) == 1
         content = shards[0].read_text()
         assert "timeout" in content
-        assert "wall-clock timeout" in content
+        assert "idle" in content
         assert "hung_task" in content or "hung-task" in content
 
 

@@ -229,6 +229,16 @@ class ClouBudgetWarning(Message):
         super().__init__()
 
 
+class ClouContextPressure(Message):
+    """Supervisor context pressure level changed."""
+
+    def __init__(self, level: str, estimate: int, threshold: int) -> None:
+        self.level = level        # "none", "warn", "compact", "block"
+        self.estimate = estimate  # current token estimate
+        self.threshold = threshold  # threshold that was crossed
+        super().__init__()
+
+
 class ClouCoordinatorComplete(Message):
     """Coordinator finished for milestone."""
 

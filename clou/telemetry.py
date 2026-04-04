@@ -28,6 +28,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Generator
 
+from clou.graph import compute_topology
+
 _log_mod = logging.getLogger(__name__)
 
 
@@ -140,6 +142,95 @@ def read_log(path: Path) -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
     return records
+
+
+# ---------------------------------------------------------------------------
+# Per-task data extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_task_data(
+    records: list[dict[str, Any]],
+    milestone: str,
+) -> list[dict[str, Any]]:
+    """Extract per-task execution data from telemetry records.
+
+    Returns list of dicts, each with keys:
+        task_name: str — agent description (matched to DAG task name)
+        task_id: str — SDK task identifier
+        cycle_num: int — which cycle the task ran in
+        duration_s: float — wall-clock seconds (from t_s timestamps)
+        tokens: int — total tokens consumed
+        tool_uses: int — number of tool invocations
+        status: str — "completed", "failed", "orphaned"
+
+    Ordered by: cycle_num, then task_name alphabetically.
+    """
+    # Partition agent.start and agent.end events for this milestone.
+    starts: dict[str, dict[str, Any]] = {}
+    ends: dict[str, dict[str, Any]] = {}
+    for r in records:
+        if r.get("milestone") != milestone:
+            continue
+        tid = r.get("task_id")
+        if tid is None:
+            continue
+        if r.get("event") == "agent.start":
+            starts[tid] = r
+        elif r.get("event") == "agent.end":
+            ends[tid] = r
+
+    results: list[dict[str, Any]] = []
+
+    # Process all known task_ids (union of starts and ends).
+    all_task_ids = set(starts) | set(ends)
+    for tid in all_task_ids:
+        start = starts.get(tid)
+        end = ends.get(tid)
+
+        if start and end:
+            # Normal case: both start and end exist.
+            t_start = start.get("t_s", 0.0)
+            t_end = end.get("t_s", 0.0)
+            duration_s = round(t_end - t_start, 3)
+            if duration_s < 0:
+                duration_s = 0.0
+            results.append({
+                "task_name": start.get("description", tid),
+                "task_id": tid,
+                "cycle_num": start.get("cycle_num", 0),
+                "duration_s": duration_s,
+                "tokens": end.get("total_tokens", 0),
+                "tool_uses": end.get("tool_uses", 0),
+                "status": end.get("status", "completed"),
+            })
+        elif start and not end:
+            # Orphaned: start without end.
+            results.append({
+                "task_name": start.get("description", tid),
+                "task_id": tid,
+                "cycle_num": start.get("cycle_num", 0),
+                "duration_s": 0.0,
+                "tokens": 0,
+                "tool_uses": 0,
+                "status": "orphaned",
+            })
+        else:
+            # End without start (unusual but handle gracefully).
+            assert end is not None
+            results.append({
+                "task_name": tid,
+                "task_id": tid,
+                "cycle_num": end.get("cycle_num", 0),
+                "duration_s": 0.0,
+                "tokens": end.get("total_tokens", 0),
+                "tool_uses": end.get("tool_uses", 0),
+                "status": end.get("status", "completed"),
+            })
+
+    # Sort by (cycle_num, task_name) for deterministic output.
+    results.sort(key=lambda d: (d["cycle_num"], d["task_name"]))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +362,92 @@ def write_milestone_summary(
                     f"| — "
                     f"| — |"
                 )
+
+    # -- Topology section --
+    compose_path = (
+        project_dir / ".clou" / "milestones" / milestone / "compose.py"
+    )
+    topo: dict[str, Any] | None = None
+    if compose_path.exists():
+        try:
+            compose_source = compose_path.read_text(encoding="utf-8")
+            topo = compute_topology(compose_source)
+        except Exception:
+            _log_mod.warning(
+                "topology computation failed for %s", milestone, exc_info=True,
+            )
+
+    if topo is not None and topo.get("depth", 0) > 0:
+        lines.extend([
+            "",
+            "## Topology",
+            "",
+            f"width: {topo['width']}",
+            f"depth: {topo['depth']}",
+            f"layer_count: {topo['layer_count']}",
+            f"gather_groups: {json.dumps(topo['gather_groups'])}",
+            f"layers: {json.dumps(topo['layers'])}",
+        ])
+
+    # -- Per-Task Data table --
+    task_data = extract_task_data(records, milestone)
+    if task_data and topo is not None and topo.get("layers"):
+        # Build task_name -> layer mapping from topology layers.
+        task_layer: dict[str, int] = {}
+        for layer_idx, layer_names in enumerate(topo["layers"]):
+            for name in layer_names:
+                task_layer[name] = layer_idx
+
+        # Enrich task data with layer info and re-sort by (layer, task_name).
+        enriched: list[dict[str, Any]] = []
+        for td in task_data:
+            layer = task_layer.get(td["task_name"], None)
+            enriched.append({**td, "layer": layer})
+
+        enriched.sort(
+            key=lambda d: (
+                d["layer"] if d["layer"] is not None else float("inf"),
+                d["task_name"],
+            ),
+        )
+
+        lines.extend([
+            "",
+            "## Per-Task Data",
+            "",
+            "| Layer | Task | Duration | Tokens | Tools | Status |",
+            "|-------|------|----------|--------|-------|--------|",
+        ])
+        for td in enriched:
+            layer_str = str(td["layer"]) if td["layer"] is not None else "\u2014"
+            dur_ms = int(td["duration_s"] * 1000)
+            lines.append(
+                f"| {layer_str} "
+                f"| {td['task_name']} "
+                f"| {_fmt_duration(dur_ms)} "
+                f"| {td['tokens']:,} "
+                f"| {td['tool_uses']} "
+                f"| {td['status']} |"
+            )
+    elif task_data:
+        # No topology but task data exists: emit without layer info.
+        lines.extend([
+            "",
+            "## Per-Task Data",
+            "",
+            "| Layer | Task | Duration | Tokens | Tools | Status |",
+            "|-------|------|----------|--------|-------|--------|",
+        ])
+        for td in task_data:
+            dur_ms = int(td["duration_s"] * 1000)
+            lines.append(
+                f"| \u2014 "
+                f"| {td['task_name']} "
+                f"| {_fmt_duration(dur_ms)} "
+                f"| {td['tokens']:,} "
+                f"| {td['tool_uses']} "
+                f"| {td['status']} |"
+            )
 
     # -- Quality gate results (DB-18 telemetry extension) --
     qg_events = [
