@@ -8,25 +8,12 @@ Covers:
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 pytest.importorskip("claude_agent_sdk")
 
 from clou.golden_context import render_checkpoint
 from clou.recovery import Checkpoint, parse_checkpoint
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _write(path: Path, content: str) -> None:
-    """Write content to path, creating parent directories."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

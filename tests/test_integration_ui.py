@@ -159,7 +159,7 @@ class TestSupervisorRouting:
 
 
 class TestCoordinatorRouting:
-    """Coordinator messages route through bridge when _active_app is set."""
+    """Coordinator messages route through bridge when active app is set via accessor."""
 
     @pytest.fixture(autouse=True)
     def _patch_io(self) -> Any:
@@ -214,7 +214,7 @@ class TestCoordinatorRouting:
 
     @pytest.mark.asyncio
     async def test_no_routing_when_no_app(self, project_dir: Path) -> None:
-        """No routing when _active_app is None."""
+        """No routing when get_active_app() returns None."""
         client = _mock_sdk_client([_make_result(usage={"input_tokens": 100})])
 
         old_app = get_active_app()

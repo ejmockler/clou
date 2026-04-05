@@ -72,6 +72,10 @@ next_step: VERIFY
 current_phase: implementation
 phases_completed: 2
 phases_total: 3
+validation_retries: 0
+readiness_retries: 0
+crash_retries: 0
+staleness_count: 0
 """
 
 

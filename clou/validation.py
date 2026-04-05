@@ -100,7 +100,11 @@ _TERMINAL_STATUSES = frozenset({"completed", "failed"})
 # --- Checkpoint-tier validation (DB-12) ---
 _CHECKPOINT_REQUIRED_KEYS = frozenset({"cycle", "next_step"})
 _CHECKPOINT_OPTIONAL_KEYS = frozenset(
-    {"step", "current_phase", "phase", "phases_completed", "phases_total"}
+    {
+        "step", "current_phase", "phase", "phases_completed", "phases_total",
+        "validation_retries", "readiness_retries", "crash_retries",
+        "staleness_count",
+    }
 )
 _CHECKPOINT_ALIASES: dict[str, str] = {"phase": "current_phase"}
 
@@ -479,7 +483,11 @@ def validate_checkpoint(content: str) -> list[ValidationFinding]:
 
     # Integer fields (only validate when present)
     int_errors = False
-    for key in ("cycle", "phases_completed", "phases_total"):
+    for key in (
+        "cycle", "phases_completed", "phases_total",
+        "validation_retries", "readiness_retries", "crash_retries",
+        "staleness_count",
+    ):
         if key not in fields:
             continue
         try:
