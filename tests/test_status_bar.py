@@ -155,6 +155,94 @@ class TestRenderStatusBar:
         assert style_at.color.get_truecolor().hex == gold_hex
 
 
+class TestContextPressureGlyph:
+    """Context pressure glyph — the session's embodied weight made visible."""
+
+    def test_none_emits_no_glyph(self) -> None:
+        """Absence is positive — 'none' pressure shows no indicator."""
+        result = render_status_bar(context_pressure="none")
+        plain = result.plain
+        # Must not contain either pressure glyph.
+        assert "\u2022" not in plain  # •
+        assert "\u25cb" not in plain  # ○
+        # Identity should start at beginning (no prefix).
+        assert plain.startswith("clou")
+
+    def test_warn_emits_amber_dot(self) -> None:
+        result = render_status_bar(context_pressure="warn")
+        plain = result.plain
+        assert "\u2022" in plain
+        assert plain.startswith("\u2022")
+        # Verify color is amber.
+        amber_hex = PALETTE["accent-amber"].to_hex()
+        style_at = result.get_style_at_offset(_CONSOLE, 0)
+        assert style_at.color is not None
+        assert style_at.color.get_truecolor().hex == amber_hex
+
+    def test_compact_emits_gold_dot(self) -> None:
+        result = render_status_bar(context_pressure="compact")
+        plain = result.plain
+        assert "\u2022" in plain
+        assert plain.startswith("\u2022")
+        # Verify color is gold (the primary accent — this is THE moment).
+        gold_hex = PALETTE["accent-gold"].to_hex()
+        style_at = result.get_style_at_offset(_CONSOLE, 0)
+        assert style_at.color is not None
+        assert style_at.color.get_truecolor().hex == gold_hex
+
+    def test_block_emits_rose_ring(self) -> None:
+        result = render_status_bar(context_pressure="block")
+        plain = result.plain
+        # Ring, not dot — the boundary made visible.
+        assert "\u25cb" in plain
+        assert plain.startswith("\u25cb")
+        assert "\u2022" not in plain  # no dot
+        # Verify color is rose.
+        rose_hex = PALETTE["accent-rose"].to_hex()
+        style_at = result.get_style_at_offset(_CONSOLE, 0)
+        assert style_at.color is not None
+        assert style_at.color.get_truecolor().hex == rose_hex
+
+    def test_glyph_precedes_identity(self) -> None:
+        """Glyph claims peripheral attention before the identity."""
+        result = render_status_bar(context_pressure="warn")
+        plain = result.plain
+        glyph_pos = plain.index("\u2022")
+        clou_pos = plain.index("clou")
+        assert glyph_pos < clou_pos
+
+    def test_glyph_coexists_with_milestone(self) -> None:
+        """Pressure glyph + full milestone layout renders together."""
+        result = render_status_bar(
+            context_pressure="warn",
+            milestone="auth-system",
+            cycle_type="EXECUTE",
+            cycle_num=3,
+        )
+        plain = result.plain
+        assert plain.startswith("\u2022")
+        assert "auth-system" in plain
+        assert "EXECUTE" in plain
+
+    def test_glyph_coexists_with_rate_limited(self) -> None:
+        """Pressure glyph + rate-limited warning both present."""
+        result = render_status_bar(
+            context_pressure="compact",
+            rate_limited=True,
+        )
+        plain = result.plain
+        assert plain.startswith("\u2022")
+        assert "rate limited" in plain
+
+    def test_unknown_pressure_level_emits_no_glyph(self) -> None:
+        """Unknown level falls back to absence — fails safe."""
+        result = render_status_bar(context_pressure="unknown_level")
+        plain = result.plain
+        assert "\u2022" not in plain
+        assert "\u25cb" not in plain
+        assert plain.startswith("clou")
+
+
 class TestClouStatusBarClass:
     """Tests for the ClouStatusBar class structure."""
 
@@ -173,6 +261,7 @@ class TestClouStatusBarClass:
             "output_tokens",
             "cost_usd",
             "rate_limited",
+            "context_pressure",
         }
         # Reactive descriptors are on the class
         for attr in expected:

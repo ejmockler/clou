@@ -1919,3 +1919,125 @@ class TestValidateReadiness:
         assert findings[0].severity == Severity.WARNING
         # Root-scoped paths stay as-is (already .clou/-relative).
         assert findings[0].path == "project.md"
+
+
+# ---------------------------------------------------------------------------
+# T5: phases_completed cross-file WARNING
+# ---------------------------------------------------------------------------
+
+
+class TestPhasesCompletedCrossFile:
+    """validate_delivery produces a WARNING when phases_completed in the
+    checkpoint disagrees with the count of completed phases in
+    status.md's Phase Progress table.
+    """
+
+    def test_mismatch_produces_warning(self, tmp_path: Path) -> None:
+        """status.md shows 2 completed phases, checkpoint says 3 -> WARNING."""
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        cp.write_text(
+            "cycle: 4\nstep: ASSESS\nnext_step: VERIFY\n"
+            "current_phase: deploy\nphases_completed: 3\nphases_total: 4\n"
+        )
+        _write(
+            milestone_dir / "status.md",
+            "## Current State\nphase: deploy\ncycle: 4\nnext_step: VERIFY\n\n"
+            "## Phase Progress\n"
+            "| Phase | Status |\n"
+            "|-------|--------|\n"
+            "| setup | completed |\n"
+            "| api | completed |\n"
+            "| deploy | in_progress |\n"
+            "| docs | pending |\n",
+        )
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        warnings = [f for f in findings if f.severity == Severity.WARNING]
+        assert any(
+            "2 completed phases" in w.message
+            and "phases_completed=3" in w.message
+            for w in warnings
+        ), f"Expected phases_completed mismatch warning, got: {warnings}"
+
+    def test_matching_phases_no_warning(self, tmp_path: Path) -> None:
+        """status.md shows 2 completed, checkpoint says 2 -> no WARNING."""
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        cp.write_text(
+            "cycle: 4\nstep: ASSESS\nnext_step: VERIFY\n"
+            "current_phase: deploy\nphases_completed: 2\nphases_total: 4\n"
+        )
+        _write(
+            milestone_dir / "status.md",
+            "## Current State\nphase: deploy\ncycle: 4\nnext_step: VERIFY\n\n"
+            "## Phase Progress\n"
+            "| Phase | Status |\n"
+            "|-------|--------|\n"
+            "| setup | completed |\n"
+            "| api | completed |\n"
+            "| deploy | in_progress |\n"
+            "| docs | pending |\n",
+        )
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        phase_warnings = [
+            f for f in findings
+            if f.severity == Severity.WARNING and "phases_completed" in f.message
+        ]
+        assert phase_warnings == [], (
+            f"Expected no phases_completed warning, got: {phase_warnings}"
+        )
+
+    def test_no_phase_progress_table_no_warning(self, tmp_path: Path) -> None:
+        """Missing Phase Progress table -> no phases_completed warning."""
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        cp.write_text(
+            "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: impl\nphases_completed: 1\nphases_total: 2\n"
+        )
+        _write(
+            milestone_dir / "status.md",
+            "## Current State\nphase: impl\ncycle: 2\nnext_step: ASSESS\n",
+        )
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        phase_warnings = [
+            f for f in findings
+            if f.severity == Severity.WARNING and "phases_completed" in f.message
+        ]
+        assert phase_warnings == []
+
+    def test_zero_completed_matches_zero(self, tmp_path: Path) -> None:
+        """Both show 0 completed -> no warning."""
+        milestone_dir = tmp_path / "milestone"
+        milestone_dir.mkdir()
+        cp = milestone_dir / "active" / "coordinator.md"
+        cp.parent.mkdir(parents=True)
+        cp.write_text(
+            "cycle: 1\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: setup\nphases_completed: 0\nphases_total: 2\n"
+        )
+        _write(
+            milestone_dir / "status.md",
+            "## Current State\nphase: setup\ncycle: 1\nnext_step: ASSESS\n\n"
+            "## Phase Progress\n"
+            "| Phase | Status |\n"
+            "|-------|--------|\n"
+            "| setup | in_progress |\n"
+            "| impl | pending |\n",
+        )
+
+        findings = validate_delivery(milestone_dir, cp, "m1")
+        phase_warnings = [
+            f for f in findings
+            if f.severity == Severity.WARNING and "phases_completed" in f.message
+        ]
+        assert phase_warnings == []

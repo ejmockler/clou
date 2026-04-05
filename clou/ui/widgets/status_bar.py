@@ -23,6 +23,17 @@ _GOLD_HEX = PALETTE["accent-gold"].to_hex()
 _DIM_HEX = PALETTE["text-dim"].to_hex()
 _MUTED_HEX = PALETTE["text-muted"].to_hex()
 _ORANGE_HEX = PALETTE["accent-orange"].to_hex()
+_AMBER_HEX = PALETTE["accent-amber"].to_hex()
+_ROSE_HEX = PALETTE["accent-rose"].to_hex()
+
+# Context pressure glyphs — the session's embodied weight.
+# WARN/COMPACT share a dot (amber → gold is warmth intensifying).
+# BLOCK breaks the shape open to a ring (the boundary made visible).
+_PRESSURE_GLYPH: dict[str, tuple[str, str]] = {
+    "warn": ("\u2022", _AMBER_HEX),    # • amber
+    "compact": ("\u2022", _GOLD_HEX),  # • gold
+    "block": ("\u25cb", _ROSE_HEX),    # ○ rose
+}
 
 
 def format_cost(usd: float) -> str:
@@ -59,6 +70,7 @@ def render_status_bar(
     output_tokens: int = 0,
     cost_usd: float = 0.0,
     rate_limited: bool = False,
+    context_pressure: str = "none",
 ) -> Text:
     """Build the Rich Text for the status bar.
 
@@ -69,8 +81,17 @@ def render_status_bar(
         f"{format_tokens(input_tokens)}\u2193 {format_tokens(output_tokens)}\u2191"
     )
 
+    # Context pressure glyph: absence is positive (pressure="none" → no glyph).
+    # The glyph precedes identity, claiming a single character's worth of
+    # attention at peripheral bandwidth. Users feel it without reading.
+    pressure_prefix: list[tuple[str, str]] = []
+    if context_pressure in _PRESSURE_GLYPH:
+        glyph, color = _PRESSURE_GLYPH[context_pressure]
+        pressure_prefix = [(glyph, color), (" ", "")]
+
     if rate_limited:
         return Text.assemble(
+            *pressure_prefix,
             ("clou", "bold"),
             ("  ", ""),
             ("\u26a0 rate limited", f"bold {_ORANGE_HEX}"),
@@ -80,6 +101,7 @@ def render_status_bar(
 
     if not milestone:
         return Text.assemble(
+            *pressure_prefix,
             ("clou", "bold"),
             ("  tokens: ", f"{_DIM_HEX}"),
             (token_str, ""),
@@ -94,6 +116,7 @@ def render_status_bar(
     else:
         cycle_hex = _DIM_HEX
     return Text.assemble(
+        *pressure_prefix,
         ("clou", "bold"),
         ("  ", ""),
         (milestone, f"bold {_GOLD_HEX}"),
@@ -120,6 +143,7 @@ class ClouStatusBar(Static):
     output_tokens: reactive[int] = reactive(0)
     cost_usd: reactive[float] = reactive(0.0)
     rate_limited: reactive[bool] = reactive(False)
+    context_pressure: reactive[str] = reactive("none")
 
     def render(self) -> RenderResult:
         """Render the status bar content using Rich Text.assemble()."""
@@ -132,4 +156,5 @@ class ClouStatusBar(Static):
             output_tokens=self.output_tokens,
             cost_usd=self.cost_usd,
             rate_limited=self.rate_limited,
+            context_pressure=self.context_pressure,
         )

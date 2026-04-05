@@ -93,6 +93,27 @@ def emit_agent_start(
     )
 
 
+def emit_agent_end(
+    milestone: str,
+    cycle_num: int,
+    task_id: str,
+    *,
+    status: str = "completed",
+    tokens: int = 10000,
+    tool_uses: int = 5,
+) -> None:
+    """Emit only agent.end (no agent.start) -- produces an end-without-start."""
+    telemetry.event(
+        "agent.end",
+        milestone=milestone,
+        cycle_num=cycle_num,
+        task_id=task_id,
+        status=status,
+        total_tokens=tokens,
+        tool_uses=tool_uses,
+    )
+
+
 def emit_cycle(
     milestone: str,
     cycle_num: int,
@@ -831,6 +852,239 @@ class TestEmptyTelemetry:
 
             # No per-task data section (no agent events for this milestone).
             assert "## Per-Task Data" not in content
+
+        finally:
+            telemetry._log = old
+
+
+# ---------------------------------------------------------------------------
+# Intent 9-11 integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestEndWithoutStartIntegration:
+    """Intent 9: agent.end without matching agent.start at integration level.
+
+    Proves the full pipeline (telemetry events -> write_milestone_summary ->
+    metrics.md) handles orphaned end events gracefully: task_id used as name,
+    0.0 duration, and metrics recorded in Per-Task Data.
+    """
+
+    def test_end_without_start_pipeline(self, tmp_path: Path) -> None:
+        """Emit only agent.end (no agent.start) and verify the full pipeline
+        records it in Per-Task Data with task_id as name and 0s duration.
+        """
+        old = setup_log(tmp_path)
+        try:
+            write_compose(tmp_path, "m-endonly", WIDE_GRAPH_SOURCE)
+
+            # Emit only agent.end -- no matching agent.start.
+            emit_agent_end(
+                "m-endonly", 1, "orphan-end-task",
+                tokens=3000, tool_uses=2,
+            )
+
+            # Emit cycle span to trigger summary writing.
+            emit_cycle("m-endonly", 1, "EXECUTE", "ASSESS")
+
+            # Write the summary.
+            write_milestone_summary(tmp_path, "m-endonly", "completed")
+
+            # Read metrics.md.
+            metrics = (
+                tmp_path / ".clou" / "milestones" / "m-endonly" / "metrics.md"
+            )
+            assert metrics.exists(), "metrics.md should be created"
+            content = metrics.read_text()
+
+            # Header: the orphaned end counts toward agents_spawned=0
+            # (no start) and agents_completed=1 (end has status=completed).
+            assert "agents_spawned: 0" in content
+            assert "agents_completed: 1" in content
+
+            # Per-Task Data section present (task data exists, topology
+            # exists, so the enriched path is taken).
+            assert "## Per-Task Data" in content
+            ptd_start = content.index("## Per-Task Data")
+            table_content = content[ptd_start:]
+
+            # task_id used as name (no agent.start to provide description).
+            assert "orphan-end-task" in table_content
+
+            # Find the orphan row and verify contents.
+            orphan_row = [
+                ln for ln in table_content.split("\n")
+                if "orphan-end-task" in ln and ln.startswith("|")
+            ]
+            assert len(orphan_row) == 1, "Expected exactly one orphan-end-task row"
+
+            # Duration should be 0s (no start time to compute from).
+            assert "0s" in orphan_row[0], "orphan end should show 0s duration"
+
+            # Token count should appear.
+            assert "3,000" in orphan_row[0], "tokens (3000) should appear in row"
+
+            # Tool uses should appear.
+            assert "| 2 |" in orphan_row[0], "tool_uses (2) should appear in row"
+
+            # Status should be completed (the end event has status=completed).
+            assert "completed" in orphan_row[0]
+
+            # Agents table also records the orphan end.
+            assert "## Agents" in content
+            agents_start = content.index("## Agents")
+            agents_section = content[agents_start:]
+            next_heading = agents_section.find("\n## ", 1)
+            if next_heading != -1:
+                agents_section = agents_section[:next_heading]
+            agent_row = [
+                ln for ln in agents_section.split("\n")
+                if "orphan-end-task" in ln and ln.startswith("|")
+            ]
+            assert len(agent_row) == 1, (
+                "Expected orphan-end-task in Agents table"
+            )
+
+        finally:
+            telemetry._log = old
+
+
+class TestSyntaxErrorComposeDegradation:
+    """Intent 10: compose.py present but has SyntaxError.
+
+    Proves the full pipeline degrades cleanly: broken compose.py produces
+    zero topology (no ## Topology section), but ## Per-Task Data still
+    renders with emitted agent events.
+    """
+
+    def test_syntax_error_compose_pipeline(self, tmp_path: Path) -> None:
+        """Write a compose.py with invalid syntax, emit agent events, and
+        verify metrics.md has no Topology section but Per-Task Data present.
+        """
+        old = setup_log(tmp_path)
+        try:
+            # Write a compose.py with invalid syntax.
+            write_compose(tmp_path, "m-syntax", "def foo(")
+
+            # Emit agent events for two tasks.
+            emit_agent(
+                "m-syntax", 1, "s1", "task_alpha",
+                tokens=4000, tool_uses=2,
+            )
+            emit_agent(
+                "m-syntax", 1, "s2", "task_beta",
+                tokens=5000, tool_uses=3,
+            )
+
+            # Emit cycle span.
+            emit_cycle("m-syntax", 1, "EXECUTE", "ASSESS")
+
+            # Write the summary.
+            write_milestone_summary(tmp_path, "m-syntax", "completed")
+
+            # Read metrics.md.
+            metrics = (
+                tmp_path / ".clou" / "milestones" / "m-syntax" / "metrics.md"
+            )
+            assert metrics.exists(), "metrics.md should be created"
+            content = metrics.read_text()
+
+            # Header present.
+            assert content.startswith("# Metrics: m-syntax")
+
+            # Topology section must NOT appear (SyntaxError -> depth=0).
+            assert "## Topology" not in content
+
+            # Per-Task Data section IS present (task data exists, no topo).
+            assert "## Per-Task Data" in content
+            ptd_start = content.index("## Per-Task Data")
+            table_content = content[ptd_start:]
+
+            # Both tasks present.
+            assert "task_alpha" in table_content
+            assert "task_beta" in table_content
+
+            # Layer column shows dash (no topology available).
+            assert "\u2014" in table_content, (
+                "expected dash for layer column when topology fails"
+            )
+
+            # Token values present.
+            assert "4,000" in table_content, "task_alpha tokens (4000) missing"
+            assert "5,000" in table_content, "task_beta tokens (5000) missing"
+
+            # Row count: 2 data rows.
+            lines = table_content.strip().split("\n")
+            data_rows = [
+                ln for ln in lines
+                if ln.startswith("|") and "Layer" not in ln and "---" not in ln
+            ]
+            assert len(data_rows) == 2, (
+                f"Expected 2 task rows, got {len(data_rows)}"
+            )
+
+            # Agents table still present.
+            assert "## Agents" in content
+
+        finally:
+            telemetry._log = old
+
+
+class TestTopologyPresentButNoTaskData:
+    """Intent 11: valid topology but no agent events emitted.
+
+    Proves the pipeline renders ## Topology section with correct width/depth
+    but does NOT render ## Per-Task Data (no task data to show).
+    """
+
+    def test_topology_only_no_task_data(self, tmp_path: Path) -> None:
+        """Write a valid compose.py, emit a cycle span but NO agent events.
+
+        Asserts metrics.md CONTAINS ## Topology and does NOT contain
+        ## Per-Task Data.
+        """
+        old = setup_log(tmp_path)
+        try:
+            # Write a valid compose.py (wide graph: width=3, depth=2).
+            write_compose(tmp_path, "m-topoonly", WIDE_GRAPH_SOURCE)
+
+            # Emit cycle span but NO agent events.
+            emit_cycle("m-topoonly", 1, "EXECUTE", "ASSESS")
+
+            # Write the summary.
+            write_milestone_summary(tmp_path, "m-topoonly", "completed")
+
+            # Read metrics.md.
+            metrics = (
+                tmp_path / ".clou" / "milestones" / "m-topoonly" / "metrics.md"
+            )
+            assert metrics.exists(), "metrics.md should be created"
+            content = metrics.read_text()
+
+            # Header present with zero agent counts.
+            assert content.startswith("# Metrics: m-topoonly")
+            assert "agents_spawned: 0" in content
+            assert "agents_completed: 0" in content
+            assert "agents_failed: 0" in content
+
+            # Topology section IS present with correct values.
+            assert "## Topology" in content
+            assert "width: 3" in content
+            assert "depth: 2" in content
+            assert "layer_count: 2" in content
+            assert "gather_groups: [3]" in content
+            assert "layers:" in content
+            assert '["task_a", "task_b", "task_c"]' in content
+            assert '["combine"]' in content
+
+            # Per-Task Data section must NOT appear (no agent events).
+            assert "## Per-Task Data" not in content
+
+            # Cycles section should still be present (we emitted a cycle).
+            assert "## Cycles" in content
+
+            # Agents section should NOT be present (no agent events).
+            assert "## Agents" not in content
 
         finally:
             telemetry._log = old

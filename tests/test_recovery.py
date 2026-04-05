@@ -467,7 +467,7 @@ def test_git_revert_golden_context_exists() -> None:
     assert inspect.iscoroutinefunction(git_revert_golden_context)
     sig = inspect.signature(git_revert_golden_context)
     params = list(sig.parameters.keys())
-    assert params == ["project_dir", "milestone"]
+    assert params == ["project_dir", "milestone", "current_phase"]
 
 
 # ---------------------------------------------------------------------------
@@ -1027,9 +1027,9 @@ def test_git_commit_phase_calls_git_commands(
 
             async def communicate(self) -> tuple[bytes, bytes]:
                 if "diff" in cmd and "--name-only" in cmd:
-                    return b"src/main.py\n", b""
+                    return b".clou/milestones/m1/status.md\n", b""
                 if "ls-files" in cmd:
-                    return b"src/new.py\n", b""
+                    return b".clou/milestones/m1/phases/design/phase.md\n", b""
                 return b"", b""
 
         return _Proc()
@@ -1045,7 +1045,8 @@ def test_git_commit_phase_calls_git_commands(
     assert "ls-files" in commands[1]
     assert "add" in commands[2]
     assert "-A" not in commands[2]  # NOT git add -A
-    assert "src/main.py" in commands[2] or "src/new.py" in commands[2]
+    assert ".clou/milestones/m1/status.md" in commands[2] or \
+        ".clou/milestones/m1/phases/design/phase.md" in commands[2]
     assert "diff" in commands[3] and "--cached" in commands[3]
     assert "commit" in commands[4]
     assert "-m" in commands[4]
@@ -1094,7 +1095,7 @@ def test_git_commit_phase_message_format(
 
             async def communicate(self) -> tuple[bytes, bytes]:
                 if "diff" in cmd and "--name-only" in cmd:
-                    return b"src/main.py\n", b""
+                    return b".clou/milestones/auth-v2/status.md\n", b""
                 return b"", b""
 
         if "commit" in cmd:
@@ -1108,6 +1109,276 @@ def test_git_commit_phase_message_format(
     asyncio.run(git_commit_phase(tmp_path, "auth-v2", "implementation"))
 
     assert commit_msg == "feat(auth-v2): complete phase 'implementation'"
+
+
+# ---------------------------------------------------------------------------
+# V4: git_commit_phase — milestone-scoped staging only
+# ---------------------------------------------------------------------------
+
+
+def test_git_commit_phase_excludes_non_milestone_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V4: Only files under .clou/milestones/{ms}/ are staged; user files excluded."""
+    staged_files: list[str] = []
+
+    async def _mock_subprocess(*args: object, **kwargs: object) -> object:
+        cmd = [str(a) for a in args]
+
+        class _Proc:
+            returncode = 1 if ("diff" in cmd and "--cached" in cmd) else 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                if "diff" in cmd and "--name-only" in cmd:
+                    # Simulate user-changed file + milestone file
+                    return (
+                        b"src/app.py\n"
+                        b".clou/milestones/m1/status.md\n",
+                        b"",
+                    )
+                if "ls-files" in cmd:
+                    return (
+                        b"README.md\n"
+                        b".clou/milestones/m1/phases/impl/execution.md\n",
+                        b"",
+                    )
+                return b"", b""
+
+        if "add" in cmd:
+            # Capture what was staged
+            dash_idx = cmd.index("--")
+            staged_files.extend(cmd[dash_idx + 1 :])
+
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _mock_subprocess)
+    asyncio.run(git_commit_phase(tmp_path, "m1", "impl"))
+
+    # Only milestone-scoped files should be staged
+    assert ".clou/milestones/m1/status.md" in staged_files
+    assert ".clou/milestones/m1/phases/impl/execution.md" in staged_files
+    # User files must NOT be staged
+    assert "src/app.py" not in staged_files
+    assert "README.md" not in staged_files
+
+
+def test_git_commit_phase_excludes_other_milestone_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V4: Files from other milestones are not staged."""
+    staged_files: list[str] = []
+
+    async def _mock_subprocess(*args: object, **kwargs: object) -> object:
+        cmd = [str(a) for a in args]
+
+        class _Proc:
+            returncode = 1 if ("diff" in cmd and "--cached" in cmd) else 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                if "diff" in cmd and "--name-only" in cmd:
+                    return (
+                        b".clou/milestones/m1/status.md\n"
+                        b".clou/milestones/m2/status.md\n",
+                        b"",
+                    )
+                return b"", b""
+
+        if "add" in cmd:
+            dash_idx = cmd.index("--")
+            staged_files.extend(cmd[dash_idx + 1 :])
+
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _mock_subprocess)
+    asyncio.run(git_commit_phase(tmp_path, "m1", "impl"))
+
+    assert ".clou/milestones/m1/status.md" in staged_files
+    assert ".clou/milestones/m2/status.md" not in staged_files
+
+
+# ---------------------------------------------------------------------------
+# V6: git_revert_golden_context — preserve completed phases' execution.md
+# ---------------------------------------------------------------------------
+
+
+def test_git_revert_scopes_to_current_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V6: When current_phase is given, only that phase dir is reverted."""
+    commands: list[list[str]] = []
+
+    async def _mock_subprocess(*args: object, **kwargs: object) -> object:
+        cmd = [str(a) for a in args]
+        commands.append(cmd)
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"", b""
+
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _mock_subprocess)
+    asyncio.run(
+        git_revert_golden_context(tmp_path, "m1", current_phase="impl")
+    )
+
+    # First command is git checkout
+    checkout_cmd = commands[0]
+    assert "checkout" in checkout_cmd
+    # Should include phases/impl/ but NOT phases/ (all phases)
+    paths_after_dash = checkout_cmd[checkout_cmd.index("--") + 1 :]
+    phase_paths = [p for p in paths_after_dash if "phases/" in p]
+    assert len(phase_paths) == 1
+    assert phase_paths[0] == ".clou/milestones/m1/phases/impl/"
+
+
+def test_git_revert_without_current_phase_reverts_all_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V6: Without current_phase, all phases are reverted (backward compat)."""
+    commands: list[list[str]] = []
+
+    async def _mock_subprocess(*args: object, **kwargs: object) -> object:
+        cmd = [str(a) for a in args]
+        commands.append(cmd)
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"", b""
+
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _mock_subprocess)
+    asyncio.run(git_revert_golden_context(tmp_path, "m1"))
+
+    checkout_cmd = commands[0]
+    paths_after_dash = checkout_cmd[checkout_cmd.index("--") + 1 :]
+    phase_paths = [p for p in paths_after_dash if "phases/" in p]
+    assert len(phase_paths) == 1
+    assert phase_paths[0] == ".clou/milestones/m1/phases/"
+
+
+# ---------------------------------------------------------------------------
+# V10: git_revert_golden_context — clean untracked files
+# ---------------------------------------------------------------------------
+
+
+def test_git_revert_runs_git_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V10: After checkout revert, git clean -fd is run on directory paths."""
+    commands: list[list[str]] = []
+
+    async def _mock_subprocess(*args: object, **kwargs: object) -> object:
+        cmd = [str(a) for a in args]
+        commands.append(cmd)
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"", b""
+
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _mock_subprocess)
+    asyncio.run(
+        git_revert_golden_context(tmp_path, "m1", current_phase="impl")
+    )
+
+    # Should have two commands: checkout + clean
+    assert len(commands) == 2
+    clean_cmd = commands[1]
+    assert "clean" in clean_cmd
+    assert "-fd" in clean_cmd
+    # Clean paths should only be directories (ending with /)
+    clean_paths = clean_cmd[clean_cmd.index("--") + 1 :]
+    for p in clean_paths:
+        assert p.endswith("/"), f"Clean path {p!r} should end with /"
+    # Must include the current phase directory
+    assert ".clou/milestones/m1/phases/impl/" in clean_paths
+    # Must include active/ and escalations/
+    assert ".clou/milestones/m1/active/" in clean_paths
+    assert ".clou/milestones/m1/escalations/" in clean_paths
+
+
+def test_git_revert_clean_scoped_to_milestone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V10: git clean is scoped to milestone dirs only, never user files."""
+    commands: list[list[str]] = []
+
+    async def _mock_subprocess(*args: object, **kwargs: object) -> object:
+        cmd = [str(a) for a in args]
+        commands.append(cmd)
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"", b""
+
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _mock_subprocess)
+    asyncio.run(git_revert_golden_context(tmp_path, "m1"))
+
+    clean_cmd = commands[1]
+    clean_paths = clean_cmd[clean_cmd.index("--") + 1 :]
+    for p in clean_paths:
+        assert p.startswith(".clou/milestones/m1/"), (
+            f"Clean path {p!r} is outside milestone directory"
+        )
+
+
+# ---------------------------------------------------------------------------
+# T3: git_revert_golden_context — excludes supervisor files
+# ---------------------------------------------------------------------------
+
+
+def test_git_revert_excludes_supervisor_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T3: Revert path list excludes supervisor files (milestone.md, intents.md, requirements.md)."""
+    commands: list[list[str]] = []
+
+    async def _mock_subprocess(*args: object, **kwargs: object) -> object:
+        cmd = [str(a) for a in args]
+        commands.append(cmd)
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"", b""
+
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _mock_subprocess)
+    asyncio.run(git_revert_golden_context(tmp_path, "m1"))
+
+    checkout_cmd = commands[0]
+    paths_after_dash = checkout_cmd[checkout_cmd.index("--") + 1 :]
+
+    # Supervisor files must NOT be in the revert path list
+    supervisor_files = ["milestone.md", "intents.md", "requirements.md"]
+    for sf in supervisor_files:
+        full_path = f".clou/milestones/m1/{sf}"
+        assert full_path not in paths_after_dash, (
+            f"Supervisor file {sf!r} should not be reverted"
+        )
+
+    # Coordinator-owned paths should be present
+    assert ".clou/milestones/m1/active/" in paths_after_dash
+    assert ".clou/milestones/m1/status.md" in paths_after_dash
+    assert ".clou/milestones/m1/compose.py" in paths_after_dash
+    assert ".clou/milestones/m1/decisions.md" in paths_after_dash
+    assert ".clou/milestones/m1/assessment.md" in paths_after_dash
+    assert ".clou/milestones/m1/escalations/" in paths_after_dash
 
 
 # ---------------------------------------------------------------------------
@@ -1614,7 +1885,7 @@ def test_staging_exclude_patterns() -> None:
 
 
 def test_staging_scopes_clou_to_active_milestone() -> None:
-    """git_commit_phase only stages .clou/ files for the active milestone."""
+    """V4: git_commit_phase only stages files within .clou/milestones/{ms}/."""
     import fnmatch  # noqa: F811
 
     from clou.recovery import _STAGING_EXCLUDE_PATTERNS  # noqa: F811
@@ -1624,18 +1895,18 @@ def test_staging_scopes_clou_to_active_milestone() -> None:
     changed = [
         ".clou/milestones/my-ms/compose.py",       # should include
         ".clou/milestones/my-ms/status.md",         # should include
-        ".clou/milestones/other-ms/compose.py",     # different milestone — exclude
-        ".clou/memory.md",                          # shared .clou/ metadata — exclude
-        "src/main.py",                              # workspace file — include
+        ".clou/milestones/other-ms/compose.py",     # different milestone -- exclude
+        ".clou/memory.md",                          # shared .clou/ metadata -- exclude
+        "src/main.py",                              # workspace file -- exclude (V4)
     ]
     to_stage = [
         f for f in changed
-        if not any(fnmatch.fnmatch(f, pat) for pat in _STAGING_EXCLUDE_PATTERNS)
-        and (not f.startswith(".clou/") or f.startswith(milestone_prefix))
+        if f.startswith(milestone_prefix)
+        and not any(fnmatch.fnmatch(f, pat) for pat in _STAGING_EXCLUDE_PATTERNS)
     ]
     assert ".clou/milestones/my-ms/compose.py" in to_stage
     assert ".clou/milestones/my-ms/status.md" in to_stage
-    assert "src/main.py" in to_stage
+    assert "src/main.py" not in to_stage  # V4: user files excluded
     assert ".clou/milestones/other-ms/compose.py" not in to_stage
     assert ".clou/memory.md" not in to_stage
 

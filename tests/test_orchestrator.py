@@ -570,7 +570,9 @@ class TestRunCoordinator:
             result = await run_coordinator(project_dir, "auth")
 
         assert result == "completed"
-        mock_revert.assert_called_once_with(project_dir, "auth")
+        mock_revert.assert_called_once_with(
+            project_dir, "auth", current_phase=None,
+        )
         # Two cycles: first failed validation + retry, second passed
         assert cycle_calls == 2
 
@@ -1150,7 +1152,9 @@ class TestRunCoordinator:
 
         assert result == "completed"
         # Git revert was called because errors were present
-        mock_revert.assert_called_once_with(project_dir, "auth")
+        mock_revert.assert_called_once_with(
+            project_dir, "auth", current_phase=None,
+        )
         assert call_count == 2
 
     @pytest.mark.asyncio

@@ -34,6 +34,7 @@ from clou.ui.messages import (
     ClouAgentProgress,
     ClouAgentSpawned,
     ClouAskUser,
+    ClouContextPressure,
     ClouCoordinatorComplete,
     ClouCoordinatorSpawned,
     ClouDagUpdate,
@@ -65,6 +66,26 @@ _log = logging.getLogger(__name__)
 #: Animation frame rate (frames per second).
 _FPS: int = 24
 _FRAME_DURATION: float = 1.0 / _FPS
+
+#: Breath period modulation by context pressure (seconds).
+#: The baseline 4.5s lengthens as the supervisor accumulates memory —
+#: deeper breathing as the session matures. NONE is baseline; WARN is
+#: subliminal (~11% deeper); COMPACT is noticeable; BLOCK is heavy.
+_BREATH_PERIOD_BY_PRESSURE: dict[str, float] = {
+    "none": 4.5,
+    "warn": 5.0,
+    "compact": 5.5,
+    "block": 6.0,
+}
+
+
+def _breath_period_for_pressure(pressure: str) -> float:
+    """Return the breath period (seconds) for a given context pressure level.
+
+    As the supervisor's embodied memory accumulates, the breath
+    deepens. This is somatically felt before consciously noticed.
+    """
+    return _BREATH_PERIOD_BY_PRESSURE.get(pressure, 4.5)
 
 
 @dataclass
@@ -112,6 +133,10 @@ class ClouApp(App[None]):
     ]
 
     mode: reactive[Mode] = reactive(Mode.DIALOGUE)
+    #: Supervisor context pressure: "none" | "warn" | "compact" | "block".
+    #: Modulates breath period and status bar glyph — the session's
+    #: embodied memory made perceivable.
+    context_pressure: reactive[str] = reactive("none")
 
     def __init__(
         self,
@@ -402,9 +427,12 @@ class ClouApp(App[None]):
         state = self._breath_machine.state
 
         if state is BreathState.BREATHING:
+            # Period modulated by context pressure — the session breathes
+            # deeper as its memory accumulates.
+            period = _breath_period_for_pressure(self.context_pressure)
             # Wrap for the periodic waveform.
-            wrapped = self._animation_time % 4.5
-            breath_value = BreathStateMachine.compute_breath(wrapped)
+            wrapped = self._animation_time % period
+            breath_value = BreathStateMachine.compute_breath(wrapped, period=period)
         elif state is BreathState.HOLDING:
             breath_value = 1.0  # Peak luminance held.
         elif state is BreathState.RELEASING:
@@ -593,6 +621,37 @@ class ClouApp(App[None]):
 
         event.input.clear()
 
+        # Gate-open path — the user is answering a live ask_user question.
+        # Resolve numeric input to the choice label (so the model gets
+        # the resolved answer, not a bare "2"), commit the Q+A to
+        # history, then hide the widget and queue for the feeder.
+        from clou.ui.widgets.gate import GateWidget
+
+        conversation = self.query_one(ConversationWidget)
+        try:
+            gate_widget = self.query_one(GateWidget)
+        except LookupError:
+            gate_widget = None
+
+        if gate_widget is not None and gate_widget.is_active:
+            question = gate_widget.question
+            choices = gate_widget.choices
+            resolved = gate_widget.resolve_input(text)
+            gate_widget.hide()
+            conversation.commit_gate_exchange(question, choices, resolved)
+            self._user_input_queue.append(resolved)
+            self._user_input_ready.set()
+            try:
+                chat_input = self.query_one("#user-input ChatInput")
+                chat_input.placeholder = "Talk to clou..."
+            except LookupError:
+                pass
+            # Exit HANDOFF now that the user has responded — the
+            # supervisor continues its arc-sharpening flow in DIALOGUE.
+            if self.mode is Mode.HANDOFF:
+                self.transition_mode(Mode.DIALOGUE)
+            return
+
         # In handoff mode, return to dialogue so the supervisor can respond.
         # In breath mode, stay — the coordinator is running and the supervisor
         # is blocked.  The message queues until the coordinator completes.
@@ -603,7 +662,6 @@ class ClouApp(App[None]):
 
         # Show user message as queued — it transitions to active when the
         # supervisor picks it up (ClouProcessingStarted).
-        conversation = self.query_one(ConversationWidget)
         self._queue_count += 1
         conversation.add_user_message(text, queued=True)
 
@@ -810,7 +868,14 @@ class ClouApp(App[None]):
             pass
 
     def on_clou_ask_user(self, msg: ClouAskUser) -> None:
-        """Gate opened — update placeholder so the user knows a response is expected."""
+        """Gate opened — surface the question in the GateWidget above input."""
+        from clou.ui.widgets.gate import GateWidget
+
+        try:
+            gate_widget = self.query_one(GateWidget)
+            gate_widget.show(msg.question, msg.choices)
+        except LookupError:
+            pass
         try:
             chat_input = self.query_one("#user-input ChatInput")
             if msg.choices:
@@ -1014,6 +1079,34 @@ class ClouApp(App[None]):
         bar = self.query_one(ClouStatusBar)
         # Only active/limited statuses turn on the indicator; anything else clears it.
         bar.rate_limited = msg.status in {"active", "rate_limited", "limited"}
+
+    def on_clou_context_pressure(self, msg: ClouContextPressure) -> None:
+        """Supervisor context pressure level changed.
+
+        Propagates the pressure level to app-level reactive (which the
+        animation tick reads to modulate breath period) and to the status
+        bar glyph.  The supervisor's embodied memory made perceivable.
+        """
+        self.context_pressure = msg.level
+        try:
+            bar = self.query_one(ClouStatusBar)
+            bar.context_pressure = msg.level
+        except Exception:
+            _log.debug("Status bar not available for context pressure update")
+
+    def watch_context_pressure(self, old_level: str, new_level: str) -> None:
+        """Manage pressure-* CSS classes as context pressure shifts.
+
+        The conversation container gets a warm top border that modulates
+        with pressure — amber at WARN, gold at COMPACT, rose at BLOCK.
+        CSS rules live in clou.tcss under the pressure-* scope.
+        """
+        # Clear all pressure classes first (idempotent).
+        for level in ("warn", "compact", "block"):
+            self.remove_class(f"pressure-{level}")
+        # Apply the current one (NONE = no class, absence is positive).
+        if new_level in ("warn", "compact", "block"):
+            self.add_class(f"pressure-{new_level}")
 
     def on_clou_coordinator_complete(self, msg: ClouCoordinatorComplete) -> None:
         """Coordinator finished — enter handoff or return to dialogue."""

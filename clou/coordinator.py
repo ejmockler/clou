@@ -834,7 +834,9 @@ async def run_coordinator(
                     project_dir
                 )
                 try:
-                    await git_revert_golden_context(project_dir, milestone)
+                    await git_revert_golden_context(
+                        project_dir, milestone, current_phase=_current_phase,
+                    )
                 except RuntimeError:
                     log.exception("Git revert failed for %r", milestone)
                 pending_validation_errors = findings

@@ -40,6 +40,7 @@ from clou.ui.widgets.edit_disclosure import (
     DISCLOSURE_PRUNE,
     EditDisclosure,
 )
+from clou.ui.widgets.gate import GateWidget
 from clou.ui.widgets.message_widgets import MarkdownMessage, UserMessage
 from clou.ui.widgets.prompt_input import PromptInput
 from clou.ui.widgets.wake import WakeIndicator
@@ -113,6 +114,7 @@ class ConversationWidget(DragScrollMixin, Widget):
         yield Static("", id="queue-indicator")
         yield CommandPalette(id="command-palette")
         yield WakeIndicator(id="wake-indicator")
+        yield GateWidget(id="user-gate")
         yield PromptInput(id="user-input")
 
     def on_mount(self) -> None:
@@ -220,6 +222,31 @@ class ConversationWidget(DragScrollMixin, Widget):
     def add_command_error(self, text: str) -> None:
         """Append a brief dim error for bad slash commands."""
         self._append(Text(f"  {text}", style=_DIM_HEX))
+
+    def commit_gate_exchange(
+        self,
+        question: str,
+        choices: list[str] | None,
+        answer: str,
+    ) -> None:
+        """Append a question+answer pair to history after a gate closes.
+
+        Called when the user submits an answer to a live gate. The gate
+        widget has already hidden; this records the exchange in the
+        conversation history as a persistent scrollback entry.
+        """
+        self._stop_working()
+        self._clear_tail()
+        parts: list[str] = []
+        if question:
+            parts.append(f"**{question}**")
+        if choices:
+            for i, choice in enumerate(choices, 1):
+                parts.append(f"{i}. {choice}")
+        md = "\n".join(parts).strip()
+        if md:
+            self._append_markdown(md)
+        self.add_user_message(answer, queued=False)
 
     # -- Working indicator -----------------------------------------------
 
@@ -384,23 +411,16 @@ class ConversationWidget(DragScrollMixin, Widget):
         if not self._tc.working:
             self._start_working()
         if msg.name in ("ask_user", "mcp__clou__ask_user"):
+            # Question + choices surface in the GateWidget above the input —
+            # not inline in history. The Q+A pair commits to history after
+            # the user answers (see ConversationWidget.commit_gate_exchange).
             self._stop_working()
             question = str(msg.tool_input.get("question", ""))
             raw_choices = msg.tool_input.get("choices")
             choices: list[str] | None = (
                 [str(c) for c in raw_choices] if isinstance(raw_choices, list) else None
             )
-            parts: list[str] = []
-            if question:
-                parts.append(f"**{question}**")
-            if choices:
-                for i, c in enumerate(choices, 1):
-                    parts.append(f"{i}. {c}")
-            md = "\n".join(parts).strip()
-            if md:
-                self._append_markdown(md)
             self._clear_tail()
-            # Notify the app that the gate is waiting for input.
             from clou.ui.messages import ClouAskUser
 
             self.post_message(ClouAskUser(question=question, choices=choices))

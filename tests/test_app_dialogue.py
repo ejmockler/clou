@@ -8,6 +8,7 @@ import pytest
 
 from clou.ui.app import ClouApp
 from clou.ui.messages import (
+    ClouAskUser,
     ClouCoordinatorSpawned,
     ClouEscalationArrived,
     ClouEscalationResolved,
@@ -19,6 +20,7 @@ from clou.ui.messages import (
     Mode,
 )
 from clou.ui.widgets.conversation import ConversationWidget
+from clou.ui.widgets.gate import GateWidget
 from clou.ui.widgets.handoff import HandoffWidget
 from clou.ui.widgets.status_bar import ClouStatusBar
 
@@ -157,6 +159,156 @@ class TestInputSubmission:
             assert len(msgs) >= 1
             all_text = "".join(str(w.render()) for w in msgs)
             assert "message during decision" in all_text
+
+
+# ---------------------------------------------------------------------------
+# Gate (ask_user) — dedicated question widget
+# ---------------------------------------------------------------------------
+
+
+class TestGateWidget:
+    @pytest.mark.asyncio
+    async def test_ask_user_activates_gate_widget(self) -> None:
+        """Posting ClouAskUser surfaces the question in the GateWidget."""
+        async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            gate_widget = app.query_one(GateWidget)
+            assert gate_widget.is_active is False
+
+            app.post_message(
+                ClouAskUser(
+                    question="What next?",
+                    choices=["Continue", "Stop"],
+                )
+            )
+            await pilot.pause()
+
+            assert gate_widget.is_active is True
+            assert gate_widget.question == "What next?"
+            assert gate_widget.choices == ["Continue", "Stop"]
+            assert gate_widget.has_class("active")
+
+    @pytest.mark.asyncio
+    async def test_ask_user_updates_placeholder(self) -> None:
+        """Gate opening updates the input placeholder to signal answering."""
+        async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            app.post_message(
+                ClouAskUser(question="Q?", choices=["A", "B"])
+            )
+            await pilot.pause()
+            inp = app.query_one("#user-input ChatInput")
+            assert "Pick a number" in inp.placeholder
+
+    @pytest.mark.asyncio
+    async def test_ask_user_open_ended_placeholder(self) -> None:
+        """Open-ended questions use a simpler placeholder."""
+        async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            app.post_message(ClouAskUser(question="Q?", choices=None))
+            await pilot.pause()
+            inp = app.query_one("#user-input ChatInput")
+            assert inp.placeholder == "Type your answer..."
+
+    @pytest.mark.asyncio
+    async def test_gate_submit_resolves_number_and_hides(self) -> None:
+        """Submitting '2' with an active gate sends the resolved label."""
+        async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            app.post_message(
+                ClouAskUser(
+                    question="Which?",
+                    choices=["Speed", "Safety", "Other"],
+                )
+            )
+            await pilot.pause()
+
+            inp = app.query_one("#user-input ChatInput")
+            inp.value = "2"
+            await inp.action_submit()
+            await pilot.pause()
+
+            gate_widget = app.query_one(GateWidget)
+            assert gate_widget.is_active is False
+            # Resolved label goes into the queue, not the raw "2".
+            assert "Safety" in list(app._user_input_queue)
+
+    @pytest.mark.asyncio
+    async def test_gate_submit_free_text_passes_through(self) -> None:
+        """Free-form answers are queued unchanged."""
+        async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            app.post_message(
+                ClouAskUser(question="Q?", choices=["A", "B"])
+            )
+            await pilot.pause()
+
+            inp = app.query_one("#user-input ChatInput")
+            inp.value = "my custom reply"
+            await inp.action_submit()
+            await pilot.pause()
+
+            assert "my custom reply" in list(app._user_input_queue)
+
+    @pytest.mark.asyncio
+    async def test_gate_submit_commits_exchange_to_history(self) -> None:
+        """After answering, the Q+A pair lands in conversation history."""
+        async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            app.post_message(
+                ClouAskUser(
+                    question="What next?",
+                    choices=["Continue", "Stop"],
+                )
+            )
+            await pilot.pause()
+
+            inp = app.query_one("#user-input ChatInput")
+            inp.value = "1"
+            await inp.action_submit()
+            await pilot.pause()
+
+            conv = app.query_one(ConversationWidget)
+            history_text = "".join(str(w.render()) for w in conv.query(".msg"))
+            assert "What next?" in history_text
+            assert "Continue" in history_text
+
+    @pytest.mark.asyncio
+    async def test_gate_submit_does_not_increment_queue_count(self) -> None:
+        """Gate answers do not count as queued user messages."""
+        async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            app.post_message(
+                ClouAskUser(question="Q?", choices=["A", "B"])
+            )
+            await pilot.pause()
+
+            assert app._queue_count == 0
+            inp = app.query_one("#user-input ChatInput")
+            inp.value = "2"
+            await inp.action_submit()
+            await pilot.pause()
+            assert app._queue_count == 0
+
+    @pytest.mark.asyncio
+    async def test_gate_submit_exits_handoff_to_dialogue(self) -> None:
+        """Answering a gate in HANDOFF mode transitions back to DIALOGUE."""
+        async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            app.transition_mode(Mode.HANDOFF)
+            await pilot.pause()
+            assert app.mode == Mode.HANDOFF
+
+            app.post_message(
+                ClouAskUser(question="Q?", choices=["A", "B"])
+            )
+            await pilot.pause()
+
+            inp = app.query_one("#user-input ChatInput")
+            inp.value = "1"
+            await inp.action_submit()
+            await pilot.pause()
+            assert app.mode == Mode.DIALOGUE
 
 
 # ---------------------------------------------------------------------------

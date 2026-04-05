@@ -174,6 +174,55 @@ class TestErrorMessage:
 
 
 # ---------------------------------------------------------------------------
+# Gate exchange commit
+# ---------------------------------------------------------------------------
+
+
+class TestCommitGateExchange:
+    @pytest.mark.asyncio
+    async def test_commits_question_and_answer(self) -> None:
+        """commit_gate_exchange appends the question markdown + user answer."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget.commit_gate_exchange(
+                "What next?",
+                ["Continue", "Stop"],
+                "Continue",
+            )
+            await pilot.pause()
+            assert _msg_count(widget) >= 2
+            text = _all_text(widget)
+            assert "What next?" in text
+            assert "Continue" in text
+            assert "Stop" in text
+
+    @pytest.mark.asyncio
+    async def test_answer_is_user_message(self) -> None:
+        """The answer appears as a UserMessage, not queued."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget.commit_gate_exchange("Q?", ["a", "b"], "a")
+            await pilot.pause()
+            user_msgs = widget.query(UserMessage)
+            assert len(user_msgs) == 1
+            assert user_msgs.first()._queued is False
+            assert user_msgs.first()._text == "a"
+
+    @pytest.mark.asyncio
+    async def test_without_choices_still_records_answer(self) -> None:
+        """Open-ended gate answer still commits to history."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget.commit_gate_exchange("Free-form?", None, "my custom answer")
+            await pilot.pause()
+            user_msgs = widget.query(UserMessage)
+            assert len(user_msgs) == 1
+            assert user_msgs.first()._text == "my custom answer"
+            text = _all_text(widget)
+            assert "Free-form?" in text
+
+
+# ---------------------------------------------------------------------------
 # Supervisor text
 # ---------------------------------------------------------------------------
 
@@ -357,6 +406,61 @@ class TestToolUse:
             assert "main.py" in text
             # Should NOT contain the full path or raw dict.
             assert "/Users/noot" not in text
+
+    @pytest.mark.asyncio
+    async def test_ask_user_tool_does_not_append_to_history(self) -> None:
+        """ask_user tool_use does NOT render question inline — the
+        GateWidget is the live surface. Question+answer commit to
+        history only after the user responds."""
+        async with ConversationApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            before = _msg_count(widget)
+            widget.post_message(
+                ClouToolUse(
+                    name="mcp__clou__ask_user",
+                    tool_input={
+                        "question": "What next?",
+                        "choices": ["Continue", "Stop"],
+                    },
+                )
+            )
+            await pilot.pause()
+            assert _msg_count(widget) == before
+            text = _all_text(widget)
+            assert "What next?" not in text
+
+    @pytest.mark.asyncio
+    async def test_ask_user_tool_posts_clou_ask_user(self) -> None:
+        """ask_user tool_use posts a ClouAskUser message for the app to route."""
+        from clou.ui.messages import ClouAskUser
+
+        received: list[ClouAskUser] = []
+
+        class CapturingApp(App[None]):
+            def compose(self) -> ComposeResult:
+                yield ConversationWidget()
+
+            def on_clou_ask_user(self, msg: ClouAskUser) -> None:
+                received.append(msg)
+
+        async with CapturingApp().run_test() as pilot:
+            widget = pilot.app.query_one(ConversationWidget)
+            widget._initializing = False
+            widget.post_message(
+                ClouToolUse(
+                    name="mcp__clou__ask_user",
+                    tool_input={
+                        "question": "Which?",
+                        "choices": ["A", "B"],
+                    },
+                )
+            )
+            await pilot.pause()
+            await pilot.pause()
+            assert len(received) == 1
+            assert received[0].question == "Which?"
+            assert received[0].choices == ["A", "B"]
 
 
 class TestToolSummary:

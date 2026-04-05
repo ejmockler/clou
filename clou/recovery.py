@@ -11,7 +11,7 @@ Public API:
     write_validation_escalation(project_dir, milestone, findings) -> None
     attempt_self_heal(project_dir, milestone, errors) -> list[str]
     log_self_heal_attempt(project_dir, milestone, fixes, remaining_errors) -> None
-    git_revert_golden_context(project_dir: Path, milestone: str) -> None
+    git_revert_golden_context(project_dir: Path, milestone: str, current_phase: str | None = None) -> None
 """
 
 from __future__ import annotations
@@ -932,14 +932,13 @@ async def git_commit_phase(project_dir: Path, milestone: str, phase: str) -> Non
     changed |= set(stdout2_bytes.decode(errors="replace").splitlines())
     changed.discard("")
 
-    # Scope .clou/ staging to this milestone's paths only (prevents
-    # committing another milestone's golden context or shared metadata
-    # that the coordinator doesn't own).
+    # Stage ONLY files within the milestone directory (V4: prevents
+    # committing user's unrelated changes or other milestone's context).
     milestone_prefix = f".clou/milestones/{milestone}/"
     to_stage = [
         f for f in changed
-        if not any(fnmatch.fnmatch(f, pat) for pat in _STAGING_EXCLUDE_PATTERNS)
-        and (not f.startswith(".clou/") or f.startswith(milestone_prefix))
+        if f.startswith(milestone_prefix)
+        and not any(fnmatch.fnmatch(f, pat) for pat in _STAGING_EXCLUDE_PATTERNS)
     ]
 
     if not to_stage:
@@ -1001,16 +1000,25 @@ async def git_commit_phase(project_dir: Path, milestone: str, phase: str) -> Non
         raise RuntimeError(msg)
 
 
-async def git_revert_golden_context(project_dir: Path, milestone: str) -> None:
+async def git_revert_golden_context(
+    project_dir: Path,
+    milestone: str,
+    current_phase: str | None = None,
+) -> None:
     """Revert coordinator-owned golden context files to pre-cycle state.
 
     Only reverts files the coordinator owns (DB-07 ownership).
     Supervisor-authored files (milestone.md, intents.md, requirements.md)
-    are NOT reverted — they are immutable after handoff.
+    are NOT reverted --- they are immutable after handoff.
+
+    V6: When *current_phase* is provided, only that phase's directory under
+    ``phases/`` is reverted, preserving execution.md files in completed phases.
+    V10: After checkout revert, untracked files in the reverted paths are
+    removed via ``git clean -fd``.
     """
     _validate_milestone(milestone)
     ms = f".clou/milestones/{milestone}"
-    # Coordinator-owned files only — NOT milestone.md, intents.md, requirements.md.
+    # Coordinator-owned files only --- NOT milestone.md, intents.md, requirements.md.
     coordinator_paths = [
         f"{ms}/active/",
         f"{ms}/status.md",
@@ -1018,8 +1026,14 @@ async def git_revert_golden_context(project_dir: Path, milestone: str) -> None:
         f"{ms}/decisions.md",
         f"{ms}/assessment.md",
         f"{ms}/escalations/",
-        f"{ms}/phases/",
     ]
+    # V6: Scope phases/ revert to current phase only (preserves completed
+    # phases' execution.md files).
+    if current_phase:
+        coordinator_paths.append(f"{ms}/phases/{current_phase}/")
+    else:
+        coordinator_paths.append(f"{ms}/phases/")
+
     proc = await asyncio.create_subprocess_exec(
         "git",
         "checkout",
@@ -1040,6 +1054,35 @@ async def git_revert_golden_context(project_dir: Path, milestone: str) -> None:
         stderr_text = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
         msg = f"git revert failed (exit {proc.returncode}): {stderr_text.strip()}"
         raise RuntimeError(msg)
+
+    # V10: Clean untracked files in the milestone directory.  Scoped to only
+    # the coordinator-owned paths that were reverted above.
+    clean_paths = [p for p in coordinator_paths if p.endswith("/")]
+    if clean_paths:
+        proc2 = await asyncio.create_subprocess_exec(
+            "git",
+            "clean",
+            "-fd",
+            "--",
+            *clean_paths,
+            cwd=project_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            await asyncio.wait_for(proc2.communicate(), timeout=30)
+        except TimeoutError:
+            proc2.kill()
+            await proc2.communicate()
+            raise RuntimeError("git clean timed out after 30s") from None
+        # git clean exit code 0 = success; non-zero is unexpected but not fatal
+        # for the revert operation, so we log but don't raise.
+        if proc2.returncode != 0:
+            _log.warning(
+                "git clean returned exit %d during revert for %r",
+                proc2.returncode,
+                milestone,
+            )
 
 
 # ---------------------------------------------------------------------------

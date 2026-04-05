@@ -174,6 +174,21 @@ ConversationWidget.initializing #user-input {
 }
 
 /* ================================================================
+   Context pressure — the session's embodied memory.
+   A warm edge at the top of the conversation deepens as the
+   supervisor accumulates weight. Absence is positive at NONE.
+   ================================================================ */
+ClouApp.pressure-warn #conversation {
+    border-top: hkey $accent-amber-dim;
+}
+ClouApp.pressure-compact #conversation {
+    border-top: hkey $accent-gold;
+}
+ClouApp.pressure-block #conversation {
+    border-top: hkey $accent-rose;
+}
+
+/* ================================================================
    Mode-scoped rules
    ================================================================ */
 
@@ -274,12 +289,8 @@ ClouApp.handoff #handoff-widget {
 }
 
 ClouApp.handoff #conversation {
-    height: 3;
+    max-height: 40%;
     dock: bottom;
-}
-
-ClouApp.handoff #conversation #history {
-    display: none;
 }
 
 /* === On-demand panel screens === */

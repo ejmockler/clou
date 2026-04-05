@@ -12,6 +12,7 @@ Public API:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -28,15 +29,72 @@ from clou.golden_context import (
 from clou.recovery import validate_milestone_name
 
 
-def build_coordinator_mcp_server(
+def _coerce_json_object(value: Any, *, param: str) -> dict[str, Any] | None:
+    """Return *value* as a dict, JSON-parsing a string if necessary.
+
+    The SDK's simple schema shorthand maps Python ``dict`` to JSON Schema
+    ``"string"`` (claude_agent_sdk/__init__.py:288), so the LLM may send a
+    JSON-encoded string.  Full JSON Schemas fix the advertisement, but we
+    still accept strings defensively so one drift does not crash the tool.
+    Returns None for None/empty input.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{param}: expected JSON object, got unparseable string: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"{param}: expected JSON object, got {type(parsed).__name__}"
+            )
+        return parsed
+    raise ValueError(
+        f"{param}: expected object or JSON string, got {type(value).__name__}"
+    )
+
+
+def _coerce_json_array(value: Any, *, param: str) -> list[Any]:
+    """Return *value* as a list, JSON-parsing a string if necessary.
+
+    Mirrors :func:`_coerce_json_object` for list-typed parameters.
+    Returns an empty list for None/empty input.
+    """
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{param}: expected JSON array, got unparseable string: {exc}"
+            ) from exc
+        if not isinstance(parsed, list):
+            raise ValueError(
+                f"{param}: expected JSON array, got {type(parsed).__name__}"
+            )
+        return parsed
+    raise ValueError(
+        f"{param}: expected array or JSON string, got {type(value).__name__}"
+    )
+
+
+def _build_coordinator_tools(
     project_dir: Path,
     milestone: str,
-) -> Any:
-    """Build an in-process MCP server with protocol artifact tools.
+) -> list[Any]:
+    """Build the coordinator's ``SdkMcpTool`` list (testable seam).
 
-    Scoped to a single milestone — all writes target that milestone's
-    directory.  The coordinator session gets this alongside template
-    MCP servers (e.g. brutalist).
+    Exposes the decorated tools so unit tests can invoke handlers
+    directly via ``tool.handler(args)`` without routing through the
+    MCP transport.
     """
     validate_milestone_name(milestone)
     ms_dir = project_dir / ".clou" / "milestones" / milestone
@@ -74,16 +132,29 @@ def build_coordinator_mcp_server(
         "Write the milestone status file (status.md). "
         "Use this instead of writing the file directly.",
         {
-            "phase": str,
-            "cycle": int,
-            "next_step": str,
-            "phase_progress": dict,
-            "notes": str,
+            "type": "object",
+            "properties": {
+                "phase": {"type": "string"},
+                "cycle": {"type": "integer"},
+                "next_step": {"type": "string"},
+                "phase_progress": {
+                    "type": "object",
+                    "description": (
+                        "Map of phase name → status "
+                        "(pending/in_progress/completed/failed)."
+                    ),
+                    "additionalProperties": {"type": "string"},
+                },
+                "notes": {"type": "string"},
+            },
+            "required": ["phase", "cycle", "next_step", "phase_progress", "notes"],
         },
     )
     async def update_status_tool(args: dict[str, Any]) -> dict[str, Any]:
-        phase_progress = args.get("phase_progress")
-        if isinstance(phase_progress, dict):
+        phase_progress = _coerce_json_object(
+            args.get("phase_progress"), param="phase_progress"
+        )
+        if phase_progress is not None:
             phase_progress = {str(k): str(v) for k, v in phase_progress.items()}
         content = render_status(
             milestone=milestone,
@@ -104,16 +175,51 @@ def build_coordinator_mcp_server(
         "and task entries. Use this instead of writing execution.md "
         "directly — the tool guarantees ## Summary and ## Tasks structure.",
         {
-            "phase": str,
-            "status": str,
-            "tasks": list,
-            "failures": str,
-            "blockers": str,
-            "notes": str,
+            "type": "object",
+            "properties": {
+                "phase": {"type": "string"},
+                "status": {"type": "string"},
+                "tasks": {
+                    "type": "array",
+                    "description": "List of task entries for this phase.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "status": {"type": "string"},
+                            "files_changed": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "tests": {"type": "string"},
+                            "notes": {"type": "string"},
+                        },
+                    },
+                },
+                "failures": {"type": "string"},
+                "blockers": {"type": "string"},
+            },
+            "required": ["phase", "status", "tasks", "failures", "blockers"],
         },
     )
     async def write_execution_tool(args: dict[str, Any]) -> dict[str, Any]:
-        tasks_raw = args.get("tasks", [])
+        tasks_items = _coerce_json_array(args.get("tasks"), param="tasks")
+        tasks_raw: list[dict[str, Any]] = []
+        for i, item in enumerate(tasks_items):
+            coerced = _coerce_json_object(item, param=f"tasks[{i}]")
+            if coerced is None:
+                # A null or empty-string item in a protocol array is
+                # malformed input, not "skip this slot".  Silent drop
+                # would corrupt task counts and vanish evidence.
+                raise ValueError(
+                    f"tasks[{i}]: expected object, got null/empty"
+                )
+            files_raw = coerced.get("files_changed")
+            if files_raw is not None:
+                coerced["files_changed"] = _coerce_json_array(
+                    files_raw, param=f"tasks[{i}].files_changed"
+                )
+            tasks_raw.append(coerced)
         tasks_completed = sum(1 for t in tasks_raw if t.get("status") == "completed")
         tasks_failed = sum(1 for t in tasks_raw if t.get("status") == "failed")
         tasks_in_progress = sum(1 for t in tasks_raw if t.get("status") == "in_progress")
@@ -147,7 +253,20 @@ def build_coordinator_mcp_server(
         path.write_text(content, encoding="utf-8")
         return {"written": str(path), "task_count": len(tasks_raw)}
 
+    return [write_checkpoint_tool, update_status_tool, write_execution_tool]
+
+
+def build_coordinator_mcp_server(
+    project_dir: Path,
+    milestone: str,
+) -> Any:
+    """Build an in-process MCP server with protocol artifact tools.
+
+    Scoped to a single milestone — all writes target that milestone's
+    directory.  The coordinator session gets this alongside template
+    MCP servers (e.g. brutalist).
+    """
     return create_sdk_mcp_server(
         "clou_coordinator",
-        tools=[write_checkpoint_tool, update_status_tool, write_execution_tool],
+        tools=_build_coordinator_tools(project_dir, milestone),
     )
