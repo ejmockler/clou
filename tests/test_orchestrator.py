@@ -1158,6 +1158,76 @@ class TestRunCoordinator:
         assert call_count == 2
 
     @pytest.mark.asyncio
+    async def test_validation_failure_passes_current_phase_to_git_revert(
+        self, project_dir: Path
+    ) -> None:
+        """Validation failure wires current_phase from parse_checkpoint to git_revert_golden_context.
+
+        This verifies the coordinator's call-site: _current_phase is extracted
+        from the checkpoint via parse_checkpoint().current_phase and forwarded
+        as the current_phase kwarg to git_revert_golden_context on the
+        validation-failure branch.
+        """
+        # Write a checkpoint so parse_checkpoint can extract current_phase.
+        # Also write milestone marker to prevent stale-checkpoint clearing.
+        cp_path = (
+            project_dir / ".clou" / "milestones" / "auth"
+            / "active" / "coordinator.md"
+        )
+        cp_path.parent.mkdir(parents=True, exist_ok=True)
+        cp_path.write_text(
+            "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: design\nphases_completed: 0\nphases_total: 1\n"
+        )
+        marker = project_dir / ".clou" / ".coordinator-milestone"
+        marker.write_text("auth")
+
+        cycle_calls = 0
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            nonlocal cycle_calls
+            cycle_calls += 1
+            return "ok"
+
+        validation_results = iter(
+            [
+                [_vf("missing ## Cycle")],  # first: fail
+                [],  # second: pass
+            ]
+        )
+
+        with (
+            patch(
+                f"{_PC}.determine_next_cycle",
+                side_effect=[
+                    ("EXECUTE", ["status.md"]),
+                    ("EXECUTE", ["status.md"]),
+                    ("COMPLETE", []),
+                ],
+            ),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(
+                f"{_PC}.validate_golden_context",
+                side_effect=lambda *a, **kw: next(validation_results),
+            ),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.attempt_self_heal", return_value=[]),
+            patch(
+                f"{_PC}.git_revert_golden_context", new_callable=AsyncMock
+            ) as mock_revert,
+            patch(f"{_PC}.build_cycle_prompt", return_value="retry prompt"),
+        ):
+            result = await run_coordinator(project_dir, "auth")
+
+        assert result == "completed"
+        mock_revert.assert_called_once_with(
+            project_dir, "auth", current_phase="design",
+        )
+        assert cycle_calls == 2
+
+    @pytest.mark.asyncio
     async def test_staleness_escalation(self, project_dir: Path) -> None:
         """3 consecutive same-type cycles with no phase advancement -> escalated_staleness."""
         # Write milestone marker so checkpoint is not cleared as stale.
@@ -1172,6 +1242,9 @@ class TestRunCoordinator:
             "current_phase: impl\nphases_completed: 1\nphases_total: 3\n"
         )
 
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            return "ok"
+
         with (
             patch(
                 f"{_PC}.determine_next_cycle",
@@ -1179,6 +1252,9 @@ class TestRunCoordinator:
             ),
             patch(f"{_PC}.read_cycle_count", return_value=3),
             patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
             patch(
                 f"{_PC}.write_staleness_escalation", new_callable=AsyncMock
             ) as mock_esc,

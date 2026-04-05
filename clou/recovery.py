@@ -1017,6 +1017,10 @@ async def git_revert_golden_context(
     removed via ``git clean -fd``.
     """
     _validate_milestone(milestone)
+    # Defense-in-depth: reject path traversal in current_phase.
+    if current_phase and (".." in current_phase or "/" in current_phase):
+        msg = f"Invalid current_phase: {current_phase!r} (must not contain '..' or '/')"
+        raise ValueError(msg)
     ms = f".clou/milestones/{milestone}"
     # Coordinator-owned files only --- NOT milestone.md, intents.md, requirements.md.
     coordinator_paths = [

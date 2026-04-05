@@ -903,6 +903,17 @@ def test_git_revert_rejects_bad_milestone(tmp_path: Path, bad_name: str) -> None
         asyncio.run(git_revert_golden_context(tmp_path, bad_name))
 
 
+@pytest.mark.parametrize("bad_phase", ["../../../etc", "foo/bar", "a/../b", "sub/dir"])
+def test_git_revert_rejects_traversal_in_current_phase(
+    tmp_path: Path, bad_phase: str
+) -> None:
+    """F4: current_phase with path traversal sequences is rejected."""
+    with pytest.raises(ValueError, match="Invalid current_phase"):
+        asyncio.run(
+            git_revert_golden_context(tmp_path, "m1", current_phase=bad_phase)
+        )
+
+
 # ---------------------------------------------------------------------------
 # git_revert_golden_context — timeout handling
 # ---------------------------------------------------------------------------

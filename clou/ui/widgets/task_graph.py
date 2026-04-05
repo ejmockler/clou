@@ -282,6 +282,8 @@ class TaskGraphWidget(Widget):
 
     def on_click(self, event: Click) -> None:
         """Click a task row to focus and toggle its expansion."""
+        # Any click on the coordinator panel clears conversation focus.
+        self.app.remove_class("conv-focus")
         y = event.y
         if y < 0 or y >= len(self._row_map):
             return

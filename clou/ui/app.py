@@ -286,6 +286,8 @@ class ClouApp(App[None]):
         """Swap CSS classes and perform atmospheric side-effects."""
         self.remove_class(old.name.lower())
         self.add_class(new.name.lower())
+        # Clear conversation focus overlay on any mode change.
+        self.remove_class("conv-focus")
         self._apply_conversation_height_override(new)
 
         # --- DIALOGUE -> BREATH ---
@@ -474,8 +476,17 @@ class ClouApp(App[None]):
     # Input handling
     # ------------------------------------------------------------------
 
-    def on_click(self) -> None:
-        """Clicking anywhere in the app refocuses the input."""
+    def on_click(self, event) -> None:
+        """Clicking anywhere — toggle panel focus in BREATH/DECISION, refocus input."""
+        if self.mode in (Mode.BREATH, Mode.DECISION):
+            try:
+                conv = self.query_one("#conversation")
+                if conv.region.contains(event.screen_x, event.screen_y):
+                    self.add_class("conv-focus")
+                else:
+                    self.remove_class("conv-focus")
+            except LookupError:
+                pass
         try:
             self.query_one("#user-input ChatInput").focus()
         except LookupError:

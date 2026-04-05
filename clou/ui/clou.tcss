@@ -237,6 +237,26 @@ ClouApp.breath #breath-widget {
     color: $text-dim;
 }
 
+/* === Conversation focus overlay — user clicks into conversation === */
+ClouApp.breath.conv-focus #conversation #history {
+    opacity: 1.0;
+}
+ClouApp.breath.conv-focus #task-graph {
+    opacity: 0.4;
+}
+ClouApp.breath.conv-focus #breath-widget {
+    opacity: 0.4;
+}
+ClouApp.decision.conv-focus #conversation #history {
+    opacity: 1.0;
+}
+ClouApp.decision.conv-focus #task-graph {
+    opacity: 0.2;
+}
+ClouApp.decision.conv-focus #breath-widget {
+    opacity: 0.2;
+}
+
 /* === Decision mode — breath pauses, card surfaces === */
 ClouApp.decision #task-graph {
     display: block;
