@@ -71,6 +71,11 @@ class Checkpoint:
     current_phase: str = ""
     phases_completed: int = 0
     phases_total: int = 0
+    # Retry counters — persisted so they survive process restarts.
+    validation_retries: int = 0
+    readiness_retries: int = 0
+    crash_retries: int = 0
+    staleness_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +138,10 @@ def parse_checkpoint(content: str) -> Checkpoint:
         current_phase=fields.get("current_phase", fields.get("phase", "")),
         phases_completed=_safe_int(fields.get("phases_completed", "0")),
         phases_total=_safe_int(fields.get("phases_total", "0")),
+        validation_retries=_safe_int(fields.get("validation_retries", "0")),
+        readiness_retries=_safe_int(fields.get("readiness_retries", "0")),
+        crash_retries=_safe_int(fields.get("crash_retries", "0")),
+        staleness_count=_safe_int(fields.get("staleness_count", "0")),
     )
 
 
@@ -610,6 +619,10 @@ def _normalise_checkpoint(content: str) -> tuple[str, list[str]]:
         current_phase=cp.current_phase,
         phases_completed=cp.phases_completed,
         phases_total=cp.phases_total,
+        validation_retries=cp.validation_retries,
+        readiness_retries=cp.readiness_retries,
+        crash_retries=cp.crash_retries,
+        staleness_count=cp.staleness_count,
     )
 
     if new_content != content:

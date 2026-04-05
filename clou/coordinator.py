@@ -106,10 +106,21 @@ _MAX_CRASH_RETRIES = 3
 _STALENESS_THRESHOLD = 3
 _MAX_BUDGET_USD: float | None = None  # No per-cycle cost cap by default
 
-# Module-level reference to the active Textual app.  Set by run_coordinator
-# so _run_single_cycle can route messages without a signature change (which
-# would break existing mocks in test_orchestrator.py).
-_active_app: ClouApp | None = None
+# Encapsulated coordinator state — no module-level mutable variables.
+# Access via get_active_app() / set_active_app() rather than global keyword.
+from types import SimpleNamespace as _SimpleNamespace
+
+_state = _SimpleNamespace(app=None)
+
+
+def get_active_app() -> ClouApp | None:
+    """Return the active Textual app, or None if not running."""
+    return _state.app
+
+
+def set_active_app(app: ClouApp | None) -> None:
+    """Set (or clear) the active Textual app reference."""
+    _state.app = app
 
 
 _ENV_PROBE_MAX_LINES: int = 20
@@ -279,8 +290,7 @@ async def run_coordinator(
     app: ClouApp | None = None,
 ) -> str:
     """Run a coordinator for a single milestone via session-per-cycle loop."""
-    global _active_app
-    _active_app = app
+    set_active_app(app)
 
     validate_milestone_name(milestone)
 
@@ -295,16 +305,23 @@ async def run_coordinator(
     checkpoint_path = clou_dir / "milestones" / milestone / "active" / "coordinator.md"
     # Outside .clou/active/ so git_revert_golden_context doesn't touch it.
     milestone_marker = clou_dir / ".coordinator-milestone"
-    validation_retries = 0
-    readiness_retries = 0
-    crash_retries = 0
+
+    # Restore retry counters from checkpoint (survives process restart).
+    _initial_cp = (
+        parse_checkpoint(checkpoint_path.read_text())
+        if checkpoint_path.exists()
+        else None
+    )
+    validation_retries = _initial_cp.validation_retries if _initial_cp else 0
+    readiness_retries = _initial_cp.readiness_retries if _initial_cp else 0
+    crash_retries = _initial_cp.crash_retries if _initial_cp else 0
     pending_validation_errors: list[ValidationFinding] | None = None
     _pending_working_tree: str | None = None
 
     # Staleness detection state (F3).
     _prev_cycle_type: str | None = None
     _prev_phases_completed: int = -1
-    _staleness_count: int = 0
+    _staleness_count: int = _initial_cp.staleness_count if _initial_cp else 0
     _saw_type_change: bool = False  # True if cycle type changed since last reset
 
     decisions_path = clou_dir / "milestones" / milestone / "decisions.md"
@@ -338,6 +355,10 @@ async def run_coordinator(
                         current_phase=cp.current_phase,
                         phases_completed=cp.phases_completed,
                         phases_total=cp.phases_total,
+                        validation_retries=cp.validation_retries,
+                        readiness_retries=cp.readiness_retries,
+                        crash_retries=cp.crash_retries,
+                        staleness_count=cp.staleness_count,
                     )
                 )
             log.info(
@@ -347,7 +368,8 @@ async def run_coordinator(
 
     def _post_new_escalations() -> None:
         """Scan for new escalation files and post them to the UI."""
-        if _active_app is None:
+        _app = get_active_app()
+        if _app is None:
             return
         esc_dir = clou_dir / "milestones" / milestone / "escalations"
         if not esc_dir.is_dir():
@@ -360,7 +382,7 @@ async def run_coordinator(
                 )
                 try:
                     data = parse_escalation(esc_file)
-                    _active_app.post_message(
+                    _app.post_message(
                         ClouEscalationArrived(
                             path=esc_file,
                             classification=data["classification"],
@@ -385,6 +407,31 @@ async def run_coordinator(
     milestone_marker.parent.mkdir(parents=True, exist_ok=True)
     milestone_marker.write_text(milestone)
 
+    def _persist_retry_counters() -> None:
+        """Merge current retry counters into the checkpoint file.
+
+        Reads the existing checkpoint, re-renders it with the current
+        retry counter values, and writes it back.  No-op if the
+        checkpoint does not exist yet.
+        """
+        if not checkpoint_path.exists():
+            return
+        cp = parse_checkpoint(checkpoint_path.read_text())
+        checkpoint_path.write_text(
+            render_checkpoint(
+                cycle=cp.cycle,
+                step=cp.step,
+                next_step=cp.next_step,
+                current_phase=cp.current_phase,
+                phases_completed=cp.phases_completed,
+                phases_total=cp.phases_total,
+                validation_retries=validation_retries,
+                readiness_retries=readiness_retries,
+                crash_retries=crash_retries,
+                staleness_count=_staleness_count,
+            )
+        )
+
     _ms_outcome = "unknown"
     telemetry.event("milestone.start", milestone=milestone)
     try:
@@ -392,13 +439,14 @@ async def run_coordinator(
             # --- Cycle-boundary checks (DB-15) ---
 
             # Check for /stop request.
+            _app = get_active_app()
             if (
-                _active_app is not None
-                and hasattr(_active_app, "_stop_requested")
-                and isinstance(_active_app._stop_requested, asyncio.Event)
-                and _active_app._stop_requested.is_set()
+                _app is not None
+                and hasattr(_app, "_stop_requested")
+                and isinstance(_app._stop_requested, asyncio.Event)
+                and _app._stop_requested.is_set()
             ):
-                _active_app._stop_requested.clear()
+                _app._stop_requested.clear()
                 log.info("Stop requested for %r at cycle boundary", milestone)
                 _ms_outcome = "stopped"
                 return "stopped"
@@ -409,10 +457,10 @@ async def run_coordinator(
             # template opts in via pause_on_user_message (default: False).
             if (
                 _pause_on_message
-                and _active_app is not None
-                and hasattr(_active_app, "_user_input_queue")
-                and isinstance(_active_app._user_input_queue, deque)
-                and _active_app._user_input_queue
+                and _app is not None
+                and hasattr(_app, "_user_input_queue")
+                and isinstance(_app._user_input_queue, deque)
+                and _app._user_input_queue
             ):
                 cycle_count_now = read_cycle_count(checkpoint_path)
                 log.info(
@@ -421,7 +469,7 @@ async def run_coordinator(
                     milestone,
                     cycle_count_now,
                 )
-                _active_app.post_message(
+                _app.post_message(
                     ClouCoordinatorPaused(
                         cycle_num=cycle_count_now,
                         reason="user message pending",
@@ -441,9 +489,9 @@ async def run_coordinator(
                     )
                     _ms_outcome = "escalated_budget"
                     return "escalated_budget"
-                if pct >= 0.5 and _active_app is not None:
+                if pct >= 0.5 and _app is not None:
                     threshold = 75 if pct >= 0.75 else 50
-                    _active_app.post_message(
+                    _app.post_message(
                         ClouBudgetWarning(
                             spent_usd=spent,
                             budget_usd=tmpl.budget_usd,
@@ -581,6 +629,7 @@ async def run_coordinator(
                     _post_new_escalations()
                     _ms_outcome = "escalated_validation"
                     return "escalated_validation"
+                _persist_retry_counters()
                 continue
             readiness_warnings = warnings_only(readiness)
             if readiness_warnings:
@@ -640,8 +689,8 @@ async def run_coordinator(
                 cycle_type,
             )
 
-            if _active_app is not None:
-                _active_app.post_message(
+            if _app is not None:
+                _app.post_message(
                     ClouStatusUpdate(
                         cycle_type=cycle_type,
                         cycle_num=cycle_count + 1,
@@ -653,7 +702,7 @@ async def run_coordinator(
                 if dag_data is not None:
                     try:
                         tasks, deps = dag_data
-                        _active_app.post_message(ClouDagUpdate(tasks=tasks, deps=deps))
+                        _app.post_message(ClouDagUpdate(tasks=tasks, deps=deps))
                     except Exception:
                         log.debug("Could not post DAG to UI", exc_info=True)
 
@@ -697,6 +746,7 @@ async def run_coordinator(
                     _post_new_escalations()
                     _ms_outcome = "escalated_crash_loop"
                     return "escalated_crash_loop"
+                _persist_retry_counters()
                 continue
 
             if status == "agent_team_crash":
@@ -729,6 +779,7 @@ async def run_coordinator(
                 # checkpoint.  Skip validation (golden context is partial)
                 # and let determine_next_cycle route from the checkpoint.
                 crash_retries = 0
+                _persist_retry_counters()
                 continue
 
             # Post-cycle delivery: verify the coordinator wrote its state.
@@ -845,6 +896,7 @@ async def run_coordinator(
                 except RuntimeError:
                     log.exception("Git revert failed for %r", milestone)
                 pending_validation_errors = findings
+                _persist_retry_counters()
                 continue
             else:
                 validation_retries = 0
@@ -870,8 +922,8 @@ async def run_coordinator(
                             cp.current_phase,
                         )
 
-            if _active_app is not None:
-                _active_app.post_message(
+            if _app is not None:
+                _app.post_message(
                     ClouCycleComplete(
                         cycle_num=cycle_count + 1,
                         cycle_type=cycle_type,
@@ -880,7 +932,7 @@ async def run_coordinator(
                     )
                 )
 
-            if _active_app is not None:
+            if _app is not None:
                 compose_path = clou_dir / "milestones" / milestone / "compose.py"
                 if compose_path.exists():
                     try:
@@ -888,10 +940,11 @@ async def run_coordinator(
 
                         source = compose_path.read_text(encoding="utf-8")
                         tasks, deps = extract_dag_data(source)
-                        _active_app.post_message(ClouDagUpdate(tasks=tasks, deps=deps))
+                        _app.post_message(ClouDagUpdate(tasks=tasks, deps=deps))
                     except Exception:
                         log.debug("Could not parse DAG from compose.py", exc_info=True)
 
+            _persist_retry_counters()
             _post_new_escalations()
 
         return "completed"  # unreachable, but satisfies mypy
@@ -916,8 +969,9 @@ async def run_coordinator(
                     "memory consolidation failed for %r", milestone, exc_info=True,
                 )
                 try:
-                    if _active_app is not None:
-                        _active_app.post_message(
+                    _fapp = get_active_app()
+                    if _fapp is not None:
+                        _fapp.post_message(
                             ClouBreathEvent(
                                 text=f"memory consolidation failed for {milestone}",
                                 cycle_type="FINALIZE",
@@ -926,7 +980,7 @@ async def run_coordinator(
                         )
                 except Exception:
                     log.debug("failed to post consolidation warning to UI", exc_info=True)
-        _active_app = None
+        set_active_app(None)
 
 
 # ---------------------------------------------------------------------------

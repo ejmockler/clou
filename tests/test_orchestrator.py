@@ -986,8 +986,6 @@ class TestRunCoordinator:
     @pytest.mark.asyncio
     async def test_fatal_escalation_posts_to_ui(self, project_dir: Path) -> None:
         """Fatal escalation paths post ClouEscalationArrived before returning."""
-        import clou.coordinator as coord
-
         mock_app = MagicMock()
         posted: list[Any] = []
         mock_app.post_message.side_effect = lambda msg: posted.append(msg)
@@ -1012,7 +1010,6 @@ class TestRunCoordinator:
             patch(
                 f"{_PC}.write_cycle_limit_escalation", new_callable=AsyncMock
             ),
-            patch.object(coord, "_active_app", mock_app),
         ):
             result = await run_coordinator(project_dir, "auth", app=mock_app)
 
@@ -1417,8 +1414,6 @@ class TestCycleBoundaryPauseFlag:
     ) -> None:
         """With pause_on_user_message=False (default), pending user messages
         do NOT pause the coordinator — it continues to COMPLETE."""
-        import clou.coordinator as coord
-
         mock_app = self._make_app_with_queue()
 
         with (
@@ -1430,7 +1425,6 @@ class TestCycleBoundaryPauseFlag:
                 f"{_PC}.determine_next_cycle",
                 return_value=("COMPLETE", []),
             ),
-            patch.object(coord, "_active_app", mock_app),
         ):
             result = await run_coordinator(
                 project_dir, "auth", app=mock_app,
@@ -1444,8 +1438,6 @@ class TestCycleBoundaryPauseFlag:
     ) -> None:
         """With pause_on_user_message=True, pending user messages
         pause the coordinator at the cycle boundary."""
-        import clou.coordinator as coord
-
         mock_app = self._make_app_with_queue()
 
         with (
@@ -1457,7 +1449,6 @@ class TestCycleBoundaryPauseFlag:
                 f"{_PC}.determine_next_cycle",
                 return_value=("EXECUTE", ["status.md"]),
             ),
-            patch.object(coord, "_active_app", mock_app),
         ):
             result = await run_coordinator(
                 project_dir, "auth", app=mock_app,
@@ -1472,8 +1463,6 @@ class TestCycleBoundaryPauseFlag:
         """The /stop check fires even when pause_on_user_message=False."""
         import asyncio
 
-        import clou.coordinator as coord
-
         mock_app = MagicMock()
         mock_app._stop_requested = asyncio.Event()
         mock_app._stop_requested.set()
@@ -1484,7 +1473,6 @@ class TestCycleBoundaryPauseFlag:
                 f"{_PC}.load_template",
                 return_value=self._make_template(pause=False),
             ),
-            patch.object(coord, "_active_app", mock_app),
         ):
             result = await run_coordinator(
                 project_dir, "auth", app=mock_app,
@@ -1516,7 +1504,6 @@ class TestCycleBoundaryPauseFlag:
                     return_value=("EXECUTE", ["status.md"]),
                 ),
                 patch(f"{_PC}.read_cycle_count", return_value=1),
-                patch.object(coord, "_active_app", mock_app),
             ):
                 result = await run_coordinator(
                     project_dir, "auth", app=mock_app,

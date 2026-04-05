@@ -73,11 +73,19 @@ def render_checkpoint(
     current_phase: str = "",
     phases_completed: int = 0,
     phases_total: int = 0,
+    *,
+    validation_retries: int = 0,
+    readiness_retries: int = 0,
+    crash_retries: int = 0,
+    staleness_count: int = 0,
 ) -> str:
     """Render a coordinator checkpoint file.
 
     All fields are always written explicitly — no omissions, no aliases,
     no ambiguity for ``parse_checkpoint()`` or ``validate_checkpoint()``.
+
+    Retry counters are keyword-only to avoid breaking existing callers
+    that pass positional arguments.
     """
     if cycle < 0:
         raise ValueError(f"cycle must be non-negative, got {cycle}")
@@ -102,6 +110,10 @@ def render_checkpoint(
         f"current_phase: {current_phase}\n"
         f"phases_completed: {phases_completed}\n"
         f"phases_total: {phases_total}\n"
+        f"validation_retries: {validation_retries}\n"
+        f"readiness_retries: {readiness_retries}\n"
+        f"crash_retries: {crash_retries}\n"
+        f"staleness_count: {staleness_count}\n"
     )
 
 

@@ -3,7 +3,7 @@
 Verifies that:
 - Supervisor messages are routed through bridge when app is provided
 - Coordinator messages produce breath events via bridge
-- Lifecycle: _active_app is set/cleared by run_coordinator
+- Lifecycle: active app is set/cleared by run_coordinator via accessor
 - Backward compatibility: orchestrator works without app (app=None)
 """
 
@@ -22,7 +22,9 @@ from claude_agent_sdk import ResultMessage
 
 from clou.coordinator import (
     _run_single_cycle,
+    get_active_app,
     run_coordinator,
+    set_active_app,
 )
 from clou.orchestrator import run_supervisor
 
@@ -183,10 +185,8 @@ class TestCoordinatorRouting:
         client = _mock_sdk_client([tool_msg, final])
         mock_app = MagicMock()
 
-        import clou.coordinator as coord
-
-        old_app = coord._active_app
-        coord._active_app = mock_app
+        old_app = get_active_app()
+        set_active_app(mock_app)
 
         try:
             with (
@@ -204,7 +204,7 @@ class TestCoordinatorRouting:
             ):
                 await _run_single_cycle(project_dir, "auth", "EXECUTE", "do work", app=mock_app)
         finally:
-            coord._active_app = old_app
+            set_active_app(old_app)
 
         assert mock_route.call_count == 2
         first = mock_route.call_args_list[0]
@@ -217,10 +217,8 @@ class TestCoordinatorRouting:
         """No routing when _active_app is None."""
         client = _mock_sdk_client([_make_result(usage={"input_tokens": 100})])
 
-        import clou.coordinator as coord
-
-        old_app = coord._active_app
-        coord._active_app = None
+        old_app = get_active_app()
+        set_active_app(None)
 
         try:
             with (
@@ -238,7 +236,7 @@ class TestCoordinatorRouting:
             ):
                 await _run_single_cycle(project_dir, "auth", "PLAN", "plan it")
         finally:
-            coord._active_app = old_app
+            set_active_app(old_app)
 
         mock_route.assert_not_called()
 
@@ -249,11 +247,11 @@ class TestCoordinatorRouting:
 
 
 class TestActiveAppLifecycle:
-    """run_coordinator sets and cleans up _active_app."""
+    """run_coordinator sets and cleans up _active_app via accessor."""
 
     @pytest.mark.asyncio
     async def test_app_set_during_coordinator(self, tmp_path: Path) -> None:
-        """_active_app is cleaned up after run_coordinator returns."""
+        """Active app is cleaned up after run_coordinator returns."""
         mock_app = MagicMock()
 
         with patch(
@@ -262,15 +260,11 @@ class TestActiveAppLifecycle:
         ):
             await run_coordinator(tmp_path, "auth", app=mock_app)
 
-        import clou.coordinator as coord
-
-        assert coord._active_app is None
+        assert get_active_app() is None
 
     @pytest.mark.asyncio
     async def test_app_cleaned_on_error(self, tmp_path: Path) -> None:
-        """_active_app is None even after run_coordinator raises."""
-        import clou.coordinator as coord
-
+        """Active app is None even after run_coordinator raises."""
         mock_app = MagicMock()
 
         with (
@@ -282,20 +276,18 @@ class TestActiveAppLifecycle:
         ):
             await run_coordinator(tmp_path, "auth", app=mock_app)
 
-        assert coord._active_app is None
+        assert get_active_app() is None
 
     @pytest.mark.asyncio
     async def test_app_none_by_default(self, tmp_path: Path) -> None:
-        """_active_app is None when no app is passed."""
-        import clou.coordinator as coord
-
+        """Active app is None when no app is passed."""
         with patch(
             f"{_PC}.determine_next_cycle",
             return_value=("COMPLETE", []),
         ):
             await run_coordinator(tmp_path, "auth")
 
-        assert coord._active_app is None
+        assert get_active_app() is None
 
 
 # ---------------------------------------------------------------------------
