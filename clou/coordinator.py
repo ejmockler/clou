@@ -176,6 +176,11 @@ def _write_failure_shard(
     Returns:
         The path of the written shard file.
     """
+    # Defense-in-depth: reject path traversal in phase.
+    if ".." in phase or "/" in phase:
+        msg = f"Invalid phase: {phase!r} (must not contain '..' or '/')"
+        raise ValueError(msg)
+
     from clou.shard import write_shard_path
 
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()

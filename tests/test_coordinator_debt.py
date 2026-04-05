@@ -1,10 +1,11 @@
-"""Tests for coordinator tech-debt gaps T1, T2, T4.
+"""Tests for coordinator tech-debt gaps T1, T2, T4, and RF4/RF6 rework.
 
 T1: Escalation reset idempotency at cycle 0.
 T2: Retry counter independence (readiness vs validation).
 T4: Diff stat truncation at 20-line boundary.
+T7: RF4 — _write_failure_shard rejects path traversal in phase.
 
-These test **existing** behavior. No production code changes.
+T1-T4 test existing behavior. T7 tests the RF4 security fix.
 """
 
 from __future__ import annotations
@@ -20,7 +21,11 @@ import pytest
 
 pytest.importorskip("claude_agent_sdk")
 
-from clou.coordinator import _capture_working_tree_state, _ENV_PROBE_MAX_LINES
+from clou.coordinator import (
+    _capture_working_tree_state,
+    _ENV_PROBE_MAX_LINES,
+    _write_failure_shard,
+)
 from clou.golden_context import render_checkpoint
 from clou.recovery import parse_checkpoint
 
@@ -425,3 +430,50 @@ class TestDiffStatTruncation:
 
         assert result == output
         assert "more files" not in result
+
+
+# ---------------------------------------------------------------------------
+# T7: RF4 — _write_failure_shard rejects path traversal in phase
+# ---------------------------------------------------------------------------
+
+
+class TestWriteFailureShardPhaseValidation:
+    """_write_failure_shard must reject phase values containing '..' or '/'."""
+
+    def test_rejects_dotdot_traversal(self, tmp_path: Path) -> None:
+        """Phase containing '..' raises ValueError before any filesystem ops."""
+        with pytest.raises(ValueError, match=r"must not contain '\.\.' or '/'"):
+            _write_failure_shard(
+                milestone_dir=tmp_path / "milestones" / "test-ms",
+                phase="../../escape",
+                task_name="bad-task",
+                failure_type="timeout",
+                error_detail="test",
+                dependency_impact=[],
+            )
+
+    def test_rejects_slash(self, tmp_path: Path) -> None:
+        """Phase containing '/' raises ValueError."""
+        with pytest.raises(ValueError, match=r"must not contain '\.\.' or '/'"):
+            _write_failure_shard(
+                milestone_dir=tmp_path / "milestones" / "test-ms",
+                phase="sub/dir",
+                task_name="bad-task",
+                failure_type="timeout",
+                error_detail="test",
+                dependency_impact=[],
+            )
+
+    def test_valid_phase_accepted(self, tmp_path: Path) -> None:
+        """A well-formed phase name does NOT raise."""
+        ms_dir = tmp_path / "milestones" / "test-ms"
+        result = _write_failure_shard(
+            milestone_dir=ms_dir,
+            phase="impl",
+            task_name="some-task",
+            failure_type="timeout",
+            error_detail="test error",
+            dependency_impact=["downstream-a"],
+        )
+        assert result.exists()
+        assert "impl" in str(result)
