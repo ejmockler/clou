@@ -143,6 +143,58 @@ async def execute():
 """
 
 
+LINEAR_CHAIN_SOURCE = """\
+class A: ...
+class B: ...
+class C: ...
+
+async def step_a() -> A:
+    \"\"\"Step A.\"\"\"
+async def step_b(a: A) -> B:
+    \"\"\"Step B.\"\"\"
+async def step_c(b: B) -> C:
+    \"\"\"Step C.\"\"\"
+
+async def execute():
+    a = await step_a()
+    b = await step_b(a)
+    c = await step_c(b)
+"""
+
+
+SINGLE_TASK_SOURCE = """\
+class Result: ...
+
+async def only_task() -> Result:
+    \"\"\"The only task.\"\"\"
+
+async def execute():
+    r = await only_task()
+"""
+
+
+DIAMOND_SOURCE = """\
+class Start: ...
+class Left: ...
+class Right: ...
+class End: ...
+
+async def start_task() -> Start:
+    \"\"\"Start.\"\"\"
+async def left_branch(s: Start) -> Left:
+    \"\"\"Left branch.\"\"\"
+async def right_branch(s: Start) -> Right:
+    \"\"\"Right branch.\"\"\"
+async def end_task(l: Left, r: Right) -> End:
+    \"\"\"End task.\"\"\"
+
+async def execute():
+    s = await start_task()
+    l, r = await gather(left_branch(s), right_branch(s))
+    e = await end_task(l, r)
+"""
+
+
 # ---------------------------------------------------------------------------
 # Integration tests
 # ---------------------------------------------------------------------------
@@ -224,6 +276,259 @@ class TestWideGraphPipeline:
 
             # Duration should be >= 0 (t_s is auto-computed, so near zero).
             # Just verify the column exists and rows are present.
+            lines = table_content.strip().split("\n")
+            data_rows = [
+                ln for ln in lines
+                if ln.startswith("|") and "Layer" not in ln and "---" not in ln
+            ]
+            assert len(data_rows) == 4, f"Expected 4 task rows, got {len(data_rows)}"
+
+        finally:
+            telemetry._log = old
+
+
+class TestLinearChainPipeline:
+    """Pipeline test: linear chain a -> b -> c (fully serial)."""
+
+    def test_linear_chain_pipeline(self, tmp_path: Path) -> None:
+        """Linear chain: step_a -> step_b -> step_c.
+
+        Asserts metrics.md contains ## Topology with width=1, depth=3,
+        layers=[["step_a"],["step_b"],["step_c"]], gather_groups=[].
+        Also asserts ## Per-Task Data has all 3 tasks with correct layers.
+        """
+        old = setup_log(tmp_path)
+        try:
+            write_compose(tmp_path, "m-linear", LINEAR_CHAIN_SOURCE)
+
+            # Emit agent events for all 3 tasks.
+            emit_agent("m-linear", 1, "l1", "step_a", tokens=5000, tool_uses=2)
+            emit_agent("m-linear", 1, "l2", "step_b", tokens=6000, tool_uses=3)
+            emit_agent("m-linear", 1, "l3", "step_c", tokens=7000, tool_uses=4)
+
+            # Emit cycle span.
+            emit_cycle("m-linear", 1, "EXECUTE", "ASSESS")
+
+            # Write the summary.
+            write_milestone_summary(tmp_path, "m-linear", "completed")
+
+            # Read metrics.md.
+            metrics = (
+                tmp_path / ".clou" / "milestones" / "m-linear" / "metrics.md"
+            )
+            assert metrics.exists(), "metrics.md should be created"
+            content = metrics.read_text()
+
+            # -- Topology section assertions --
+            assert "## Topology" in content
+            assert "width: 1" in content
+            assert "depth: 3" in content
+            assert "layer_count: 3" in content
+            assert "gather_groups: []" in content
+
+            # Layers: each task in its own layer.
+            assert "layers:" in content
+            assert '["step_a"]' in content
+            assert '["step_b"]' in content
+            assert '["step_c"]' in content
+
+            # -- Per-Task Data section assertions --
+            assert "## Per-Task Data" in content
+            assert "| Layer | Task | Duration | Tokens | Tools | Status |" in content
+
+            ptd_start = content.index("## Per-Task Data")
+            table_content = content[ptd_start:]
+
+            # All 3 tasks present.
+            assert "step_a" in table_content
+            assert "step_b" in table_content
+            assert "step_c" in table_content
+
+            # Layer ordering: step_a (layer 0) before step_b (1) before step_c (2).
+            sa_pos = table_content.index("step_a")
+            sb_pos = table_content.index("step_b")
+            sc_pos = table_content.index("step_c")
+            assert sa_pos < sb_pos < sc_pos
+
+            # Correct layer numbers.
+            assert "| 0 " in table_content
+            assert "| 1 " in table_content
+            assert "| 2 " in table_content
+
+            # Token values.
+            assert "5,000" in table_content, "step_a tokens (5000) missing"
+            assert "6,000" in table_content, "step_b tokens (6000) missing"
+            assert "7,000" in table_content, "step_c tokens (7000) missing"
+
+            # Correct row count.
+            lines = table_content.strip().split("\n")
+            data_rows = [
+                ln for ln in lines
+                if ln.startswith("|") and "Layer" not in ln and "---" not in ln
+            ]
+            assert len(data_rows) == 3, f"Expected 3 task rows, got {len(data_rows)}"
+
+        finally:
+            telemetry._log = old
+
+
+class TestSingleTaskPipeline:
+    """Pipeline test: single task only."""
+
+    def test_single_task_pipeline(self, tmp_path: Path) -> None:
+        """Single task: only_task.
+
+        Asserts metrics.md contains ## Topology with width=1, depth=1,
+        layers=[["only_task"]], gather_groups=[].
+        Also asserts ## Per-Task Data has the one task row.
+        """
+        old = setup_log(tmp_path)
+        try:
+            write_compose(tmp_path, "m-single", SINGLE_TASK_SOURCE)
+
+            # Emit agent events for the single task.
+            emit_agent("m-single", 1, "s1", "only_task", tokens=4000, tool_uses=1)
+
+            # Emit cycle span.
+            emit_cycle("m-single", 1, "EXECUTE", "ASSESS")
+
+            # Write the summary.
+            write_milestone_summary(tmp_path, "m-single", "completed")
+
+            # Read metrics.md.
+            metrics = (
+                tmp_path / ".clou" / "milestones" / "m-single" / "metrics.md"
+            )
+            assert metrics.exists(), "metrics.md should be created"
+            content = metrics.read_text()
+
+            # -- Topology section assertions --
+            assert "## Topology" in content
+            assert "width: 1" in content
+            assert "depth: 1" in content
+            assert "layer_count: 1" in content
+            assert "gather_groups: []" in content
+
+            # Layers: single layer with one task.
+            assert "layers:" in content
+            assert '["only_task"]' in content
+
+            # -- Per-Task Data section assertions --
+            assert "## Per-Task Data" in content
+            assert "| Layer | Task | Duration | Tokens | Tools | Status |" in content
+
+            ptd_start = content.index("## Per-Task Data")
+            table_content = content[ptd_start:]
+
+            # Task present.
+            assert "only_task" in table_content
+
+            # Layer 0.
+            assert "| 0 " in table_content
+
+            # Token value.
+            assert "4,000" in table_content, "only_task tokens (4000) missing"
+
+            # Single data row.
+            lines = table_content.strip().split("\n")
+            data_rows = [
+                ln for ln in lines
+                if ln.startswith("|") and "Layer" not in ln and "---" not in ln
+            ]
+            assert len(data_rows) == 1, f"Expected 1 task row, got {len(data_rows)}"
+
+        finally:
+            telemetry._log = old
+
+
+class TestDiamondPipeline:
+    """Pipeline test: diamond pattern a -> gather(b, c) -> d."""
+
+    def test_diamond_pipeline(self, tmp_path: Path) -> None:
+        """Diamond: start_task -> gather(left_branch, right_branch) -> end_task.
+
+        Asserts metrics.md contains ## Topology with width=2, depth=3,
+        gather_groups=[2].  Per-Task Data has all 4 tasks with correct
+        layer assignments: start_task=0, branches=1, end_task=2.
+        """
+        old = setup_log(tmp_path)
+        try:
+            write_compose(tmp_path, "m-diamond", DIAMOND_SOURCE)
+
+            # Emit agent events for all 4 tasks.
+            emit_agent(
+                "m-diamond", 1, "d1", "start_task", tokens=3000, tool_uses=1,
+            )
+            emit_agent(
+                "m-diamond", 1, "d2", "left_branch", tokens=5000, tool_uses=2,
+            )
+            emit_agent(
+                "m-diamond", 1, "d3", "right_branch", tokens=5000, tool_uses=2,
+            )
+            emit_agent(
+                "m-diamond", 1, "d4", "end_task", tokens=8000, tool_uses=4,
+            )
+
+            # Emit cycle span.
+            emit_cycle("m-diamond", 1, "EXECUTE", "ASSESS")
+
+            # Write the summary.
+            write_milestone_summary(tmp_path, "m-diamond", "completed")
+
+            # Read metrics.md.
+            metrics = (
+                tmp_path / ".clou" / "milestones" / "m-diamond" / "metrics.md"
+            )
+            assert metrics.exists(), "metrics.md should be created"
+            content = metrics.read_text()
+
+            # -- Topology section assertions --
+            assert "## Topology" in content
+            assert "width: 2" in content
+            assert "depth: 3" in content
+            assert "layer_count: 3" in content
+            assert "gather_groups: [2]" in content
+
+            # Layers.
+            assert "layers:" in content
+            assert '["start_task"]' in content
+            assert '["left_branch", "right_branch"]' in content
+            assert '["end_task"]' in content
+
+            # -- Per-Task Data section assertions --
+            assert "## Per-Task Data" in content
+            assert "| Layer | Task | Duration | Tokens | Tools | Status |" in content
+
+            ptd_start = content.index("## Per-Task Data")
+            table_content = content[ptd_start:]
+
+            # All 4 tasks present.
+            assert "start_task" in table_content
+            assert "left_branch" in table_content
+            assert "right_branch" in table_content
+            assert "end_task" in table_content
+
+            # Layer ordering: start(0) before branches(1) before end(2).
+            start_pos = table_content.index("start_task")
+            left_pos = table_content.index("left_branch")
+            right_pos = table_content.index("right_branch")
+            end_pos = table_content.index("end_task")
+            assert start_pos < left_pos
+            assert start_pos < right_pos
+            assert left_pos < end_pos
+            assert right_pos < end_pos
+
+            # Correct layer numbers: 0, 1, and 2 all present.
+            assert "| 0 " in table_content
+            assert "| 1 " in table_content
+            assert "| 2 " in table_content
+
+            # Token values.
+            assert "3,000" in table_content, "start_task tokens (3000) missing"
+            assert "5,000" in table_content, "branch tokens (5000) missing"
+            assert "8,000" in table_content, "end_task tokens (8000) missing"
+
+            # Correct row count.
             lines = table_content.strip().split("\n")
             data_rows = [
                 ln for ln in lines
