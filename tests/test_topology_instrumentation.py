@@ -8,20 +8,21 @@ asserts on the resulting metrics.md content.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any
 
 from clou import telemetry
-from clou.graph import compute_topology
 from clou.telemetry import (
     SpanLog,
-    extract_task_data,
     init,
-    read_log,
     write_milestone_summary,
 )
 
+
+# NOTE: The ``from clou.telemetry import init`` binding above deliberately
+# captures the *real* init function at import time, before the autouse
+# ``_isolate_telemetry`` fixture in conftest.py monkeypatches it.  Tests in
+# this file manage telemetry isolation themselves via ``setup_log()`` /
+# ``finally`` blocks that save and restore ``telemetry._log``.
 
 # ---------------------------------------------------------------------------
 # Reusable helpers
@@ -214,6 +215,12 @@ class TestWideGraphPipeline:
             # Layer numbers: 0 for a/b/c, 1 for combine.
             assert "| 0 " in table_content
             assert "| 1 " in table_content
+
+            # Token values should appear comma-formatted in the table.
+            assert "8,000" in table_content, "task_a tokens (8000) missing"
+            assert "9,000" in table_content, "task_b tokens (9000) missing"
+            assert "7,000" in table_content, "task_c tokens (7000) missing"
+            assert "12,000" in table_content, "combine tokens (12000) missing"
 
             # Duration should be >= 0 (t_s is auto-computed, so near zero).
             # Just verify the column exists and rows are present.
