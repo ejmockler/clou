@@ -360,6 +360,16 @@ class TestLinearChainPipeline:
             assert "6,000" in table_content, "step_b tokens (6000) missing"
             assert "7,000" in table_content, "step_c tokens (7000) missing"
 
+            # Status values: all tasks should show "completed".
+            assert table_content.count("completed") >= 3, (
+                "expected at least 3 'completed' status values in Per-Task Data"
+            )
+
+            # Tool uses values: verify each task's tool_uses count appears.
+            assert "| 2 |" in table_content, "step_a tool_uses (2) missing"
+            assert "| 3 |" in table_content, "step_b tool_uses (3) missing"
+            assert "| 4 |" in table_content, "step_c tool_uses (4) missing"
+
             # Correct row count.
             lines = table_content.strip().split("\n")
             data_rows = [
@@ -429,6 +439,14 @@ class TestSingleTaskPipeline:
             # Token value.
             assert "4,000" in table_content, "only_task tokens (4000) missing"
 
+            # Status value: the single task should show "completed".
+            assert "completed" in table_content, (
+                "expected 'completed' status in Per-Task Data"
+            )
+
+            # Tool uses value: verify only_task's tool_uses count (1) appears.
+            assert "| 1 |" in table_content, "only_task tool_uses (1) missing"
+
             # Single data row.
             lines = table_content.strip().split("\n")
             data_rows = [
@@ -463,7 +481,7 @@ class TestDiamondPipeline:
                 "m-diamond", 1, "d2", "left_branch", tokens=5000, tool_uses=2,
             )
             emit_agent(
-                "m-diamond", 1, "d3", "right_branch", tokens=5000, tool_uses=2,
+                "m-diamond", 1, "d3", "right_branch", tokens=6000, tool_uses=3,
             )
             emit_agent(
                 "m-diamond", 1, "d4", "end_task", tokens=8000, tool_uses=4,
@@ -523,10 +541,22 @@ class TestDiamondPipeline:
             assert "| 1 " in table_content
             assert "| 2 " in table_content
 
-            # Token values.
+            # Token values -- each branch has distinct tokens.
             assert "3,000" in table_content, "start_task tokens (3000) missing"
-            assert "5,000" in table_content, "branch tokens (5000) missing"
+            assert "5,000" in table_content, "left_branch tokens (5000) missing"
+            assert "6,000" in table_content, "right_branch tokens (6000) missing"
             assert "8,000" in table_content, "end_task tokens (8000) missing"
+
+            # Status values: all 4 tasks should show "completed".
+            assert table_content.count("completed") >= 4, (
+                "expected at least 4 'completed' status values in Per-Task Data"
+            )
+
+            # Tool uses values: verify task tool_uses counts appear.
+            assert "| 1 |" in table_content, "start_task tool_uses (1) missing"
+            assert "| 2 |" in table_content, "left_branch tool_uses (2) missing"
+            assert "| 3 |" in table_content, "right_branch tool_uses (3) missing"
+            assert "| 4 |" in table_content, "end_task tool_uses (4) missing"
 
             # Correct row count.
             lines = table_content.strip().split("\n")
@@ -535,6 +565,272 @@ class TestDiamondPipeline:
                 if ln.startswith("|") and "Layer" not in ln and "---" not in ln
             ]
             assert len(data_rows) == 4, f"Expected 4 task rows, got {len(data_rows)}"
+
+        finally:
+            telemetry._log = old
+
+
+# ---------------------------------------------------------------------------
+# Degradation and edge case tests
+# ---------------------------------------------------------------------------
+
+# Compose source for orphaned agent test — two tasks in a gather.
+GATHER_TWO_SOURCE = """\
+class A: ...
+class B: ...
+class Combined: ...
+
+async def task_a() -> A:
+    \"\"\"Task A.\"\"\"
+async def task_b() -> B:
+    \"\"\"Task B.\"\"\"
+async def combine(a: A, b: B) -> Combined:
+    \"\"\"Combine.\"\"\"
+
+async def execute():
+    a, b = await gather(task_a(), task_b())
+    result = await combine(a, b)
+"""
+
+
+class TestNoComposeOmitsTopology:
+    """Graceful degradation when compose.py is missing."""
+
+    def test_no_compose_omits_topology(self, tmp_path: Path) -> None:
+        """No compose.py written -- topology section omitted, per-task data
+        still appears with layer shown as a dash.
+        """
+        old = setup_log(tmp_path)
+        try:
+            # Do NOT write compose.py -- just emit telemetry events.
+            emit_agent("m-nocomp", 1, "n1", "some_task", tokens=3000, tool_uses=2)
+            emit_agent(
+                "m-nocomp", 1, "n2", "another_task", tokens=4000, tool_uses=3,
+            )
+            emit_cycle("m-nocomp", 1, "EXECUTE", "ASSESS")
+
+            write_milestone_summary(tmp_path, "m-nocomp", "completed")
+
+            metrics = (
+                tmp_path / ".clou" / "milestones" / "m-nocomp" / "metrics.md"
+            )
+            assert metrics.exists(), "metrics.md should be created"
+            content = metrics.read_text()
+
+            # Header present.
+            assert content.startswith("# Metrics: m-nocomp")
+
+            # Topology section must NOT appear.
+            assert "## Topology" not in content
+
+            # Per-Task Data section IS present (without layer info).
+            assert "## Per-Task Data" in content
+            ptd_start = content.index("## Per-Task Data")
+            table_content = content[ptd_start:]
+
+            # Layer column shows dash for all tasks.
+            assert "\u2014" in table_content, (
+                "expected dash (\u2014) for layer column when compose.py is absent"
+            )
+
+            # Agent rows still appear.
+            assert "some_task" in table_content
+            assert "another_task" in table_content
+
+            # Agents table present.
+            assert "## Agents" in content
+
+            # Row count: 2 data rows.
+            lines = table_content.strip().split("\n")
+            data_rows = [
+                ln for ln in lines
+                if ln.startswith("|") and "Layer" not in ln and "---" not in ln
+            ]
+            assert len(data_rows) == 2, f"Expected 2 task rows, got {len(data_rows)}"
+
+        finally:
+            telemetry._log = old
+
+
+class TestOrphanedAgentsInPipeline:
+    """Edge case: agent.start without agent.end produces orphaned status."""
+
+    def test_orphaned_agents_in_pipeline(self, tmp_path: Path) -> None:
+        """One task completes normally, one has only agent.start (orphaned).
+
+        Asserts per-task row shows 'orphaned' status with zero duration,
+        and agents_failed counts the orphaned agent.
+        """
+        old = setup_log(tmp_path)
+        try:
+            write_compose(tmp_path, "m-orphan", GATHER_TWO_SOURCE)
+
+            # task_a completes normally.
+            emit_agent("m-orphan", 1, "o1", "task_a", tokens=5000, tool_uses=3)
+
+            # task_b only starts -- orphaned.
+            emit_agent_start("m-orphan", 1, "o2", "task_b")
+
+            emit_cycle("m-orphan", 1, "EXECUTE", "ASSESS")
+
+            write_milestone_summary(tmp_path, "m-orphan", "completed")
+
+            metrics = (
+                tmp_path / ".clou" / "milestones" / "m-orphan" / "metrics.md"
+            )
+            assert metrics.exists(), "metrics.md should be created"
+            content = metrics.read_text()
+
+            # Header: agents_failed should be 1 (orphaned counts as failed).
+            assert "agents_failed: 1" in content
+
+            # Per-Task Data section present.
+            assert "## Per-Task Data" in content
+            ptd_start = content.index("## Per-Task Data")
+            table_content = content[ptd_start:]
+
+            # Both tasks present.
+            assert "task_a" in table_content
+            assert "task_b" in table_content
+
+            # task_a shows "completed".
+            # Find the task_a row and check status.
+            task_a_row = [
+                ln for ln in table_content.split("\n")
+                if "task_a" in ln and ln.startswith("|")
+            ]
+            assert len(task_a_row) == 1, "Expected exactly one task_a row"
+            assert "completed" in task_a_row[0]
+
+            # task_b shows "orphaned" with zero duration.
+            task_b_row = [
+                ln for ln in table_content.split("\n")
+                if "task_b" in ln and ln.startswith("|")
+            ]
+            assert len(task_b_row) == 1, "Expected exactly one task_b row"
+            assert "orphaned" in task_b_row[0]
+            assert "0s" in task_b_row[0], "orphaned task should show 0s duration"
+
+            # Agents table shows task_b as orphaned.
+            assert "## Agents" in content
+            agents_start = content.index("## Agents")
+            # Limit to just the Agents section (up to next ## heading).
+            agents_rest = content[agents_start:]
+            next_section = agents_rest.find("\n## ", 1)
+            agents_section = (
+                agents_rest[:next_section] if next_section != -1 else agents_rest
+            )
+            agent_b_row = [
+                ln for ln in agents_section.split("\n")
+                if "task_b" in ln and ln.startswith("|")
+            ]
+            assert len(agent_b_row) == 1, "Expected exactly one task_b agent row"
+            assert "orphaned" in agent_b_row[0]
+
+        finally:
+            telemetry._log = old
+
+
+class TestExistingSectionsPreserved:
+    """write_milestone_summary overwrites previous metrics.md cleanly."""
+
+    def test_existing_sections_preserved(self, tmp_path: Path) -> None:
+        """Write dummy metrics.md, then call write_milestone_summary.
+
+        Asserts old content is completely replaced and new output is
+        well-formed.
+        """
+        old = setup_log(tmp_path)
+        try:
+            # Pre-populate metrics.md with stale content.
+            ms_dir = tmp_path / ".clou" / "milestones" / "m-overwrite"
+            ms_dir.mkdir(parents=True, exist_ok=True)
+            (ms_dir / "metrics.md").write_text(
+                "# Old content\nshould be gone\n", encoding="utf-8",
+            )
+
+            write_compose(tmp_path, "m-overwrite", WIDE_GRAPH_SOURCE)
+            emit_agent(
+                "m-overwrite", 1, "ow1", "task_a", tokens=2000, tool_uses=1,
+            )
+            emit_agent(
+                "m-overwrite", 1, "ow2", "task_b", tokens=3000, tool_uses=2,
+            )
+            emit_agent(
+                "m-overwrite", 1, "ow3", "task_c", tokens=4000, tool_uses=3,
+            )
+            emit_agent(
+                "m-overwrite", 1, "ow4", "combine", tokens=5000, tool_uses=4,
+            )
+            emit_cycle("m-overwrite", 1, "EXECUTE", "ASSESS")
+
+            write_milestone_summary(tmp_path, "m-overwrite", "completed")
+
+            metrics = ms_dir / "metrics.md"
+            assert metrics.exists(), "metrics.md should exist"
+            content = metrics.read_text()
+
+            # Old content must be gone.
+            assert "Old content" not in content
+            assert "should be gone" not in content
+
+            # New content starts with proper header.
+            assert content.startswith("# Metrics: m-overwrite")
+
+            # Topology and per-task sections are correct.
+            assert "## Topology" in content
+            assert "width: 3" in content
+            assert "## Per-Task Data" in content
+
+            ptd_start = content.index("## Per-Task Data")
+            table_content = content[ptd_start:]
+            assert "task_a" in table_content
+            assert "task_b" in table_content
+            assert "task_c" in table_content
+            assert "combine" in table_content
+
+        finally:
+            telemetry._log = old
+
+
+class TestEmptyTelemetry:
+    """Graceful handling when no events are emitted for the milestone."""
+
+    def test_empty_telemetry(self, tmp_path: Path) -> None:
+        """Init telemetry, emit events for a DIFFERENT milestone, then
+        write summary for the target milestone.
+
+        Asserts metrics.md has zero counts and no topology or per-task
+        sections.
+        """
+        old = setup_log(tmp_path)
+        try:
+            # Emit events for a different milestone to prove filtering works.
+            emit_agent(
+                "other-milestone", 1, "x1", "irrelevant", tokens=9999,
+                tool_uses=9,
+            )
+            emit_cycle("other-milestone", 1, "EXECUTE", "ASSESS")
+
+            # Write summary for milestone with zero events.
+            write_milestone_summary(tmp_path, "m-empty", "completed")
+
+            metrics = (
+                tmp_path / ".clou" / "milestones" / "m-empty" / "metrics.md"
+            )
+            assert metrics.exists(), "metrics.md should be created"
+            content = metrics.read_text()
+
+            # Header present with zero counts.
+            assert content.startswith("# Metrics: m-empty")
+            assert "cycles: 0" in content
+            assert "agents_spawned: 0" in content
+
+            # No topology section (no compose.py, and irrelevant anyway).
+            assert "## Topology" not in content
+
+            # No per-task data section (no agent events for this milestone).
+            assert "## Per-Task Data" not in content
 
         finally:
             telemetry._log = old
