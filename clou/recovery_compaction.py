@@ -71,6 +71,11 @@ def compact_decisions(
         heading_end = group.index("\n") if "\n" in group else len(group)
         heading = group[:heading_end].strip()
 
+        # Already-compacted groups are preserved as-is.
+        if "(compacted)" in heading:
+            compacted_lines.append(group.rstrip() + "\n")
+            continue
+
         # Count accepted/overridden findings.
         accepted = len(re.findall(r"(?m)^### Accepted:", group))
         overridden = len(re.findall(r"(?m)^### Overridden:", group))
@@ -149,6 +154,31 @@ def _parse_memory(content: str) -> list[MemoryPattern]:
     return patterns
 
 
+def retrieve_patterns(
+    patterns: list[MemoryPattern],
+    *,
+    type_filter: str | None = None,
+    all_milestones: list[str] | None = None,
+) -> list[MemoryPattern]:
+    """Return patterns filtered by *type_filter*, excluding archived/invalidated.
+
+    *all_milestones* is accepted for future recency scoring but currently
+    unused beyond interface compatibility.
+    """
+    result: list[MemoryPattern] = []
+    for p in patterns:
+        # Exclude archived and invalidated patterns.
+        if p.status == "archived":
+            continue
+        if p.invalidated:
+            continue
+        # Apply type filter when specified.
+        if type_filter is not None and p.type != type_filter:
+            continue
+        result.append(p)
+    return result
+
+
 def _render_memory(patterns: list[MemoryPattern]) -> str:
     """Render pattern entries back to memory.md format."""
     lines = ["# Operational Memory", "", "## Patterns", ""]
@@ -209,7 +239,7 @@ def _reinforce_or_create(
     does not double-count reinforcement.
     """
     for p in patterns:
-        if p.name == name:
+        if p.name == name and p.type == type_:
             if milestone not in p.observed:
                 p.observed.append(milestone)
                 p.reinforced += 1
@@ -271,6 +301,83 @@ def _apply_decay(
             p.status = "fading"
 
 
+# ---------------------------------------------------------------------------
+# Temporal invalidation (DB-18 I3)
+# ---------------------------------------------------------------------------
+
+#: Structural keyword groups for contradiction detection.
+#: Each group maps a pattern type to sets of mutually exclusive terms.
+_CONTRADICTION_GROUPS: dict[str, list[set[str]]] = {
+    "decomposition": [
+        {"sequential", "parallel", "gather"},
+    ],
+    "escalation": [
+        {"staleness", "validation_failure", "crash"},
+    ],
+}
+
+
+def _detect_contradiction(
+    existing_desc: str,
+    new_desc: str,
+    pattern_type: str,
+) -> str:
+    """Detect structural contradictions between existing and new descriptions.
+
+    Returns a human-readable reason string if a contradiction is found,
+    or an empty string if descriptions are compatible.
+
+    Only checks structural keyword groups defined in _CONTRADICTION_GROUPS.
+    Numeric-only changes (e.g., cycle count 2 -> 3) are NOT contradictions.
+    """
+    groups = _CONTRADICTION_GROUPS.get(pattern_type, [])
+    if not groups:
+        return ""
+
+    existing_lower = existing_desc.lower()
+    new_lower = new_desc.lower()
+
+    for group in groups:
+        existing_terms = {t for t in group if t in existing_lower}
+        new_terms = {t for t in group if t in new_lower}
+        if existing_terms and new_terms and existing_terms != new_terms:
+            return (
+                f"structural change: {', '.join(sorted(existing_terms))} "
+                f"-> {', '.join(sorted(new_terms))}"
+            )
+    return ""
+
+
+def _invalidate_contradictions(
+    patterns: list[MemoryPattern],
+    name: str,
+    type_: str,
+    new_description: str,
+    milestone: str,
+) -> bool:
+    """Mark existing pattern as invalidated if new description contradicts it.
+
+    Returns True if a contradiction was detected and the pattern was
+    invalidated. Already-invalidated patterns are not double-invalidated.
+
+    The invalidated pattern is preserved in memory.md (not deleted) with
+    ``invalidated`` set to the milestone name and ``invalidation_reason``
+    recording the detected structural change.
+    """
+    for p in patterns:
+        if p.name != name or p.type != type_:
+            continue
+        # Skip already-invalidated patterns.
+        if p.invalidated:
+            return False
+        reason = _detect_contradiction(p.description, new_description, type_)
+        if reason:
+            p.invalidated = milestone
+            p.invalidation_reason = reason
+            return True
+    return False
+
+
 _NUMERIC_PREFIX_RE = re.compile(r"^(\d+)")
 
 
@@ -282,12 +389,19 @@ def _milestone_sort_key(name: str) -> tuple[int, str]:
     return (0, name)
 
 
-def _consolidated_milestones(memory_path: Path) -> set[str]:
+def _consolidated_milestones(
+    memory_path: Path,
+    milestones_dir: Path | None = None,
+) -> set[str]:
     """Return the set of milestones structurally consolidated into memory.md.
 
     Only considers orchestrator-authored patterns (cost-calibration) to
     avoid false positives from supervisor annotations that mention a
     milestone before structural consolidation ran for it.
+
+    When *milestones_dir* is provided, the result is intersected with
+    actual milestone directory names to prune stale references from
+    memory.md (e.g. after a milestone directory was deleted).
     """
     if not memory_path.exists():
         return set()
@@ -296,4 +410,206 @@ def _consolidated_milestones(memory_path: Path) -> set[str]:
     for p in patterns:
         if p.type == "cost-calibration":
             seen.update(p.observed)
+    if milestones_dir is not None and milestones_dir.is_dir():
+        existing = {
+            d.name for d in milestones_dir.iterdir()
+            if d.is_dir() and (d / "metrics.md").exists()
+        }
+        seen &= existing
     return seen
+
+
+def _accumulate_distribution(existing_desc: str, new_value: int) -> str:
+    """Accumulate a numeric value into a min/median/max distribution string.
+
+    Parses existing distribution data from *existing_desc*, adds *new_value*,
+    and returns a formatted distribution suffix string.
+    """
+    import statistics
+
+    # Extract prior values from distribution string if present.
+    values: list[int] = []
+    dist_match = re.search(r"Distribution: cycles.*?\(n=(\d+)\)", existing_desc)
+    if dist_match:
+        # Extract individual values from stored representation.
+        nums = re.findall(r"min=(\d+).*?median=(\d+).*?max=(\d+).*?n=(\d+)", existing_desc)
+        if nums:
+            _min, _med, _max, _n = int(nums[0][0]), int(nums[0][1]), int(nums[0][2]), int(nums[0][3])
+            # Reconstruct approximate values from min/median/max.
+            values = [_min] + [_med] * max(0, _n - 2) + [_max] if _n > 1 else [_min]
+    elif existing_desc:
+        # Try to parse a single cycle count from plain description.
+        cycle_match = re.match(r"^(\d+)\s+cycles?", existing_desc)
+        if cycle_match:
+            values = [int(cycle_match.group(1))]
+
+    values.append(new_value)
+    n = len(values)
+    med = int(statistics.median(values))
+    return f"Distribution: cycles min={min(values)} median={med} max={max(values)} (n={n})."
+
+
+_FED_INTO_RE = re.compile(r"\(([^)]+)\)\s*$")
+
+
+def _extract_milestone_from_fed_into(entry_text: str) -> str | None:
+    """Extract the milestone name from a 'Fed into:' line in an entry.
+
+    Looks for the pattern ``(milestone-name)`` at the end of the line.
+    Returns None if no Fed-into tag or no parenthesized milestone found.
+    """
+    for line in entry_text.split("\n"):
+        if "**Fed into:**" in line or "Fed into:" in line:
+            m = _FED_INTO_RE.search(line)
+            if m:
+                return m.group(1).strip()
+    return None
+
+
+def _parse_understanding_sections(
+    content: str,
+) -> tuple[str, dict[str, list[str]], dict[str, str]]:
+    """Split understanding.md into preamble, section entries, and section prose.
+
+    Returns ``(preamble, sections, section_prose)`` where *preamble* is
+    everything before the first ``## `` header, *sections* maps section
+    titles to lists of entry texts (each starting with ``### ``), and
+    *section_prose* maps section titles to the prose text between the
+    ``## `` header line and the first ``### `` entry (preserved verbatim).
+    """
+    # Split on ## headers (level 2).
+    parts = re.split(r"(?m)^## ", content)
+    preamble = parts[0]
+    sections: dict[str, list[str]] = {}
+    section_prose: dict[str, str] = {}
+
+    for part in parts[1:]:
+        # The section title is the first line.
+        newline_idx = part.find("\n")
+        if newline_idx == -1:
+            title = part.strip()
+            body = ""
+        else:
+            title = part[:newline_idx].strip()
+            body = part[newline_idx + 1:]
+
+        # Split body into entries at ### headers.
+        entry_parts = re.split(r"(?m)^### ", body)
+        # First element is text between ## header and first ### — preserve it.
+        prose = entry_parts[0] if entry_parts else ""
+        section_prose[title] = prose
+        entries: list[str] = []
+        for ep in entry_parts[1:]:
+            entries.append("### " + ep)
+
+        sections[title] = entries
+
+    return preamble, sections, section_prose
+
+
+def _render_understanding(
+    preamble: str,
+    sections: dict[str, list[str]],
+    section_prose: dict[str, str] | None = None,
+) -> str:
+    """Render understanding.md from preamble, sections, and section prose.
+
+    Each part from ``_parse_understanding_sections()`` already includes its
+    exact original whitespace (preamble ends with ``\\n\\n``, prose starts
+    with ``\\n`` and ends with ``\\n\\n``, entries start with ``### ``).
+    Parts are concatenated directly without any separator.
+    """
+    parts = [preamble]
+    for title, entries in sections.items():
+        parts.append(f"## {title}\n")
+        # Emit per-section prose verbatim when available.  The prose
+        # captured by _parse_understanding_sections includes structural
+        # whitespace (e.g. "\n" for the blank line between header and
+        # first entry), so it must be emitted as-is for round-trip
+        # fidelity.
+        if section_prose is not None:
+            prose = section_prose.get(title, "")
+            if prose:
+                parts.append(prose)
+        if entries:
+            parts.append("".join(entries))
+    return "".join(parts)
+
+
+def compact_understanding(
+    understanding_path: Path,
+    milestones_dir: Path,
+    *,
+    archive_threshold: int = 10,
+) -> bool:
+    """Resolve and archive understanding.md entries for completed milestones.
+
+    Entries in "Active tensions" or "Continuity" whose "Fed into:" tag
+    references a completed milestone (one with metrics.md) are moved to
+    "Resolved".  Entries in "Resolved" referencing milestones older than
+    *archive_threshold* milestones from the latest are removed entirely
+    (git history preserves them).
+
+    Returns True if any changes were made, False otherwise.
+    """
+    if not understanding_path.exists():
+        return False
+
+    content = understanding_path.read_text(encoding="utf-8")
+    preamble, sections, section_prose = _parse_understanding_sections(content)
+
+    # Determine which milestones are completed (have metrics.md).
+    completed_milestones: set[str] = set()
+    if milestones_dir.is_dir():
+        for d in milestones_dir.iterdir():
+            if d.is_dir() and (d / "metrics.md").exists():
+                completed_milestones.add(d.name)
+
+    # Build sorted milestone list for distance computation.
+    all_milestones: list[str] = sorted(
+        completed_milestones, key=_milestone_sort_key,
+    )
+    latest_idx = len(all_milestones) - 1 if all_milestones else -1
+
+    milestone_index: dict[str, int] = {
+        m: i for i, m in enumerate(all_milestones)
+    }
+
+    changed = False
+
+    # --- Resolution: move completed entries to Resolved ---
+    resolved_entries = sections.get("Resolved", [])
+    for section_name in ("Active tensions", "Continuity"):
+        if section_name not in sections:
+            continue
+        remaining: list[str] = []
+        for entry in sections[section_name]:
+            ms_name = _extract_milestone_from_fed_into(entry)
+            if ms_name and ms_name in completed_milestones:
+                resolved_entries.append(entry)
+                changed = True
+            else:
+                remaining.append(entry)
+        sections[section_name] = remaining
+
+    # --- Archival: remove old Resolved entries ---
+    if latest_idx >= 0 and resolved_entries:
+        kept: list[str] = []
+        for entry in resolved_entries:
+            ms_name = _extract_milestone_from_fed_into(entry)
+            if ms_name and ms_name in milestone_index:
+                distance = latest_idx - milestone_index[ms_name]
+                if distance > archive_threshold:
+                    changed = True
+                    continue  # Remove from file.
+            kept.append(entry)
+        resolved_entries = kept
+
+    sections["Resolved"] = resolved_entries
+
+    if not changed:
+        return False
+
+    rendered = _render_understanding(preamble, sections, section_prose)
+    understanding_path.write_text(rendered, encoding="utf-8")
+    return True

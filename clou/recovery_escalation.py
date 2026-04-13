@@ -100,9 +100,22 @@ async def write_cycle_limit_escalation(
     )
 
 
-async def write_agent_crash_escalation(project_dir: Path, milestone: str) -> None:
-    """Write escalation when agent team crashes."""
+async def write_agent_crash_escalation(
+    project_dir: Path,
+    milestone: str,
+    *,
+    error_detail: str | None = None,
+) -> None:
+    """Write escalation when agent team crashes.
+
+    *error_detail*, when provided, is included in the evidence section
+    so that the supervisor (or user) can diagnose the root cause without
+    needing to reproduce the crash.
+    """
     _validate_milestone(milestone)
+    evidence = "Agent subprocess exited with non-zero status."
+    if error_detail:
+        evidence = f"{evidence}\n\nError detail: {error_detail}"
     _write_escalation(
         project_dir=project_dir,
         milestone=milestone,
@@ -111,7 +124,7 @@ async def write_agent_crash_escalation(project_dir: Path, milestone: str) -> Non
         classification="blocking",
         context="An agent team process terminated unexpectedly during execution.",
         issue="The agent team crashed and could not complete its assigned work.",
-        evidence="Agent subprocess exited with non-zero status.",
+        evidence=evidence,
         options=[
             "Retry the cycle with the same configuration",
             "Revert golden context and retry from the previous checkpoint",

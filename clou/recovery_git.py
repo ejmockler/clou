@@ -22,6 +22,7 @@ _log = logging.getLogger(__name__)
 _STAGING_EXCLUDE_PATTERNS: tuple[str, ...] = (
     ".clou/telemetry/*",
     ".clou/sessions/*",
+    "*/_filtered_memory.md",
     "node_modules/*",
     "__pycache__/*",
     "*.pyc",

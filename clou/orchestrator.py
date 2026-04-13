@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re as _re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -36,6 +37,11 @@ from claude_agent_sdk import (
 )
 
 from clou.coordinator import run_coordinator
+from clou.graph import (
+    parse_roadmap_annotations,
+    validate_roadmap_annotations,
+    compute_independent_sets,
+)
 from clou.recovery import validate_milestone_name
 from clou.tokens import (
     MODEL,
@@ -48,9 +54,9 @@ from clou.harness import (
     load_template,
     read_template_name,
 )
-from clou.hooks import build_hooks, to_sdk_hooks
+from clou.hooks import build_hooks, is_cleanup_allowed, to_sdk_hooks
 from clou.prompts import load_prompt
-from clou.recovery import consolidate_pending
+from clou.recovery import parse_obsolete_flags, run_lifecycle_pipeline
 from clou.gate import UserGate
 from clou.tools import clou_create_milestone, clou_init, clou_spawn_coordinator, clou_status
 from clou.ui.bridge import _strip_ansi
@@ -61,6 +67,85 @@ log = logging.getLogger("clou")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _sanitize_name(name: str, *, max_len: int = 80) -> str:
+    """Sanitize a milestone name for safe embedding in error messages.
+
+    Strips control characters and newlines, truncates to *max_len*.
+    Prevents prompt-injection via malicious milestone names (F15).
+    """
+    cleaned = _re.sub(r"[\x00-\x1f\x7f]", "", name)
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len] + "..."
+    return cleaned
+
+
+def cleanup_obsolete_files(project_dir: Path, milestone: str) -> list[str]:
+    """Delete files flagged as obsolete in a milestone's handoff.md.
+
+    Parses the milestone's handoff.md for ``Obsolete:`` flags (via
+    :func:`parse_obsolete_flags`), checks each against the orchestrator's
+    cleanup scope (via :func:`is_cleanup_allowed`), and deletes permitted
+    files that exist.
+
+    Called from both ``_run_single_coordinator`` (real-time, after completion)
+    and ``run_lifecycle_pipeline`` Stage 6 (startup catchup).
+
+    Returns list of deleted file paths (relative to project_dir).
+    """
+    clou_dir = project_dir / ".clou"
+    handoff_path = clou_dir / "milestones" / milestone / "handoff.md"
+    flagged = parse_obsolete_flags(handoff_path)
+    if not flagged:
+        return []
+
+    deleted: list[str] = []
+    for path_str in flagged:
+        # Strip `.clou/` prefix to get relative-to-.clou path for
+        # permission checking.
+        if path_str.startswith(".clou/"):
+            relative = path_str[len(".clou/"):]
+        else:
+            log.warning(
+                "Cleanup: flagged path %r does not start with .clou/, skipping",
+                path_str,
+            )
+            continue
+
+        if not is_cleanup_allowed(relative):
+            log.warning(
+                "Cleanup: %r not in cleanup scope, skipping", path_str,
+            )
+            continue
+
+        target = clou_dir / relative
+        if not target.exists():
+            log.info("Cleanup: %r already absent, skipping", path_str)
+            continue
+
+        # F9: Defense-in-depth — refuse to follow symlinks.
+        if target.is_symlink():
+            log.warning(
+                "Cleanup: %r is a symlink, skipping for safety", path_str,
+            )
+            continue
+
+        try:
+            target.unlink()
+            deleted.append(path_str)
+            log.info("Cleanup: deleted %r (flagged in %s handoff.md)", path_str, milestone)
+            telemetry.event(
+                "cleanup.obsolete_file_deleted",
+                path=path_str,
+                milestone=milestone,
+            )
+        except OSError:
+            log.warning(
+                "Cleanup: failed to delete %r", path_str, exc_info=True,
+            )
+
+    return deleted
 
 
 # Keep _to_sdk_hooks as a thin re-export for backwards compatibility
@@ -89,6 +174,89 @@ def _display(msg: object) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _run_single_coordinator(
+    project_dir: Path,
+    milestone: str,
+    app: ClouApp | None = None,
+) -> tuple[str, str]:
+    """Run a single coordinator and emit UI events.
+
+    Returns ``(milestone, result)`` where *result* is the coordinator's
+    exit string (``"completed"``, ``"error"``, ``"escalated_*"``, etc.).
+    """
+    if app is not None:
+        from clou.ui.messages import ClouCoordinatorSpawned
+
+        app.post_message(ClouCoordinatorSpawned(milestone=milestone))
+
+    try:
+        result = await run_coordinator(project_dir, milestone, app=app)
+    except Exception:
+        result = "error"
+        log.exception("Coordinator crashed for %r", milestone)
+
+    log.info("Coordinator for %r finished: %s", milestone, result)
+
+    # Post-completion cleanup: delete files flagged as obsolete in handoff.md.
+    if result == "completed":
+        try:
+            cleanup_obsolete_files(project_dir, milestone)
+        except Exception:
+            log.warning(
+                "Cleanup failed for %r", milestone, exc_info=True,
+            )
+
+    if result == "completed" and app is not None:
+        handoff_path = (
+            project_dir / ".clou" / "milestones" / milestone / "handoff.md"
+        )
+        if handoff_path.exists():
+            from clou.ui.messages import ClouHandoff
+
+            app.post_message(
+                ClouHandoff(milestone=milestone, handoff_path=handoff_path)
+            )
+
+    if app is not None:
+        from clou.ui.messages import ClouCoordinatorComplete
+
+        app.post_message(
+            ClouCoordinatorComplete(
+                milestone=milestone,
+                result=result,
+            )
+        )
+    return milestone, result
+
+
+def _build_milestone_guidance(project_dir: Path, milestone: str, result: str) -> str:
+    """Build guidance text for a single milestone result."""
+    ms_dir = project_dir / ".clou" / "milestones" / milestone
+    if result in ("paused", "stopped"):
+        return (
+            f"Coordinator for '{milestone}' {result}. "
+            f"The user's message is in the input queue --- "
+            f"address it, then call clou_spawn_coordinator "
+            f"to resume. The coordinator will continue from "
+            f"its checkpoint."
+        )
+    if result.startswith("escalated"):
+        return (
+            f"Coordinator for '{milestone}' {result}. "
+            f"Read {ms_dir / 'escalations'} for diagnosis. "
+            f"To retry: modify golden context, then call "
+            f"clou_spawn_coordinator. Cycle count resets "
+            f"after escalation resolution."
+        )
+    return (
+        f"Coordinator for '{milestone}' {result}. "
+        f"Read {ms_dir / 'handoff.md'}, "
+        f"{ms_dir / 'decisions.md'}, "
+        f"{ms_dir / 'status.md'}, "
+        f"and {ms_dir / 'metrics.md'} for results."
+    )
+
+
 def _build_mcp_server(
     project_dir: Path,
     app: ClouApp | None = None,
@@ -108,65 +276,271 @@ def _build_mcp_server(
         await clou_spawn_coordinator(project_dir, milestone)
         log.info("Spawning coordinator for milestone %r", milestone)
 
-        if app is not None:
-            from clou.ui.messages import ClouCoordinatorSpawned
-
-            app.post_message(ClouCoordinatorSpawned(milestone=milestone))
-
-        try:
-            result = await run_coordinator(project_dir, milestone, app=app)
-        except Exception:
-            result = "error"
-            log.exception("Coordinator crashed for %r", milestone)
-
-        log.info("Coordinator for %r finished: %s", milestone, result)
-
-        if result == "completed" and app is not None:
-            handoff_path = (
-                project_dir / ".clou" / "milestones" / milestone / "handoff.md"
-            )
-            if handoff_path.exists():
-                from clou.ui.messages import ClouHandoff
-
-                app.post_message(
-                    ClouHandoff(milestone=milestone, handoff_path=handoff_path)
-                )
-
-        if app is not None:
-            from clou.ui.messages import ClouCoordinatorComplete
-
-            app.post_message(
-                ClouCoordinatorComplete(
-                    milestone=milestone,
-                    result=result,
-                )
-            )
-        ms_dir = project_dir / ".clou" / "milestones" / milestone
-        if result in ("paused", "stopped"):
-            guidance = (
-                f"Coordinator for '{milestone}' {result}. "
-                f"The user's message is in the input queue — "
-                f"address it, then call clou_spawn_coordinator "
-                f"to resume. The coordinator will continue from "
-                f"its checkpoint."
-            )
-        elif result.startswith("escalated"):
-            guidance = (
-                f"Coordinator for '{milestone}' {result}. "
-                f"Read {ms_dir / 'escalations'} for diagnosis. "
-                f"To retry: modify golden context, then call "
-                f"clou_spawn_coordinator. Cycle count resets "
-                f"after escalation resolution."
-            )
-        else:
-            guidance = (
-                f"Coordinator for '{milestone}' {result}. "
-                f"Read {ms_dir / 'handoff.md'}, "
-                f"{ms_dir / 'decisions.md'}, "
-                f"{ms_dir / 'status.md'}, "
-                f"and {ms_dir / 'metrics.md'} for results."
-            )
+        _ms, result = await _run_single_coordinator(
+            project_dir, milestone, app=app,
+        )
+        guidance = _build_milestone_guidance(project_dir, milestone, result)
         return {"content": [{"type": "text", "text": guidance}]}
+
+    @tool(
+        "clou_spawn_parallel_coordinators",
+        "Spawn multiple independent coordinators concurrently. "
+        "Validates independence via roadmap.md annotations before dispatch. "
+        "Each coordinator runs its full cycle autonomously. If one fails, "
+        "siblings continue. Returns per-milestone results.",
+        {
+            "type": "object",
+            "properties": {
+                "milestones": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 5,
+                    "description": "List of milestone names to dispatch concurrently.",
+                },
+            },
+            "required": ["milestones"],
+        },
+    )
+    async def spawn_parallel_coordinators_tool(
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        milestones: list[str] = args.get("milestones", [])
+        if not milestones:
+            return {
+                "content": [{"type": "text", "text": "No milestones provided."}],
+                "is_error": True,
+            }
+
+        # Dedup while preserving order (F3: prevent duplicate dispatches).
+        milestones = list(dict.fromkeys(milestones))
+
+        # Runtime cap on concurrent fan-out (F9).
+        _MAX_PARALLEL = 5
+        if len(milestones) > _MAX_PARALLEL:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"Too many milestones ({len(milestones)}). "
+                        f"Maximum {_MAX_PARALLEL} concurrent dispatches allowed."
+                    ),
+                }],
+                "is_error": True,
+            }
+
+        # Validate milestone names.
+        for ms in milestones:
+            validate_milestone_name(ms)
+
+        # Single milestone: dispatch serially (no parallelism needed).
+        if len(milestones) == 1:
+            ms = milestones[0]
+            await clou_spawn_coordinator(project_dir, ms)
+            log.info("Spawning coordinator for milestone %r (single)", ms)
+            _ms, result = await _run_single_coordinator(
+                project_dir, ms, app=app,
+            )
+            guidance = _build_milestone_guidance(project_dir, ms, result)
+            return {"content": [{"type": "text", "text": guidance}]}
+
+        # Read and parse roadmap.md for independence validation.
+        roadmap_path = project_dir / ".clou" / "roadmap.md"
+        if not roadmap_path.exists():
+            # No roadmap: fall back to serial dispatch.
+            log.warning("No roadmap.md found; dispatching milestones serially")
+            return await _serial_fallback(
+                project_dir, milestones, app,
+                reason="No roadmap.md found",
+            )
+
+        roadmap_text = roadmap_path.read_text()
+        graph = parse_roadmap_annotations(roadmap_text)
+        validation_errors = validate_roadmap_annotations(graph)
+
+        # If validation fails, fall back to serial dispatch.
+        blocking_errors = [
+            e for e in validation_errors if e.severity == "error"
+        ]
+        if blocking_errors:
+            error_detail = "; ".join(str(e) for e in blocking_errors)
+            log.warning(
+                "Roadmap validation errors: %s; falling back to serial",
+                error_detail,
+            )
+            # Sanitize error detail before embedding in LLM-facing
+            # reason string (F15: prevent prompt injection via
+            # malicious milestone names in roadmap.md).
+            safe_detail = _sanitize_name(error_detail, max_len=200)
+            return await _serial_fallback(
+                project_dir, milestones, app,
+                reason=f"Validation errors: {safe_detail}",
+            )
+
+        # Pairwise independence check (F10): verify that the specific
+        # requested milestones declare independence from each other,
+        # not just that some unrelated milestone has an annotation.
+        if len(milestones) >= 2:
+            missing_pairs: list[tuple[str, str]] = []
+            for i in range(len(milestones)):
+                for j in range(i + 1, len(milestones)):
+                    a, b = milestones[i], milestones[j]
+                    entry_a = graph.milestones.get(a)
+                    entry_b = graph.milestones.get(b)
+                    # At least one direction of independence must be declared.
+                    a_declares_b = entry_a is not None and b in entry_a.independent_of
+                    b_declares_a = entry_b is not None and a in entry_b.independent_of
+                    if not (a_declares_b or b_declares_a):
+                        missing_pairs.append((a, b))
+            if missing_pairs:
+                pair_strs = [f"({a}, {b})" for a, b in missing_pairs]
+                log.info(
+                    "No pairwise independence for %s; serial fallback",
+                    pair_strs,
+                )
+                # F12: Use topological order for serial fallback.
+                topo_sets = compute_independent_sets(graph)
+                topo_lookup: dict[str, int] = {}
+                for li, layer in enumerate(topo_sets):
+                    for n in layer:
+                        topo_lookup[n] = li
+                topo_milestones = sorted(
+                    milestones,
+                    key=lambda m: topo_lookup.get(m, 0),
+                )
+                return await _serial_fallback(
+                    project_dir, topo_milestones, app,
+                    reason=(
+                        "No pairwise independence annotations for: "
+                        + ", ".join(pair_strs)
+                    ),
+                )
+
+        # Compute independent sets and verify requested milestones
+        # are in the same independent layer.
+        independent_sets = compute_independent_sets(graph)
+
+        # Build a lookup: milestone -> layer index.
+        ms_to_layer: dict[str, int] = {}
+        for layer_idx, layer in enumerate(independent_sets):
+            for ms_name in layer:
+                ms_to_layer[ms_name] = layer_idx
+
+        # Check that all requested milestones are known and independent.
+        requested = set(milestones)
+        unknown = requested - set(ms_to_layer)
+        if unknown:
+            log.warning(
+                "Unknown milestones %s not in roadmap; serial fallback",
+                unknown,
+            )
+            safe_unknown = [_sanitize_name(u) for u in sorted(unknown)]
+            return await _serial_fallback(
+                project_dir, milestones, app,
+                reason=f"Unknown milestones: {safe_unknown}",
+            )
+
+        # All requested milestones must be in the same layer.
+        layers_used = {ms_to_layer[ms] for ms in milestones}
+        if len(layers_used) > 1:
+            log.warning(
+                "Milestones span multiple layers (%s); serial fallback",
+                layers_used,
+            )
+            # F12: Sort by topological layer order so dependencies
+            # run before dependents in the serial fallback.
+            topo_ordered = sorted(
+                milestones, key=lambda m: ms_to_layer[m],
+            )
+            return await _serial_fallback(
+                project_dir, topo_ordered, app,
+                reason=(
+                    "Milestones span different dependency layers "
+                    "and cannot be dispatched concurrently"
+                ),
+            )
+
+        # Validate milestone directories exist.
+        for ms in milestones:
+            await clou_spawn_coordinator(project_dir, ms)
+
+        log.info(
+            "Dispatching %d coordinators concurrently: %s",
+            len(milestones), milestones,
+        )
+        telemetry.event(
+            "parallel_dispatch.start",
+            milestone_count=len(milestones),
+            milestones=milestones,
+        )
+
+        # Concurrent dispatch with failure isolation.
+        results = await asyncio.gather(
+            *(
+                _run_single_coordinator(project_dir, ms, app=app)
+                for ms in milestones
+            ),
+            return_exceptions=True,
+        )
+
+        # Build combined guidance.
+        guidance_parts: list[str] = []
+        for i, outcome in enumerate(results):
+            ms = milestones[i]
+            if isinstance(outcome, BaseException):
+                log.error(
+                    "Coordinator for %r raised: %s", ms, outcome,
+                    exc_info=outcome,
+                )
+                guidance_parts.append(
+                    f"[{ms}] ERROR: coordinator failed"
+                )
+                # Post UI error event.
+                if app is not None:
+                    from clou.ui.messages import ClouCoordinatorComplete
+
+                    app.post_message(
+                        ClouCoordinatorComplete(
+                            milestone=ms, result="error",
+                        )
+                    )
+            else:
+                _ms_name, result_str = outcome
+                guidance_parts.append(
+                    f"[{ms}] {_build_milestone_guidance(project_dir, ms, result_str)}"
+                )
+
+        telemetry.event(
+            "parallel_dispatch.end",
+            milestone_count=len(milestones),
+        )
+
+        combined = "\n\n".join(guidance_parts)
+        return {"content": [{"type": "text", "text": combined}]}
+
+    async def _serial_fallback(
+        project_dir_: Path,
+        milestones_: list[str],
+        app_: ClouApp | None,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Dispatch milestones one at a time (serial fallback)."""
+        guidance_parts: list[str] = [f"Serial fallback: {reason}"]
+        for ms in milestones_:
+            try:
+                await clou_spawn_coordinator(project_dir_, ms)
+            except ValueError as exc:
+                guidance_parts.append(f"[{ms}] ERROR: {exc}")
+                continue
+            log.info("Spawning coordinator for milestone %r (serial)", ms)
+            _ms, result = await _run_single_coordinator(
+                project_dir_, ms, app=app_,
+            )
+            guidance_parts.append(
+                f"[{ms}] {_build_milestone_guidance(project_dir_, ms, result)}"
+            )
+        combined = "\n\n".join(guidance_parts)
+        return {"content": [{"type": "text", "text": combined}]}
 
     @tool(
         "clou_status",
@@ -262,7 +636,14 @@ def _build_mcp_server(
 
     return create_sdk_mcp_server(
         "clou",
-        tools=[spawn_coordinator_tool, status_tool, init_tool, create_milestone_tool, ask_user_tool],
+        tools=[
+            spawn_coordinator_tool,
+            spawn_parallel_coordinators_tool,
+            status_tool,
+            init_tool,
+            create_milestone_tool,
+            ask_user_tool,
+        ],
     )
 
 
@@ -278,25 +659,45 @@ async def run_supervisor(
     """Start and manage the supervisor session."""
     clou_dir = project_dir / ".clou"
 
-    # Ensure operational memory is consistent before the supervisor
-    # reads memory.md at orient (DB-18). Consolidates any completed
-    # milestones not yet reflected in memory.md — handles bootstrap,
-    # crash recovery, and code deployment across existing projects.
+    # Full lifecycle pipeline at startup (DB-18): consolidation + decay,
+    # episodic archival, and decisions compaction. Ensures operational
+    # memory is consistent before the supervisor reads memory.md at
+    # orient. Handles bootstrap, crash recovery, and code deployment
+    # across existing projects.
     if clou_dir.exists():
         try:
-            n = consolidate_pending(project_dir)
-            if n:
-                log.info("Consolidated %d pending milestone(s) into memory.md", n)
+            telemetry.event("startup.lifecycle_pipeline.start")
+            consolidated = await run_lifecycle_pipeline(project_dir)
+            telemetry.event("startup.lifecycle_pipeline.end",
+                            consolidated=len(consolidated) if consolidated else 0)
+            if consolidated:
+                log.info(
+                    "Lifecycle pipeline: consolidated %d milestone(s)",
+                    len(consolidated),
+                )
         except Exception:
-            log.warning("Pending consolidation failed", exc_info=True)
+            telemetry.event("startup.lifecycle_pipeline.error")
+            log.warning("Lifecycle pipeline failed", exc_info=True)
 
-    user_gate = UserGate()
-    clou_server = _build_mcp_server(project_dir, app=app, gate=user_gate)
+    try:
+        telemetry.event("startup.mcp_server.start")
+        user_gate = UserGate()
+        clou_server = _build_mcp_server(project_dir, app=app, gate=user_gate)
+        telemetry.event("startup.mcp_server.end")
+    except Exception:
+        telemetry.event("startup.mcp_server.error")
+        raise
 
     # Load harness template for MCP servers and hook permissions.
-    tmpl_name = read_template_name(project_dir)
-    tmpl = load_template(tmpl_name)
-    hooks = _to_sdk_hooks(build_hooks("supervisor", project_dir, template=tmpl))
+    try:
+        telemetry.event("startup.hooks.start")
+        tmpl_name = read_template_name(project_dir)
+        tmpl = load_template(tmpl_name)
+        hooks = _to_sdk_hooks(build_hooks("supervisor", project_dir, template=tmpl))
+        telemetry.event("startup.hooks.end")
+    except Exception:
+        telemetry.event("startup.hooks.error")
+        raise
 
     # Supervisor gets clou MCP server only — no quality gate servers.
     # Quality gates are invoked by the brutalist during ASSESS cycles,
@@ -332,13 +733,16 @@ async def run_supervisor(
             "Read", "Write", "Edit", "Glob", "Grep", "Bash",
             "mcp__clou__ask_user",
             "mcp__clou__clou_spawn_coordinator",
+            "mcp__clou__clou_spawn_parallel_coordinators",
             "mcp__clou__clou_status",
             "mcp__clou__clou_init",
             "mcp__clou__clou_create_milestone",
         ],
     )
 
+    telemetry.event("startup.sdk_client.start")
     async with ClaudeSDKClient(options=options) as supervisor:
+        telemetry.event("startup.sdk_client.connected")
         # Protocol files live in the bundled _prompts/ dir (global, not per-project).
         from clou.prompts import _BUNDLED_PROMPTS
 

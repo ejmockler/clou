@@ -1,7 +1,7 @@
 """Memory consolidation for completed milestones (DB-18).
 
-Provides consolidate_pending(), consolidate_milestone(), and metrics
-parsing helpers (_parse_metrics_header, _count_metrics_section_rows,
+Provides consolidate_pending(), consolidate_milestone(), parse_obsolete_flags(),
+and metrics parsing helpers (_parse_metrics_header, _count_metrics_section_rows,
 _analyze_compose, etc.).
 
 Internal module -- import from clou.recovery for public API.
@@ -16,12 +16,17 @@ from pathlib import Path
 
 from clou.recovery_checkpoint import _safe_int, _validate_milestone
 from clou.recovery_compaction import (
+    _accumulate_distribution,
     _apply_decay,
     _consolidated_milestones,
+    _detect_contradiction,
+    _invalidate_contradictions,
     _milestone_sort_key,
     _parse_memory,
     _reinforce_or_create,
     _render_memory,
+    compact_decisions,
+    compact_understanding,
 )
 
 _log = logging.getLogger(__name__)
@@ -147,6 +152,55 @@ def _analyze_compose(compose_path: Path) -> tuple[int, bool]:
     return phase_count, has_gather
 
 
+# ---------------------------------------------------------------------------
+# Handoff.md obsolete-file flag parser
+# ---------------------------------------------------------------------------
+
+_OBSOLETE_RE = re.compile(r"Obsolete:\s*`([^`]+)`")
+
+
+def parse_obsolete_flags(handoff_path: Path) -> list[str]:
+    """Extract obsolete file paths from a handoff.md Known Limitations section.
+
+    Convention: within the ``## Known Limitations`` section, a line containing
+    ``Obsolete: `path/to/file``` flags that file for cleanup.  The
+    backtick-wrapped path is returned as-is (e.g. ``.clou/roadmap.py.example``).
+
+    Returns an empty list when:
+    - *handoff_path* does not exist,
+    - no ``## Known Limitations`` section is found, or
+    - no ``Obsolete:`` flags appear within that section.
+
+    Flags outside the Known Limitations section are ignored.  Flags without
+    backtick wrapping are ignored (the convention requires backticks).
+    """
+    if not handoff_path.exists():
+        return []
+
+    try:
+        content = handoff_path.read_text(encoding="utf-8")
+    except OSError:
+        _log.warning("parse_obsolete_flags: cannot read %s", handoff_path)
+        return []
+
+    paths: list[str] = []
+    in_section = False
+    for line in content.split("\n"):
+        stripped = line.strip()
+        # Detect start of Known Limitations section (exact heading match).
+        if stripped.startswith("## ") and stripped[3:].strip().lower() == "known limitations":
+            in_section = True
+            continue
+        # Stop at the next ## heading (or end of file).
+        if in_section and stripped.startswith("## "):
+            break
+        if in_section:
+            m = _OBSOLETE_RE.search(line)
+            if m:
+                paths.append(m.group(1))
+    return paths
+
+
 def consolidate_pending(project_dir: Path) -> int:
     """Consolidate any completed milestones not yet in memory.md (DB-18).
 
@@ -233,27 +287,39 @@ def consolidate_milestone(
     cycles = _safe_int(header.get("cycles", "0"))
     tokens_out = _safe_int(header.get("tokens_out", "0"))
     duration = header.get("duration", "unknown")
+    observation = f"{cycles} cycles, ~{tokens_out:,} output tokens, {duration}."
+    # Look up existing pattern description for distribution accumulation (R7).
+    existing_desc = ""
+    for p in patterns:
+        if p.name == "cycle-count-distribution" and p.type == "cost-calibration":
+            existing_desc = p.description
+            break
+    dist_suffix = _accumulate_distribution(existing_desc, cycles)
     _reinforce_or_create(
         patterns,
         name="cycle-count-distribution",
         type_="cost-calibration",
         milestone=milestone,
-        description=(
-            f"{cycles} cycles, ~{tokens_out:,} output tokens, {duration}."
-        ),
+        description=f"{observation} {dist_suffix}",
     )
 
     # 2. Decomposition topology from compose.py AST.
     if phase_count > 0:
         topology = "parallel (gather)" if has_gather else "sequential"
+        new_decomp_desc = f"{phase_count} phases, {topology} execution."
+        _invalidate_contradictions(
+            patterns,
+            name="decomposition-topology",
+            type_="decomposition",
+            new_description=new_decomp_desc,
+            milestone=milestone,
+        )
         _reinforce_or_create(
             patterns,
             name="decomposition-topology",
             type_="decomposition",
             milestone=milestone,
-            description=(
-                f"{phase_count} phases, {topology} execution."
-            ),
+            description=new_decomp_desc,
         )
 
     # 3. Escalation patterns from metrics header.
@@ -326,3 +392,107 @@ def consolidate_milestone(
     _log.info("Consolidated %r into memory.md (%d patterns)", milestone, len(patterns))
 
     return True
+
+
+async def run_lifecycle_pipeline(project_dir: Path) -> list[str]:
+    """Run the full memory lifecycle pipeline at startup (DB-18 N4).
+
+    Pipeline ordering: consolidation -> decay -> archival -> compaction.
+    Decay is applied within consolidate_pending (each consolidate_milestone
+    call applies _apply_decay). Archival and compaction run after.
+
+    Returns list of consolidated milestone names.
+    """
+    clou_dir = project_dir / ".clou"
+    milestones_dir = clou_dir / "milestones"
+
+    # Stage 1 + 2: Consolidation (includes per-milestone decay).
+    consolidated: list[str] = []
+    try:
+        already = _consolidated_milestones(clou_dir / "memory.md")
+        if milestones_dir.exists():
+            pending: list[str] = []
+            for ms_dir in milestones_dir.iterdir():
+                if not ms_dir.is_dir():
+                    continue
+                if (ms_dir / "metrics.md").exists() and ms_dir.name not in already:
+                    pending.append(ms_dir.name)
+            pending.sort(key=_milestone_sort_key)
+
+            for ms_name in pending:
+                try:
+                    if consolidate_milestone(project_dir, ms_name):
+                        consolidated.append(ms_name)
+                except Exception:
+                    _log.warning(
+                        "Lifecycle pipeline: consolidation failed for %r",
+                        ms_name,
+                        exc_info=True,
+                    )
+    except Exception:
+        _log.warning("Lifecycle pipeline: consolidation stage failed", exc_info=True)
+
+    # Stage 3: Archival — handled by decay within consolidate_milestone.
+
+    # Stage 4: Compaction — compact decisions.md for each milestone.
+    if milestones_dir.exists():
+        for ms_dir in milestones_dir.iterdir():
+            if not ms_dir.is_dir():
+                continue
+            decisions_path = ms_dir / "decisions.md"
+            try:
+                compact_decisions(decisions_path)
+            except Exception:
+                _log.warning(
+                    "Lifecycle pipeline: decisions compaction failed for %r",
+                    ms_dir.name,
+                    exc_info=True,
+                )
+
+    # Stage 5: Compact understanding.md.
+    try:
+        compact_understanding(clou_dir / "understanding.md", milestones_dir)
+    except Exception:
+        _log.warning(
+            "Lifecycle pipeline: understanding compaction failed", exc_info=True,
+        )
+
+    # Stage 6: Obsolete file cleanup — delete files flagged in handoff.md.
+    # Processes all milestone directories (not just newly consolidated ones)
+    # to catch flags added to older milestones retroactively.
+    # Calls the shared cleanup_obsolete_files() to avoid reimplementing
+    # the parse-check-unlink sequence (F2) and inherits telemetry (F8).
+    if milestones_dir.exists():
+        from clou.orchestrator import cleanup_obsolete_files
+
+        for ms_dir in milestones_dir.iterdir():
+            if not ms_dir.is_dir():
+                continue
+            # F1: Only process milestones that actually completed.
+            # A crashed coordinator with a partial handoff.md must not
+            # trigger deletion on next startup.
+            metrics_path = ms_dir / "metrics.md"
+            if not metrics_path.exists():
+                continue
+            try:
+                metrics_content = metrics_path.read_text(encoding="utf-8")
+                header = _parse_metrics_header(metrics_content)
+                outcome = header.get("outcome", "")
+                if not outcome.startswith("completed"):
+                    continue
+            except OSError:
+                _log.warning(
+                    "Lifecycle cleanup: cannot read metrics for %r, skipping",
+                    ms_dir.name,
+                )
+                continue
+            try:
+                cleanup_obsolete_files(project_dir, ms_dir.name)
+            except Exception:
+                _log.warning(
+                    "Lifecycle pipeline: cleanup failed for %r",
+                    ms_dir.name,
+                    exc_info=True,
+                )
+
+    return consolidated

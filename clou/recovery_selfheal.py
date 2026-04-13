@@ -1,8 +1,8 @@
 """Self-heal logic for golden context validation errors.
 
 Provides attempt_self_heal() and log_self_heal_attempt(), plus the
-normalisation helpers they use (checkpoint re-render, status table fix,
-missing Current State fields).
+normalisation helpers they use (checkpoint re-render, status re-render
+from checkpoint).
 
 Internal module -- import from clou.recovery for public API.
 """
@@ -230,6 +230,50 @@ def _add_missing_current_state_fields(
     return content, fixes
 
 
+def _rerender_status_from_checkpoint(
+    project_dir: Path,
+    milestone: str,
+    status_path: Path,
+) -> tuple[str | None, list[str]]:
+    """Re-render status.md entirely from the checkpoint.
+
+    If a valid checkpoint exists, derives status.md content from it
+    (via ``render_status_from_checkpoint``).  This replaces the old
+    approach of patching individual fields and normalising table values.
+
+    Returns ``(new_content, list_of_descriptions)``.  Returns
+    ``(None, [])`` when no checkpoint is available, signalling the
+    caller to fall back to legacy normalization.
+    """
+    from clou.golden_context import _extract_phase_names, render_status_from_checkpoint
+
+    fixes: list[str] = []
+
+    checkpoint_path = (
+        project_dir / ".clou" / "milestones" / milestone
+        / "active" / "coordinator.md"
+    )
+    if not checkpoint_path.exists():
+        return None, fixes
+
+    original = status_path.read_text() if status_path.exists() else ""
+
+    cp = parse_checkpoint(checkpoint_path.read_text())
+    ms_dir = project_dir / ".clou" / "milestones" / milestone
+    phase_names = _extract_phase_names(ms_dir)
+
+    new_content = render_status_from_checkpoint(
+        milestone=milestone,
+        checkpoint=cp,
+        phase_names=phase_names or None,
+    )
+
+    if new_content != original:
+        fixes.append("re-rendered status.md from checkpoint")
+
+    return new_content, fixes
+
+
 def attempt_self_heal(
     project_dir: Path,
     milestone: str,
@@ -280,13 +324,27 @@ def attempt_self_heal(
             fixes.extend(cp_fixes)
 
         if rel_path.endswith("status.md"):
-            content, table_fixes = _normalise_status_in_table(content)
-            fixes.extend(table_fixes)
-
-            content, field_fixes = _add_missing_current_state_fields(
-                content, milestone, project_dir,
+            # Prefer re-rendering status.md from checkpoint (unified
+            # state).  Falls back to legacy normalizers when no
+            # checkpoint is available (e.g. before first PLAN cycle).
+            rerendered, status_fixes = _rerender_status_from_checkpoint(
+                project_dir, milestone, abs_path,
             )
-            fixes.extend(field_fixes)
+            if rerendered is not None:
+                # Checkpoint exists -- use the re-rendered content
+                # (even if identical, don't fall back to legacy).
+                content = rerendered
+                fixes.extend(status_fixes)
+            else:
+                # No checkpoint available -- fall back to legacy
+                # field/table normalization.
+                content, table_fixes = _normalise_status_in_table(content)
+                fixes.extend(table_fixes)
+
+                content, field_fixes = _add_missing_current_state_fields(
+                    content, milestone, project_dir,
+                )
+                fixes.extend(field_fixes)
 
         if fixes and content != original:
             abs_path.write_text(content)

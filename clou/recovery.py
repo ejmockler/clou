@@ -14,6 +14,8 @@ Import from this module for the public API.
 from clou.recovery_checkpoint import (  # noqa: F401
     Checkpoint,
     ConvergenceState,
+    _MEMORY_TYPE_FILTERS,
+    _filter_memory_for_cycle,
     _safe_int,
     assess_convergence,
     determine_next_cycle,
@@ -24,13 +26,17 @@ from clou.recovery_checkpoint import (  # noqa: F401
 )
 from clou.recovery_compaction import (  # noqa: F401
     MemoryPattern,
+    _accumulate_distribution,
     _apply_decay,
     _consolidated_milestones,
+    _detect_contradiction,
+    _invalidate_contradictions,
     _milestone_sort_key,
     _parse_memory,
     _reinforce_or_create,
     _render_memory,
     compact_decisions,
+    compact_understanding,
 )
 from clou.recovery_consolidation import (  # noqa: F401
     _analyze_compose,
@@ -38,6 +44,14 @@ from clou.recovery_consolidation import (  # noqa: F401
     _parse_metrics_header,
     consolidate_milestone,
     consolidate_pending,
+    parse_obsolete_flags,
+    run_lifecycle_pipeline,
+)
+from clou.recovery_errors import (  # noqa: F401
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_RETRY_COOLDOWN,
+    ErrorKind,
+    classify_error,
 )
 from clou.recovery_escalation import (  # noqa: F401
     write_agent_crash_escalation,

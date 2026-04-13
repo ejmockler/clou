@@ -319,28 +319,83 @@ def write_milestone_summary(
             "",
             "## Cycles",
             "",
-            "| # | Type | Duration | Tokens In | Tokens Out | Outcome |",
-            "|---|------|----------|-----------|------------|---------|",
+            "| # | Type | Phase | Duration | Tokens In | Tokens Out | Outcome |",
+            "|---|------|-------|----------|-----------|------------|---------|",
         ])
         for c in cycles:
             lines.append(
                 f"| {c.get('cycle_num', '?')} "
                 f"| {c.get('cycle_type', '?')} "
+                f"| {c.get('phase', '') or '\u2014'} "
                 f"| {_fmt_duration(c.get('duration_ms', 0))} "
                 f"| {c.get('input_tokens', 0):,} "
                 f"| {c.get('output_tokens', 0):,} "
                 f"| {c.get('outcome', '?')} |"
             )
 
-    # -- Agent table --
+    # -- Phase Summary (T2-G1) --
+    phase_groups: dict[str, dict[str, int]] = {}
+    for c in cycles:
+        ph = c.get("phase", "")
+        if not ph:
+            continue
+        if ph not in phase_groups:
+            phase_groups[ph] = {
+                "duration_ms": 0, "input_tokens": 0,
+                "output_tokens": 0, "count": 0,
+            }
+        phase_groups[ph]["duration_ms"] += c.get("duration_ms", 0)
+        phase_groups[ph]["input_tokens"] += c.get("input_tokens", 0)
+        phase_groups[ph]["output_tokens"] += c.get("output_tokens", 0)
+        phase_groups[ph]["count"] += 1
+
+    if phase_groups:
+        lines.extend([
+            "",
+            "## Phase Summary",
+            "",
+            "| Phase | Cycles | Duration | Tokens In | Tokens Out |",
+            "|-------|--------|----------|-----------|------------|",
+        ])
+        for ph, agg in sorted(phase_groups.items()):
+            lines.append(
+                f"| {ph} "
+                f"| {agg['count']} "
+                f"| {_fmt_duration(agg['duration_ms'])} "
+                f"| {agg['input_tokens']:,} "
+                f"| {agg['output_tokens']:,} |"
+            )
+
+    # -- Convergence (T2-G3) --
+    convergence_data = [
+        (
+            c.get("cycle_num", "?"),
+            c.get("valid_findings", -1),
+            c.get("consecutive_zero_valid", 0),
+        )
+        for c in cycles
+        if c.get("valid_findings", -1) >= 0
+    ]
+    if convergence_data:
+        lines.extend([
+            "",
+            "## Convergence",
+            "",
+            "| Cycle | Valid Findings | Consecutive Zero |",
+            "|-------|----------------|------------------|",
+        ])
+        for cn, vf, czv in convergence_data:
+            lines.append(f"| {cn} | {vf} | {czv} |")
+
+    # -- Agent table (T2-G7: Input/Output columns) --
     all_task_ids = list(agent_ends) + sorted(orphaned)
     if all_task_ids:
         lines.extend([
             "",
             "## Agents",
             "",
-            "| Description | Cycle | Status | Tokens | Tools |",
-            "|-------------|-------|--------|--------|-------|",
+            "| Description | Cycle | Status | Tokens | Input | Output | Tools |",
+            "|-------------|-------|--------|--------|-------|--------|-------|",
         ])
         for task_id in all_task_ids:
             start = agent_starts.get(task_id, {})
@@ -352,6 +407,8 @@ def write_milestone_summary(
                     f"| {ae.get('cycle_num', '?')} "
                     f"| {ae.get('status', '?')} "
                     f"| {ae.get('total_tokens', 0):,} "
+                    f"| {ae.get('input_tokens', 0):,} "
+                    f"| {ae.get('output_tokens', 0):,} "
                     f"| {ae.get('tool_uses', 0)} |"
                 )
             else:
@@ -359,9 +416,44 @@ def write_milestone_summary(
                     f"| {desc} "
                     f"| {start.get('cycle_num', '?')} "
                     f"| orphaned "
-                    f"| — "
-                    f"| — |"
+                    f"| \u2014 "
+                    f"| \u2014 "
+                    f"| \u2014 "
+                    f"| \u2014 |"
                 )
+
+    # -- Agent Tiers (T2-G2) --
+    tier_stats: dict[str, dict[str, int]] = {}
+    for task_id in set(agent_starts) | set(agent_ends):
+        start = agent_starts.get(task_id, {})
+        end = agent_ends.get(task_id, {})
+        tier = start.get("tier") or end.get("tier") or "unknown"
+        if tier not in tier_stats:
+            tier_stats[tier] = {
+                "count": 0, "tokens": 0,
+                "input_tokens": 0, "output_tokens": 0,
+            }
+        tier_stats[tier]["count"] += 1
+        tier_stats[tier]["tokens"] += end.get("total_tokens", 0)
+        tier_stats[tier]["input_tokens"] += end.get("input_tokens", 0)
+        tier_stats[tier]["output_tokens"] += end.get("output_tokens", 0)
+
+    if tier_stats:
+        lines.extend([
+            "",
+            "## Agent Tiers",
+            "",
+            "| Tier | Count | Tokens | Input | Output |",
+            "|------|-------|--------|-------|--------|",
+        ])
+        for tier, stats in sorted(tier_stats.items()):
+            lines.append(
+                f"| {tier} "
+                f"| {stats['count']} "
+                f"| {stats['tokens']:,} "
+                f"| {stats['input_tokens']:,} "
+                f"| {stats['output_tokens']:,} |"
+            )
 
     # -- Topology section --
     compose_path = (
@@ -460,17 +552,85 @@ def write_milestone_summary(
             "",
             "## Quality Gate",
             "",
-            "| Cycle | Tools Invoked | Tools Unavailable | Tool Count |",
-            "|-------|---------------|-------------------|------------|",
+            "| Cycle | Status | Tools Invoked | Tools Unavailable | Tools Count |",
+            "|-------|--------|---------------|-------------------|-------------|",
         ])
         for qg in qg_events:
             invoked = ", ".join(qg.get("tools_invoked", []))
             unavail = ", ".join(qg.get("tools_unavailable", []))
+            # Support both old (finding_count) and new (tools_invoked_count) field names.
+            tool_count = qg.get("tools_invoked_count", qg.get("finding_count", 0))
             lines.append(
                 f"| {qg.get('cycle_num', '?')} "
+                f"| {qg.get('status', '?')} "
                 f"| {invoked or 'none'} "
                 f"| {unavail or 'none'} "
-                f"| {qg.get('finding_count', 0)} |"
+                f"| {tool_count} |"
+            )
+
+    # -- Gate Availability (T2-G5) --
+    if qg_events:
+        _total_invocations = len(qg_events)
+        _full = sum(1 for q in qg_events if q.get("status") == "full")
+        _partial = sum(1 for q in qg_events if q.get("status") == "partial")
+        _degraded = sum(1 for q in qg_events if q.get("status") == "degraded")
+
+        # Per-tool availability.
+        _tool_avail: dict[str, int] = {}
+        _tool_unavail: dict[str, int] = {}
+        for qg in qg_events:
+            for t in qg.get("tools_invoked", []):
+                _tool_avail[t] = _tool_avail.get(t, 0) + 1
+            for t in qg.get("tools_unavailable", []):
+                _tool_unavail[t] = _tool_unavail.get(t, 0) + 1
+        _all_tools = set(_tool_avail) | set(_tool_unavail)
+
+        lines.extend([
+            "",
+            "### Gate Availability",
+            "",
+            f"invocations: {_total_invocations}",
+            f"full: {_full}",
+            f"partial: {_partial}",
+            f"degraded: {_degraded}",
+        ])
+
+        if _all_tools:
+            lines.extend([
+                "",
+                "| Tool | Available | Total | Rate |",
+                "|------|-----------|-------|------|",
+            ])
+            for tool in sorted(_all_tools):
+                avail = _tool_avail.get(tool, 0)
+                unavail = _tool_unavail.get(tool, 0)
+                total = avail + unavail
+                rate = f"{avail / total * 100:.0f}%" if total > 0 else "\u2014"
+                lines.append(
+                    f"| {tool} | {avail} | {total} | {rate} |"
+                )
+
+    # -- Decision Outcomes (T2-G6) --
+    decision_outcomes = [
+        r for r in records
+        if r.get("event") == "quality_gate.decision_outcome"
+        and r.get("milestone") == milestone
+    ]
+    if decision_outcomes:
+        lines.extend([
+            "",
+            "### Decision Outcomes",
+            "",
+            "| Cycle | Decision | Rework Cycle | Subsequent Findings | Productive |",
+            "|-------|----------|--------------|---------------------|------------|",
+        ])
+        for do in decision_outcomes:
+            lines.append(
+                f"| {do.get('cycle_num', '?')} "
+                f"| {do.get('original_decision', '?')} "
+                f"| {do.get('rework_cycle', '?')} "
+                f"| {do.get('subsequent_valid_findings', '?')} "
+                f"| {'yes' if do.get('was_productive') else 'no'} |"
             )
 
     # -- Rework events (DB-18 telemetry extension) --
@@ -495,25 +655,35 @@ def write_milestone_summary(
                 f"| {rw.get('phase', '?')} |"
             )
 
-    # -- Escalation summary (DB-18 telemetry extension) --
+    # -- Escalation summary (DB-18 telemetry extension, T2-G4: Resolved) --
     esc_events = [
         r for r in records
         if r.get("event") == "escalation.created"
         and r.get("milestone") == milestone
     ]
+    esc_resolved_set: set[tuple[str, int]] = {
+        (r.get("classification", ""), r.get("cycle_num", 0))
+        for r in records
+        if r.get("event") == "escalation.resolved"
+        and r.get("milestone") == milestone
+    }
     if esc_events:
         lines.extend([
             "",
             "## Escalations",
             "",
-            "| Cycle | Classification | Severity |",
-            "|-------|----------------|----------|",
+            "| Cycle | Classification | Severity | Resolved |",
+            "|-------|----------------|----------|----------|",
         ])
         for esc in esc_events:
+            _cls = esc.get("classification", "?")
+            _cn = esc.get("cycle_num", 0)
+            _resolved = "yes" if (_cls, _cn) in esc_resolved_set else "no"
             lines.append(
                 f"| {esc.get('cycle_num', '?')} "
-                f"| {esc.get('classification', '?')} "
-                f"| {esc.get('severity', '?')} |"
+                f"| {_cls} "
+                f"| {esc.get('severity', '?')} "
+                f"| {_resolved} |"
             )
 
     # -- Incidents --
@@ -539,3 +709,243 @@ def write_milestone_summary(
     )
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_path.write_text(content, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Cognitive metrics (DB-20 Step 1)
+# ---------------------------------------------------------------------------
+
+
+def compute_reference_density(
+    read_set: list[str],
+    output_text: str,
+) -> dict[str, bool]:
+    """Check which read set files are referenced in output text.
+
+    Uses simple substring matching: for each file in read_set,
+    check if the filename (without path) appears in output_text.
+    Returns ``{filename: referenced_bool}``.
+    """
+    import os
+
+    if not read_set or not output_text:
+        return {f: False for f in read_set} if read_set else {}
+    result: dict[str, bool] = {}
+    for filepath in read_set:
+        basename = os.path.basename(filepath)
+        result[filepath] = basename in output_text
+    return result
+
+
+def parse_test_status(path: Path) -> dict[str, Any] | None:
+    """Parse a test-status.md file into structured data.
+
+    Returns dict with keys: last_run, suite, passing, failing, new_failures.
+    Returns None if file doesn't exist or is unparseable.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    if not text.strip():
+        return None
+
+    result: dict[str, Any] = {}
+    new_failures: list[str] = []
+    in_failures = False
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if in_failures and stripped.startswith("- "):
+            new_failures.append(stripped[2:])
+            continue
+        if ":" in stripped:
+            key, _, value = stripped.partition(":")
+            key = key.strip()
+            value = value.strip()
+            if key == "new_failures":
+                in_failures = True
+                continue
+            in_failures = False
+            if key in ("passing", "failing"):
+                try:
+                    result[key] = int(value)
+                except ValueError:
+                    return None
+            elif key in ("last_run", "suite"):
+                result[key] = value
+
+    result["new_failures"] = new_failures
+    if "passing" not in result or "failing" not in result:
+        return None
+    return result
+
+
+def emit_test_status(
+    milestone: str,
+    phase: str,
+    status: dict[str, Any],
+) -> None:
+    """Emit a telemetry event for test status changes."""
+    event(
+        "test_status.update",
+        milestone=milestone,
+        phase=phase,
+        passing=status.get("passing", 0),
+        failing=status.get("failing", 0),
+        new_failure_count=len(status.get("new_failures", [])),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Information channel capacity (DB-20 Step 6)
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_INTENT_RE = _re.compile(r"\bI\d+\b")
+
+_PIPELINE_STEPS: list[tuple[str, str]] = [
+    ("compose", "compose.py"),
+    ("phase", "phases/*/phase.md"),
+    ("execution", "phases/*/execution.md"),
+    ("assessment", "assessment.md"),
+    ("handoff", "handoff.md"),
+]
+
+
+def _intent_in_files(intent_id: str, paths: list[Path]) -> bool:
+    """Return True if *intent_id* appears in any of *paths*."""
+    for p in paths:
+        try:
+            if intent_id in p.read_text(encoding="utf-8"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def measure_intent_survival(
+    milestone_dir: Path,
+) -> list[dict[str, Any]]:
+    """Measure intent survival rate across the pipeline.
+
+    For each intent in intents.md, checks presence in compose.py,
+    phase.md, execution.md, assessment.md, handoff.md.
+    Returns list of dicts with per-step presence and survival_rate.
+    """
+    intents_path = milestone_dir / "intents.md"
+    if not intents_path.exists():
+        return []
+    try:
+        intents_text = intents_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    intent_ids = list(dict.fromkeys(_INTENT_RE.findall(intents_text)))
+    if not intent_ids:
+        return []
+
+    step_files: dict[str, list[Path]] = {}
+    for step_name, pattern in _PIPELINE_STEPS:
+        if "*" in pattern:
+            step_files[step_name] = sorted(milestone_dir.glob(pattern))
+        else:
+            p = milestone_dir / pattern
+            step_files[step_name] = [p] if p.exists() else []
+
+    step_names = [s for s, _ in _PIPELINE_STEPS]
+    results: list[dict[str, Any]] = []
+    for iid in intent_ids:
+        row: dict[str, Any] = {"intent_id": iid}
+        present_count = 0
+        for step_name in step_names:
+            hit = _intent_in_files(iid, step_files[step_name])
+            row[step_name] = hit
+            if hit:
+                present_count += 1
+        row["survival_rate"] = round(present_count / len(step_names), 3)
+        results.append(row)
+    return results
+
+
+def _identify_bottleneck(results: list[dict[str, Any]]) -> str:
+    """Find which pipeline step loses the most intents."""
+    steps = [s for s, _ in _PIPELINE_STEPS]
+    survival_per_step = {
+        step: sum(1 for r in results if r[step]) / len(results)
+        for step in steps
+    }
+    return min(survival_per_step, key=survival_per_step.get)  # type: ignore[arg-type]
+
+
+def emit_channel_capacity(milestone_dir: Path, milestone: str) -> None:
+    """Measure and emit intent survival telemetry."""
+    results = measure_intent_survival(milestone_dir)
+    if not results:
+        return
+    avg_survival = sum(r["survival_rate"] for r in results) / len(results)
+    event(
+        "channel_capacity.measured",
+        milestone=milestone,
+        intent_count=len(results),
+        avg_survival_rate=round(avg_survival, 3),
+        bottleneck_step=_identify_bottleneck(results),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Training distribution distance — heuristic proxy (DB-20 Step 8)
+# ---------------------------------------------------------------------------
+
+
+def compute_distribution_distance(
+    validation_retries: int,
+    milestone: str,
+    telemetry_path: Path | None = None,
+) -> dict[str, Any]:
+    """Compute a proxy for training distribution distance.
+
+    Uses validation retry count as primary signal.
+    Returns: {distance: float, confidence: str, recommendation: str}
+    """
+    if validation_retries == 0:
+        distance = 0.0
+    elif validation_retries == 1:
+        distance = 0.3
+    elif validation_retries == 2:
+        distance = 0.6
+    else:
+        distance = min(1.0, 0.3 * validation_retries)
+
+    recommendation = "standard"
+    if distance > 0.6:
+        recommendation = "conservative: reduce gather() group sizes, add intermediate verification"
+    elif distance > 0.3:
+        recommendation = "cautious: enrich phase.md with additional context"
+
+    return {
+        "distance": round(distance, 2),
+        "confidence": "low",
+        "recommendation": recommendation,
+    }
+
+
+def emit_distribution_distance(
+    milestone: str,
+    validation_retries: int,
+    telemetry_path: Path | None = None,
+) -> None:
+    """Emit distribution distance telemetry after PLAN cycle."""
+    result = compute_distribution_distance(
+        validation_retries, milestone, telemetry_path,
+    )
+    event(
+        "distribution_distance.computed",
+        milestone=milestone,
+        validation_retries=validation_retries,
+        **result,
+    )
