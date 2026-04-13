@@ -41,21 +41,26 @@ quality — that is ASSESS's job.
 
 5. Agent briefing template for each spawned worker:
 
+   For gather() groups, each worker's phase directory matches its
+   function name in compose.py. Worker for `pipeline_completion`
+   reads phases/pipeline_completion/phase.md, worker for
+   `protocol_lifecycle` reads phases/protocol_lifecycle/phase.md, etc.
+
    For gather() groups (>1 task in the layer), include the shard path:
    ```
    You are implementing `{function_name}` for milestone
-   '{milestone}', phase '{phase}'.
+   '{milestone}', phase '{function_name}'.
 
    Read your protocol file: .clou/prompts/worker.md
 
    Then read these files:
    - .clou/milestones/{milestone}/compose.py — find your function
      signature `{function_name}`. Your criteria are in the docstring.
-   - .clou/milestones/{milestone}/phases/{phase}/phase.md
+   - .clou/milestones/{milestone}/phases/{function_name}/phase.md
    - .clou/project.md — coding conventions
 
    Write results to:
-   - .clou/milestones/{milestone}/phases/{phase}/execution-{task_slug}.md
+   - .clou/milestones/{milestone}/phases/{function_name}/execution-{task_slug}.md
 
    Write execution.md incrementally as you complete work.
    ```
@@ -63,20 +68,30 @@ quality — that is ASSESS's job.
    For serial tasks (single-task layer), use the standard path:
    ```
    You are implementing `{function_name}` for milestone
-   '{milestone}', phase '{phase}'.
+   '{milestone}', phase '{function_name}'.
 
    Read your protocol file: .clou/prompts/worker.md
 
    Then read these files:
    - .clou/milestones/{milestone}/compose.py — find your function
      signature `{function_name}`. Your criteria are in the docstring.
-   - .clou/milestones/{milestone}/phases/{phase}/phase.md
+   - .clou/milestones/{milestone}/phases/{function_name}/phase.md
    - .clou/project.md — coding conventions
 
    Write results to:
-   - .clou/milestones/{milestone}/phases/{phase}/execution.md
+   - .clou/milestones/{milestone}/phases/{function_name}/execution.md
 
    Write execution.md incrementally as you complete work.
+   ```
+
+   If the DAG Context includes an intent mapping for the function,
+   append the intent IDs to the worker briefing:
+   ```
+   Your task addresses these intents: {intent_ids}
+   Structure your execution.md with per-intent sections:
+   ## {intent_id}: {one-line description}
+   Status: [implemented | in-progress | blocked]
+   {details}
    ```
 
 6. After all tasks complete:

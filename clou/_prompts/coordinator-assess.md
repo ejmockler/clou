@@ -7,19 +7,17 @@ Determine: rework needed, phase complete, or escalation required.
 </objective>
 
 <procedure>
-1. Read execution.md for the current phase — summary first, then tasks.
-1b. If execution.md shows partial gather() completion (some tasks
-    succeeded, some failed/aborted):
-    - Identify which tasks succeeded and evaluate their output normally.
-    - For failed tasks: read the failure record (failure type, error,
-      dependency impact). Assess whether the failure is recoverable
-      (rework) or structural (escalation).
-    - For aborted tasks: these were stopped because a dependency failed.
-      They are not evaluated — they will re-execute after the dependency
-      is fixed.
-    - The rework plan should address root causes (failed tasks) not
-      symptoms (aborted tasks).
-2. Compare each task's results against its criteria in compose.py.
+1. Read assessment.md — classified findings from the brutalist and
+   evaluator dispatches. This is your primary input.
+   
+   The brutalist read execution.md and compose.py. The evaluator
+   classified findings against requirements.md and intents.md.
+   You evaluate their CLASSIFIED output, not raw artifacts.
+
+2. Read the Routing Context section in your prompt — it provides
+   current_layer, next_phase, phases_completed, and phases_total
+   computed by the orchestrator from compose.py. Use these for
+   phase advancement decisions. Do not re-derive from source.
 
 3. Dispatch the brutalist (read-only agent). The brutalist discovers
    findings — it cannot evaluate, soften, or dismiss its own output.
@@ -47,6 +45,14 @@ Determine: rework needed, phase complete, or escalation required.
 
    Do not soften, summarize, or editorialize. Every finding from
    every tool goes into assessment.md exactly as returned.
+
+   If the cycle prompt includes an Intent mapping, pass it to the
+   brutalist so it can evaluate per-intent without re-deriving from
+   compose.py. Example: Intent mapping: {"task_name": ["I1", "I3"]}
+
+   If execution.md contains per-intent sections (## I1, ## I3, etc.),
+   evaluate each intent separately. Report findings per-intent so
+   the coordinator can make targeted rework decisions.
    ```
 
 4. Dispatch the assessor-evaluator. The evaluator classifies findings
@@ -106,13 +112,14 @@ Determine: rework needed, phase complete, or escalation required.
    Cross-model agreement strengthens the case. Single-model findings
    deserve more scrutiny.
 
-8. Call clou_write_checkpoint:
+8. Write checkpoint (path in cycle prompt):
      cycle: {current cycle number}
      step: ASSESS
      next_step: {see routing below}
-     current_phase: {current or next phase name}
-     phases_completed: {updated count}
-     phases_total: {total phase count}
+     current_phase: {from routing context: next_phase if advancing,
+                     or current if rework needed}
+     phases_completed: {from routing context + layer_size if advancing}
+     phases_total: {from routing context}
 
    next_step routing:
    - If rework needed: next_step: EXECUTE (rework)
@@ -121,7 +128,7 @@ Determine: rework needed, phase complete, or escalation required.
    - If all phases complete: next_step: VERIFY
    - If blocked: write escalation, next_step depends on severity.
 
-9. Call clou_update_status with phase progress.
+9. Update status.md with phase progress.
 </procedure>
 
 <schemas>

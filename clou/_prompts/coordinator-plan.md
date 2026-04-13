@@ -20,44 +20,66 @@ phase specifications and initial status.
    Ignore fading and archived patterns — only active patterns
    enter your planning context.
 
-6. Decompose into phases. Each phase is a coherent unit of work:
-   - Keep phases small enough to complete in one EXECUTE cycle.
-   - Dependent phases are sequential — typed inputs from prior phases.
-   - Minimum 3 substantive phases (excluding verification) — no
-     two-node milestones. If the work looks like two phases, you
-     haven't decomposed far enough.
-   - Context budget: each agent dispatch has a 200k token window.
-     If a phase requires reading more than 15 source files or running
-     more than 3 distinct test suites, decompose it further. Large
-     phases risk mid-cycle context exhaustion, forcing a costly
-     checkpoint-and-restart. Prefer two focused phases over one broad
-     phase that reads the entire codebase.
+6. Identify tasks — FLAT SET, NO ORDERING.
+   List every distinct unit of work the milestone requires.
+   Output them as an UNORDERED set — do not reason about
+   dependencies, ordering, or topology at this stage.
+   
+   For each task, specify:
+   - A name (function name for compose.py)
+   - A one-line success criterion
+   - A resource estimate (tokens, timeout)
+   - Which intent(s) it addresses
+   
+   Constraints on each task:
+   - Small enough to complete in one EXECUTE cycle.
+   - Context budget: 200k token window per agent. If a task requires
+     reading >15 source files or running >3 test suites, split it.
+   - Minimum 3 substantive tasks (excluding verification). If the
+     work looks like two tasks, you haven't decomposed far enough.
 
-   Width-first decomposition — start with "what work is independent?"
-   not "what order should things happen?"
+   CRITICAL: Do not think about what depends on what yet.
+   Just enumerate what work exists. The topology comes in step 7.
 
-   a. Identify independent workstreams first: changes to different
-      files or modules that don't read each other's outputs. Each is
-      a candidate for parallel execution via gather().
-   b. Then add ordering constraints only where data flow demands it:
-      a phase needs the typed output of another, or an environmental
-      requirement (service must be running, database must exist).
-   c. gather() is the default — serialization requires explicit
-      justification (data dependency or environmental requirement).
-      If you cannot name what data flows between two phases, they
-      belong in a gather() group.
-   d. Reason about critical path: which sequential chain determines
-      wall-clock time? Pull work out of that chain when possible.
-   e. Balance gather() groups: tasks in a group should be roughly
-      equal effort — one dominant task makes the others wait.
+7. Determine topology — ANALYZE THE TASK SET from step 6.
+   Now, and only now, reason about dependencies.
+   
+   For each PAIR of tasks from your step 6 list, ask:
+   does task B need to READ an artifact that task A produces?
+   Not "does B come after A" — that is ordering bias.
+   Does B literally require a typed output from A?
+
+   a. If B does not need A's output, they are independent.
+      They belong in a gather() group.
+   b. If B needs A's output, the dependency is genuine.
+      B takes A's return type as a parameter.
+   c. If you cannot name the specific artifact that flows
+      from A to B, they are independent. Do not create a
+      wrapper type to justify serialization.
+   d. Reason about critical path: which sequential chain
+      determines wall-clock time? Pull work out of that
+      chain when possible.
+   e. Balance gather() groups: tasks in a group should be
+      roughly equal effort.
    f. When NOT to parallelize — a narrow graph is correct when:
       - The scope is single-dimensional (one file, one concern).
       - All changes depend on each other serially.
       - The milestone is simple enough that multi-agent overhead
         outweighs the parallelism benefit.
       A narrow graph for a simple milestone is a feature, not a failure.
+   g. Density awareness: the sparsest adequate graph is optimal.
 
-7. Write compose.py — typed-function call graph.
+   SELF-CHECK: Compare your topology against your step 6 task set.
+   If all tasks were independent in step 6 but you created serial
+   dependencies in step 7, justify each dependency with a specific
+   named artifact that flows between them. If you cannot, restructure
+   into gather().
+   
+   The validator rejects serial chains where every intermediate type
+   is single-use (produced once, consumed once). This is the
+   structural signature of fabricated dependencies.
+
+8. Write compose.py — typed-function call graph.
    Narrow graph (serial dependencies):
    ```python
    async def implement_auth(user_model: UserModel) -> AuthService:
@@ -110,29 +132,21 @@ phase specifications and initial status.
    - gather() expresses independence — tasks in a group run in parallel.
    - Only awaited calls in execute() are dispatched — helpers are structural.
 
-8. Write phase specs: .clou/milestones/{milestone}/phases/{phase}/phase.md
+9. Write phase specs: .clou/milestones/{milestone}/phases/{phase}/phase.md
    for each phase. Include: scope, relevant context, what the agent
    needs to know about the domain.
 
-9. Call clou_update_status to write initial status.md:
-   - phase: {first phase name}
-   - cycle: 1
-   - next_step: EXECUTE
-   - phase_progress: {all phases mapped to "pending"}
+10. Write initial status.md with all phases listed as pending.
 
-10. Write decisions.md entry for PLAN cycle with decomposition reasoning.
+11. Write decisions.md entry for PLAN cycle with decomposition reasoning.
 
-11. Call clou_write_checkpoint:
+12. Write checkpoint (path in cycle prompt above):
    - cycle: 1
    - step: PLAN
    - next_step: EXECUTE
    - current_phase: {first phase name}
    - phases_completed: 0
    - phases_total: {count}
-
-Protocol tools: Use clou_write_checkpoint and clou_update_status for
-checkpoint and status files. These tools guarantee correct format.
-Use Write/Edit only for narrative files (decisions.md, phase specs).
 </procedure>
 
 <schemas>
@@ -140,6 +154,21 @@ Use Write/Edit only for narrative files (decisions.md, phase specs).
 compose.py: typed async functions + execute() entry point.
 Validated by orchestrator via AST parsing (graph.py). Checks:
 well-formedness, completeness, acyclicity, type compatibility.
+
+status.md:
+```
+# Status: {milestone}
+## Current State
+phase: {name}
+cycle: 1
+last_updated: {ISO timestamp}
+## Phase Progress
+| Phase | Status | Summary |
+|---|---|---|
+| {name} | pending | — |
+## Notes
+- Plan created cycle 1
+```
 
 </schemas>
 

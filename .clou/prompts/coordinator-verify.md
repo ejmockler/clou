@@ -17,6 +17,10 @@ handoff.
    - Key raw artifacts (snapshots, screenshots, response bodies)
    - Observable outcomes from intents.md
    Quality gate experience assessment is structural — it always runs.
+   If the quality gate is unavailable, the assessor falls back to
+   degraded internal review (see assessor.md). Evaluate degraded
+   findings identically to gate findings. Log the degraded
+   classification in decisions.md.
 5. Evaluate quality gate findings against intents.md scope.
 6. For each finding, decide and log in decisions.md:
    - Accept (code issue): create rework EXECUTE task. Log finding,
@@ -27,7 +31,7 @@ handoff.
      action, reasoning.
    - Override: no changes. Log finding, reasoning for override.
    - Escalate: issue beyond coordinator authority.
-7. Write checkpoint (path in cycle prompt):
+7. Call clou_write_checkpoint:
      cycle: {current cycle number}
      step: VERIFY
      next_step: {see routing below}
@@ -41,7 +45,7 @@ handoff.
    - If perception gap: next_step: EXECUTE (additional verification)
    - If all criteria satisfied: next_step: EXIT
    - If blocked: write escalation, next_step depends on severity.
-8. Update status.md with verification progress.
+8. Call clou_update_status with verification progress.
 </procedure>
 
 <schemas>

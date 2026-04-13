@@ -34,11 +34,9 @@ quality gate assessments resolved.
    - Manual Steps section (only if some verification was non-automatable,
      each step documents WHY)
 
-5. Write final status.md:
-   - All phases: completed
-   - Milestone status: completed
+5. Call clou_update_status with all phases set to "completed".
 
-6. Write final checkpoint (path in cycle prompt):
+6. Call clou_write_checkpoint:
      cycle: {current cycle number}
      step: EXIT
      next_step: COMPLETE

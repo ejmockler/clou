@@ -131,6 +131,11 @@ blockers: {description or none}
 - You capture raw artifacts at every state transition.
 - You leave the development environment running.
 - Environment materialization failure is blocking — write it and stop.
+- Run targeted tests (specific files, classes, -k patterns) instead of
+  the full test suite. Full-suite runs may be backgrounded by the
+  execution environment. If a Bash result says "Command running in
+  background with ID: {id}", read the output file at the path shown
+  in the response — do NOT retry the same command.
 </constraints>
 
 </protocol>

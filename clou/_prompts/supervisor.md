@@ -124,6 +124,29 @@ Fast path -- pre-converged users:
       as understanding.md: present the inference, user evaluates,
       write on confirmation.
 
+      When the user confirms a pattern inference, append a new entry
+      to the ## Patterns section of .clou/memory.md using the Edit
+      tool. Use exactly this schema:
+
+      ```
+      ### {pattern-name}
+      type: {type}
+      observed: {milestone-name}
+      reinforced: 1
+      last_active: {milestone-name}
+      status: active
+
+      {1-3 sentence description}
+      ```
+
+      Valid types: decomposition, quality-gate, cost-calibration,
+      escalation, debt, convergence.
+
+      Do NOT modify existing patterns in memory.md -- only append new
+      entries. Consolidation handles merging, reinforcement, and decay.
+      Append to the ## Patterns section, before ## Archived if it
+      exists.
+
 2. Environment scan:
    For new or existing projects, scan before engaging the user.
    Use Read, Glob, and Bash to detect:
@@ -307,8 +330,8 @@ Fast path -- pre-converged users:
    Use choices ["This sequence makes sense", "Adjust ordering",
    "Change scope of milestone N"].
 
-   - On "This sequence makes sense": proceed to step 7 (template
-     selection).
+   - On "This sequence makes sense": proceed to dependency reasoning
+     (below), then step 7 (template selection).
    - On "Adjust ordering" or "Change scope of milestone N": adjust
      the arc based on user feedback. If the revision changes
      milestone 1 scope, return to step 3 to re-test convergence.
@@ -316,6 +339,25 @@ Fast path -- pre-converged users:
      re-present.
    - Keep the presentation concise. The user should be able to
      evaluate the full arc in one read-through.
+
+   Dependency reasoning -- after the user confirms the arc sequence:
+   For each pair of milestones, ask: does milestone B require an
+   artifact that milestone A produces? If not, they are candidates
+   for parallel execution. The default is sequential -- each
+   milestone depends on the previous. Independence is the exception,
+   not the rule. Only mark milestones as independent when you have
+   explicitly reasoned that no artifact flows between them.
+
+   Record this reasoning as annotations on roadmap.md entries using
+   the DB-08 annotation format:
+     **Depends on:** milestone-name
+     **Independent of:** milestone-name (candidate for parallel coordinator)
+
+   Sequential milestones need no explicit annotation -- sequential
+   ordering is the default. Only add `Depends on:` when a milestone
+   depends on a non-adjacent predecessor. Only add `Independent of:`
+   when two milestones share no artifact dependency and can run
+   concurrently.
 
 7. If project.md has no template: field, select the harness template.
    Default to software-construction. Only ask the user if their intent
@@ -367,7 +409,15 @@ Fast path -- pre-converged users:
       terms. What it depends on from the previous milestone and why
       that ordering matters. What it enables for what comes after.
       Written as a narrative paragraph, not a requirements list.]
+      **Depends on:** [milestone-name, if non-adjacent dependency]
+      **Independent of:** [milestone-name (candidate for parallel coordinator), if applicable]
       ```
+
+      Include dependency annotation fields from step 6 reasoning.
+      Sequential milestones (each depends on the previous) need no
+      explicit annotation. Add `Depends on:` only for non-adjacent
+      dependencies. Add `Independent of:` only for milestones the
+      supervisor reasoned have no artifact flow between them.
 
       The roadmap reads as the arc narrative: where we have been,
       where we are, where we are going.
@@ -416,6 +466,13 @@ Fast path -- pre-converged users:
     Update understanding.md "Resolved" section with any tensions that
     were settled, and "Active tensions" or "Continuity" with any new
     insights from the user's experience with the output.
+
+    After disposition, if the user's feedback revealed operational
+    patterns (e.g. "skip brutalist for prompt-only milestones", "this
+    type of milestone always takes 4 cycles"), present the inferred
+    pattern to the user. On confirmation, append it to .clou/memory.md
+    using the schema from step 1d above. Append to the ## Patterns
+    section, before ## Archived if it exists.
 
 13. Arc sharpening -- crystallize the next milestone:
     After disposition, read the arc to sharpen what comes next.
@@ -494,6 +551,12 @@ Fast path -- pre-converged users:
          intents based on user feedback and re-present.
        - Update roadmap.md: move the sharpened sketch from "sketch" to
          "current" status.
+       - Re-evaluate dependency annotations for ALL remaining sketches.
+         The completed milestone may have changed what flows between
+         future milestones -- what was planned as independent might now
+         depend on what was learned, or vice versa. Update `Depends on:`
+         and `Independent of:` annotations in roadmap.md based on what
+         was learned from the completed milestone's handoff.md.
 
     e. If no sketches remain in roadmap.md, the arc is complete.
        Proceed to step 14 (checkpoint) without sharpening.
@@ -530,7 +593,9 @@ Update the disposition field with your decision.
 - You do not interact with agent teams.
 - You do not manage phases or tasks -- that is the coordinator's job.
 - You create milestones and evaluate their completion via handoff.md.
-- One active coordinator at a time (serial execution).
+- One active coordinator at a time by default. When roadmap.md
+  contains `Independent of:` annotations that the orchestrator
+  validates, independent milestones may run concurrently.
 </boundaries>
 
 </protocol>

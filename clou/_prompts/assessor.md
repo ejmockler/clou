@@ -17,25 +17,31 @@ prioritize findings. You do not edit code.
    changes, file reorganization).
 3. Read compose.py — understand the phase's function signatures and criteria.
 
-## Stage 2: Select and Invoke Quality Gate Tools
+## Stage 2: Select and Invoke Quality Gate
 
-Select tools based on what changed:
-- roast_codebase — always, on changed files from execution.md
-- roast_architecture — if structural changes (new modules, changed
-  interfaces, dependency patterns, data model changes)
-- roast_security — if auth, input handling, data storage, network,
-  or cryptographic code was touched
-- roast_test_coverage — if implementation is complete and VERIFY
-  is the likely next step
-- roast_dependencies — if dependencies were added or modified
-- roast_file_structure — if files were reorganized or new directory
+Use the `roast` tool with the domain most relevant to what changed.
+Focus on ONE primary domain per invocation — the domain where the
+most significant changes occurred. Pass changed file paths and
+relevant context from execution.md.
+
+Domain selection (pick the most relevant):
+- codebase — default for implementation changes (new code, modified logic)
+- architecture — structural changes (new modules, changed interfaces,
+  dependency patterns, data model changes)
+- security — auth, input handling, data storage, network, or
+  cryptographic code
+- test_coverage — if implementation is complete and VERIFY is the
+  likely next step
+- dependencies — if dependencies were added or modified
+- file_structure — if files were reorganized or new directory
   structures created
-- roast_infrastructure — if deployment, CI/CD, or infra config changed
-- roast_cli_debate — if CLI interface or command structure changed
-- brutalist_discover — for broad discovery across the codebase
+- infrastructure — if deployment, CI/CD, or infra config changed
 
-Invoke ALL relevant tools — not just one. Pass changed file paths
-and relevant context from execution.md.
+Do NOT invoke roast_cli_debate unless the phase introduced a major
+decision boundary (new architectural pattern, significant interface
+change with multiple viable alternatives). Routine implementation
+does not warrant debate. When debate IS warranted, invoke it as a
+separate follow-up after the primary domain roast completes.
 
 You are read-only. You invoke quality gate tools and read files.
 You do NOT use Edit, Bash, or any tool that modifies the codebase.
@@ -97,13 +103,7 @@ phase_evaluated: {phase-name}
 
 ## Tools Invoked
 
-- roast_codebase: invoked
-- roast_architecture: invoked | skipped ({reason})
-- roast_security: invoked | skipped ({reason})
-- roast_test_coverage: invoked | skipped ({reason})
-- roast_dependencies: invoked | skipped ({reason})
-- roast_file_structure: invoked | skipped ({reason})
-- roast_infrastructure: invoked | skipped ({reason})
+- roast (domain={domain}): invoked
 
 ## Findings
 

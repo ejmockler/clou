@@ -9,8 +9,9 @@ quality — that is ASSESS's job.
 <procedure>
 1. Read the DAG Context section in your prompt — it provides task names,
    dependencies, and parallel groupings extracted from compose.py. Then
-   read compose.py for function signatures and docstrings.
-2. Read phase.md — narrative context for agent briefings.
+   read compose.py for function signatures and one-line criteria.
+2. Read phase.md — the agent's complete briefing (scope, files,
+   patterns, edge cases, detailed criteria).
 3. Note the current phase from the cycle prompt context.
 
 4. Dispatch loop — use DAG layers for ordering:
@@ -19,22 +20,48 @@ quality — that is ASSESS's job.
    dispatch them as a gather() group. Tasks in later layers depend on
    earlier layers — dispatch them after their dependencies complete.
 
-   a. gather() group (tasks in same layer):
+   a. gather() group (tasks in same layer, >1 task):
       - Spawn one agent per function simultaneously.
+      - Each worker writes to its own shard file (see briefing template).
       - Monitor TaskNotificationMessages.
-      - CIRCUIT BREAKER: if any member fails, abort remaining
-        members. Preserve all execution.md entries. Write checkpoint
-        (see step 6) with next_step: ASSESS. Exit.
+      - SELECTIVE ABORT: if any member fails, compute which remaining
+        tasks transitively depend on the failed task using the DAG deps.
+        Abort only those dependents. Let independent siblings continue.
+        If ALL remaining tasks depend on the failed task, write
+        checkpoint (see step 6) with next_step: ASSESS and exit.
+      - After all agents finish: merge shards into unified execution.md.
       - Collect all completion states.
 
    b. Sequential task (single-task layer):
       - Spawn one agent.
+      - Worker writes directly to execution.md (no sharding).
       - On completion: read execution.md summary status line.
       - CIRCUIT BREAKER: if failures or blockers detected, write
         checkpoint (see step 6) with next_step: ASSESS. Exit.
       - If clean: proceed to next layer.
 
 5. Agent briefing template for each spawned worker:
+
+   For gather() groups (>1 task in the layer), include the shard path:
+   ```
+   You are implementing `{function_name}` for milestone
+   '{milestone}', phase '{phase}'.
+
+   Read your protocol file: .clou/prompts/worker.md
+
+   Then read these files:
+   - .clou/milestones/{milestone}/compose.py — find your function
+     signature `{function_name}`. Your criteria are in the docstring.
+   - .clou/milestones/{milestone}/phases/{phase}/phase.md
+   - .clou/project.md — coding conventions
+
+   Write results to:
+   - .clou/milestones/{milestone}/phases/{phase}/execution-{task_slug}.md
+
+   Write execution.md incrementally as you complete work.
+   ```
+
+   For serial tasks (single-task layer), use the standard path:
    ```
    You are implementing `{function_name}` for milestone
    '{milestone}', phase '{phase}'.
@@ -54,8 +81,8 @@ quality — that is ASSESS's job.
    ```
 
 6. After all tasks complete:
-   - Update status.md phase progress.
-   - Write checkpoint (path in cycle prompt):
+   - Call clou_update_status with current phase progress.
+   - Call clou_write_checkpoint:
      cycle: {current cycle number}
      step: EXECUTE
      next_step: ASSESS

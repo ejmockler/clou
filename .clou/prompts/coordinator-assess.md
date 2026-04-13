@@ -8,6 +8,17 @@ Determine: rework needed, phase complete, or escalation required.
 
 <procedure>
 1. Read execution.md for the current phase — summary first, then tasks.
+1b. If execution.md shows partial gather() completion (some tasks
+    succeeded, some failed/aborted):
+    - Identify which tasks succeeded and evaluate their output normally.
+    - For failed tasks: read the failure record (failure type, error,
+      dependency impact). Assess whether the failure is recoverable
+      (rework) or structural (escalation).
+    - For aborted tasks: these were stopped because a dependency failed.
+      They are not evaluated — they will re-execute after the dependency
+      is fixed.
+    - The rework plan should address root causes (failed tasks) not
+      symptoms (aborted tasks).
 2. Compare each task's results against its criteria in compose.py.
 
 3. Dispatch the brutalist (read-only agent). The brutalist discovers
@@ -20,11 +31,12 @@ Determine: rework needed, phase complete, or escalation required.
    You CANNOT evaluate findings, dismiss findings, or edit code.
    You have only read-only tools + quality gate MCP tools.
 
-   Invoke these quality gate tools:
-   - roast_codebase
-   - roast_architecture
-   - roast_security
-   - (any other available quality gate tools)
+   Invoke the `roast` tool with the ONE domain most relevant to
+   what changed. Pick from: codebase, architecture, security,
+   test_coverage, dependencies, file_structure, infrastructure.
+
+   Do NOT invoke roast_cli_debate — debate is reserved for major
+   architectural decision boundaries, not routine assessment.
 
    Read these files for context:
    - .clou/milestones/{{milestone}}/phases/{{phase}}/execution.md
@@ -95,7 +107,7 @@ Determine: rework needed, phase complete, or escalation required.
    Cross-model agreement strengthens the case. Single-model findings
    deserve more scrutiny.
 
-8. Write checkpoint (path in cycle prompt):
+8. Call clou_write_checkpoint:
      cycle: {current cycle number}
      step: ASSESS
      next_step: {see routing below}
@@ -105,12 +117,18 @@ Determine: rework needed, phase complete, or escalation required.
 
    next_step routing:
    - If rework needed: next_step: EXECUTE (rework)
+   - If the SAME task has been reworked 2+ times at the same
+     granularity (check decisions.md for prior rework cycles on
+     this phase): next_step: REPLAN
+     Repeated rework on the same task signals the task scope is
+     too broad — re-decomposition will split it into finer sub-tasks
+     rather than retrying at the same granularity.
    - If phase complete and more phases remain: advance current_phase,
      increment phases_completed, next_step: EXECUTE
    - If all phases complete: next_step: VERIFY
    - If blocked: write escalation, next_step depends on severity.
 
-9. Update status.md with phase progress.
+9. Call clou_update_status with phase progress.
 </procedure>
 
 <schemas>
