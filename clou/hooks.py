@@ -1,12 +1,14 @@
 """Hook enforcement for Clou's orchestrator.
 
-Two enforcement mechanisms:
+Three enforcement mechanisms:
 1. Write boundary enforcement (PreToolUse) — each tier can only write
    to specific .clou/ paths.
 2. Artifact validation (PostToolUse) — after any tier writes to a
    golden context artifact, validate its form.  compose.py gets AST
    validation (structural tier); formed artifacts (e.g. intents.md)
    get ArtifactForm validation (narrative tier, DB-14).
+3. Transcript capture (PostToolUse) — coordinator-tier only, captures
+   all subagent tool calls into TranscriptStore for UI inspection.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-from clou.graph import validate
+from clou.graph import validate, validate_coverage
 
 type HookCallback = Callable[..., Awaitable[dict[str, Any]]]
 
@@ -289,9 +291,30 @@ def _make_post_hook(
             except OSError:
                 _log.warning("PostToolUse: cannot read %s for validation", resolved)
                 return _PASS
-            errors = validate(source)
+            # Read intents.md early — used for both structural validation
+            # (width proportionality) and intent coverage checking.
+            intents_path = resolved.parent / "intents.md"
+            intents_source_text: str | None = None
+            if intents_path.is_file():
+                try:
+                    intents_source_text = intents_path.read_text()
+                except OSError:
+                    _log.warning(
+                        "PostToolUse: cannot read %s", intents_path,
+                    )
+
+            all_results = validate(
+                source, intents_source=intents_source_text,
+            )
+            # Separate structural errors from advisory warnings.
+            # Advisory warnings are informational and should not
+            # trigger "Fix the call graph." rejection.
+            # Severity is carried by ValidationResult, not inferred
+            # from message substrings.
+            errors = [r for r in all_results if r.severity == "error"]
+            advisories = [r for r in all_results if r.severity == "advisory"]
             if errors:
-                error_list = "\n".join(errors)
+                error_list = "\n".join(r.message for r in errors)
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "PostToolUse",
@@ -302,6 +325,61 @@ def _make_post_hook(
                         ),
                     }
                 }
+
+            # Structural validation passed — check intent coverage.
+            if intents_source_text is not None:
+                coverage_results = validate_coverage(
+                    source, intents_source_text,
+                )
+                # Separate coverage errors from advisory feedback.
+                # Advisory messages (untraced tasks, missing docstrings)
+                # should not trigger "Intent-coverage errors." rejection.
+                # Severity is carried by ValidationResult.
+                coverage_errors = [
+                    r for r in coverage_results
+                    if r.severity == "error"
+                ]
+                if coverage_errors:
+                    error_list = "\n".join(
+                        f"- {r.message}" for r in coverage_errors
+                    )
+                    ctx = (
+                        "Intent-coverage errors:\n"
+                        + error_list
+                        + "\nVerify compose.py covers all intents."
+                    )
+                    # Append topology advisories if any.
+                    if advisories:
+                        adv_list = "\n".join(
+                            f"- {a.message}" for a in advisories
+                        )
+                        ctx += (
+                            "\n\nTopology advisories:\n"
+                            + adv_list
+                        )
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PostToolUse",
+                            "additionalContext": ctx,
+                        }
+                    }
+
+            # No structural errors, no coverage errors.
+            # Surface topology advisories as non-blocking feedback.
+            if advisories:
+                adv_list = "\n".join(f"- {a.message}" for a in advisories)
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse",
+                        "additionalContext": (
+                            "Topology advisories (non-blocking):\n"
+                            + adv_list
+                            + "\nConsider whether wider decomposition "
+                            "is appropriate for this milestone's scope."
+                        ),
+                    }
+                }
+
             return _PASS
 
         # --- Formed artifacts: ArtifactForm validation (narrative tier) ---
@@ -335,6 +413,68 @@ def _make_post_hook(
         }
 
     return post_hook
+
+
+def _make_transcript_hook() -> HookCallback:
+    """Create a PostToolUse hook that captures tool calls to TranscriptStore.
+
+    Uses ``matcher=None`` to capture ALL tool calls (reads, writes, shell,
+    etc.), not just write tools like the existing PostToolUse hook.
+
+    Only subagent tool calls are recorded (those with a truthy ``agent_id``
+    in the hook input).  The coordinator's own tool calls do not carry
+    ``agent_id`` and are silently skipped.
+    """
+    from clou.transcript import (
+        TranscriptEntry,
+        get_store,
+        truncate_input,
+        truncate_output,
+    )
+
+    _PASS: dict[str, Any] = {
+        "hookSpecificOutput": {"hookEventName": "PostToolUse"},
+    }
+
+    async def transcript_hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        # Only capture subagent tool calls (agent_id present).
+        agent_id = input_data.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            return _PASS
+
+        tool_name = input_data.get("tool_name", "")
+        tool_input = input_data.get("tool_input", {})
+        tool_response = input_data.get("tool_response")
+
+        # Normalize tool_response to string and truncate.
+        if tool_response is None:
+            response_str = ""
+        elif isinstance(tool_response, str):
+            response_str = tool_response
+        else:
+            response_str = str(tool_response)
+
+        response_str = truncate_output(response_str)
+
+        import time
+
+        entry = TranscriptEntry(
+            tool_name=str(tool_name),
+            tool_input=truncate_input(tool_input) if isinstance(tool_input, dict) else {},
+            tool_response=response_str,
+            timestamp=time.monotonic(),
+            tool_use_id=str(tool_use_id or ""),
+        )
+
+        store = get_store()
+        store.record(agent_id, entry)
+        return _PASS
+
+    return transcript_hook
 
 
 def _scoped_permissions(
@@ -373,6 +513,37 @@ AGENT_TIER_MAP: dict[str, str] = {
     "brutalist": "brutalist",
     "assess-evaluator": "assess-evaluator",
 }
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator cleanup scope — separate from agent tier write permissions.
+# These patterns define which .clou/ root-level files the orchestrator is
+# allowed to delete when processing handoff.md obsolete-file flags.
+# ---------------------------------------------------------------------------
+
+CLEANUP_SCOPE: tuple[str, ...] = (
+    "*.example",    # example/template files
+    "*.bak",        # backup files
+    "*.old",        # renamed-aside files
+)
+
+
+def is_cleanup_allowed(relative_path: str) -> bool:
+    """Check if a flagged path is within the orchestrator's cleanup scope.
+
+    Args:
+        relative_path: Path relative to ``.clou/`` (e.g., ``"roadmap.py.example"``).
+
+    Returns:
+        True if the path matches :data:`CLEANUP_SCOPE` patterns and is a
+        root-level file (no directory separators).
+    """
+    if not relative_path:
+        return False
+    # Only root-level files — no nested paths.
+    if "/" in relative_path or "\\" in relative_path:
+        return False
+    return any(fnmatch.fnmatch(relative_path, pat) for pat in CLEANUP_SCOPE)
 
 
 def build_hooks(
@@ -437,6 +608,16 @@ def build_hooks(
             ),
         ],
     }
+
+    # Transcript capture: coordinator-only, matcher=None captures ALL tools.
+    # Additive alongside the artifact validation PostToolUse hook above.
+    if tier == "coordinator":
+        hooks["PostToolUse"].append(
+            HookConfig(
+                matcher=None,
+                hooks=[_make_transcript_hook()],
+            ),
+        )
 
     return hooks
 

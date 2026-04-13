@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING
 from clou.golden_context import (
     PHASE_STATUSES as _PHASE_STATUSES,
     TASK_STATUSES as _TASK_STATUSES,
+    VALID_CYCLE_OUTCOMES as _VALID_CYCLE_OUTCOMES,
     VALID_NEXT_STEPS as _VALID_NEXT_STEPS,
     VALID_STEPS as _VALID_STEPS,
 )
@@ -103,7 +104,8 @@ _CHECKPOINT_OPTIONAL_KEYS = frozenset(
     {
         "step", "current_phase", "phase", "phases_completed", "phases_total",
         "validation_retries", "readiness_retries", "crash_retries",
-        "staleness_count",
+        "staleness_count", "cycle_outcome",
+        "valid_findings", "consecutive_zero_valid",
     }
 )
 _CHECKPOINT_ALIASES: dict[str, str] = {"phase": "current_phase"}
@@ -476,6 +478,19 @@ def validate_checkpoint(content: str) -> list[ValidationFinding]:
                 message=(
                     f"invalid next_step '{fields['next_step']}' "
                     f"(expected one of: {', '.join(sorted(_VALID_NEXT_STEPS))})"
+                ),
+                path=prefix,
+            )
+        )
+
+    # Enum: cycle_outcome (only validate when present -- backward-compatible)
+    if "cycle_outcome" in fields and fields["cycle_outcome"] not in _VALID_CYCLE_OUTCOMES:
+        findings.append(
+            ValidationFinding(
+                severity=Severity.WARNING,
+                message=(
+                    f"invalid cycle_outcome '{fields['cycle_outcome']}' "
+                    f"(expected one of: {', '.join(sorted(_VALID_CYCLE_OUTCOMES))})"
                 ),
                 path=prefix,
             )

@@ -21,14 +21,37 @@ Decorator edges:
 
 Public API:
     validate(source: str) -> list[str]
+    get_colayer_tasks(source: str, task_name: str) -> list[str]
     compute_topology(source: str) -> dict[str, Any]
+
+Roadmap (DB-08 markdown) API:
+    parse_roadmap_annotations(markdown: str) -> RoadmapGraph
+    validate_roadmap_annotations(graph: RoadmapGraph, ...) -> list[ValidationResult]
+    compute_independent_sets(graph: RoadmapGraph) -> list[list[str]]
 """
 
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass
 from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationResult:
+    """A typed validation result carrying severity and message.
+
+    Severity is ``"error"`` (blocking) or ``"advisory"`` (informational).
+    ``__str__`` returns the message for backward compatibility with code
+    that converts results to strings.
+    """
+
+    severity: str  # "error" or "advisory"
+    message: str
+
+    def __str__(self) -> str:
+        return self.message
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +69,31 @@ class Sig:
     name: str
     params: tuple[tuple[str, str | None], ...]
     return_type: str | None
+    docstring: str | None = None
     resource_bounds: ResourceBounds | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MilestoneEntry:
+    """A single milestone parsed from roadmap.md."""
+
+    name: str
+    status: str
+    summary: str
+    depends_on: tuple[str, ...]
+    independent_of: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RoadmapGraph:
+    """Parsed roadmap.md milestone graph (DB-08 schema).
+
+    ``milestones`` maps milestone name to its entry.
+    ``order`` preserves the declaration order from roadmap.md.
+    """
+
+    milestones: dict[str, MilestoneEntry]
+    order: tuple[str, ...]
 
 
 # (func_name, [(position, variable_name)], [target_variable])
@@ -125,22 +172,114 @@ def extract_dag_data(
     return tasks, deps
 
 
-def validate(source: str) -> list[str]:
-    """Validate a compose.py call graph. Returns errors (empty = valid)."""
+def compute_layers(
+    tasks: list[dict[str, str]],
+    deps: dict[str, list[str]],
+) -> list[list[str]]:
+    """Group tasks into topological layers for parallel dispatch.
+
+    Layer 0 = tasks with no dependencies. Layer N = tasks whose
+    dependencies are all in layers < N. Tasks sorted alphabetically
+    within each layer for determinism.
+
+    Public API — used by prompts, UI, and telemetry modules.
+    """
+    from collections import deque
+
+    task_names = {t["name"] for t in tasks}
+    if not task_names:
+        return []
+
+    in_degree: dict[str, int] = {
+        name: sum(1 for d in deps.get(name, []) if d in task_names)
+        for name in task_names
+    }
+    dependents: dict[str, list[str]] = {name: [] for name in task_names}
+    for name in task_names:
+        for dep in deps.get(name, []):
+            if dep in task_names:
+                dependents[dep].append(name)
+
+    layers: list[list[str]] = []
+    queue: deque[str] = deque(n for n, d in in_degree.items() if d == 0)
+    assigned: set[str] = set()
+
+    while queue:
+        layer = sorted(queue)
+        layers.append(layer)
+        assigned.update(layer)
+        next_queue: deque[str] = deque()
+        for name in layer:
+            for dep in dependents[name]:
+                in_degree[dep] -= 1
+                if in_degree[dep] == 0:
+                    next_queue.append(dep)
+        queue = next_queue
+
+    # Handle cycles — append remaining tasks as final layer
+    remaining = sorted(task_names - assigned)
+    if remaining:
+        layers.append(remaining)
+
+    return layers
+
+
+def get_colayer_tasks(source: str, task_name: str) -> list[str]:
+    """Return all task names in the same DAG layer as *task_name*.
+
+    Parses compose.py *source*, computes layers, and returns all task
+    names sharing a layer with *task_name*.  Returns ``[task_name]`` on
+    parse failure or if *task_name* is not found in any layer.
+    """
+    try:
+        tasks, deps = extract_dag_data(source)
+    except Exception:
+        return [task_name]
+
+    # _compute_layers expects sigs: dict[str, Sig] — build a minimal
+    # mapping from the extract_dag_data task list.
+    sigs_map: dict[str, Sig] = {
+        t["name"]: Sig(t["name"], (), None, None) for t in tasks
+    }
+    if task_name not in sigs_map:
+        return [task_name]
+
+    layers = _compute_layers(sigs_map, deps)
+    for layer in layers:
+        if task_name in layer:
+            return layer
+    return [task_name]
+
+
+def validate(
+    source: str,
+    *,
+    intents_source: str | None = None,
+) -> list[ValidationResult]:
+    """Validate a compose.py call graph. Returns results (empty = valid).
+
+    Each result carries a ``severity`` (``"error"`` or ``"advisory"``)
+    so callers can distinguish blocking errors from informational warnings
+    without substring matching.
+
+    When *intents_source* is provided, also checks intent coverage
+    via ``validate_coverage()``.
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError as e:
-        return [f"Syntax error: {e}"]
+        return [ValidationResult("error", f"Syntax error: {e}")]
 
     sigs = _extract_sigs(tree)
-    errors: list[str] = []
+    errors: list[ValidationResult] = []
 
     # Reject sync entry points (must be async)
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.FunctionDef) and node.name in _ENTRY_NAMES:
-            errors.append(
-                f"Entry point must be async: '{node.name}' at line {node.lineno}"
-            )
+            errors.append(ValidationResult(
+                "error",
+                f"Entry point must be async: '{node.name}' at line {node.lineno}",
+            ))
 
     # Reject duplicate entry point definitions
     entry_defs: dict[str, list[int]] = {}
@@ -153,11 +292,14 @@ def validate(source: str) -> list[str]:
     for name, lines in entry_defs.items():
         if len(lines) > 1:
             line_str = ", ".join(str(ln) for ln in lines)
-            errors.append(f"Duplicate entry point '{name}' defined at lines {line_str}")
+            errors.append(ValidationResult(
+                "error",
+                f"Duplicate entry point '{name}' defined at lines {line_str}",
+            ))
 
     entry = _find_entry(tree)
     if entry is None:
-        errors.append("Missing execute() entry point")
+        errors.append(ValidationResult("error", "Missing execute() entry point"))
         return errors
 
     if errors:
@@ -166,10 +308,11 @@ def validate(source: str) -> list[str]:
     # Reject control flow in execute body
     for stmt in entry.body:
         if isinstance(stmt, _CONTROL_FLOW):
-            errors.append(
+            errors.append(ValidationResult(
+                "error",
                 f"Control flow in execute body not supported: "
-                f"{type(stmt).__name__} at line {stmt.lineno}"
-            )
+                f"{type(stmt).__name__} at line {stmt.lineno}",
+            ))
 
     calls, var_types = _walk_entry(entry, sigs)
 
@@ -190,19 +333,21 @@ def validate(source: str) -> list[str]:
     # Completeness: every called function is defined or imported
     for name in sorted(called_names - known):
         ln = called[name]
-        errors.append(f"Undefined: {name} (line {ln})")
+        errors.append(ValidationResult("error", f"Undefined: {name} (line {ln})"))
 
     # Convergence: every defined task function is called
     for name in sorted(set(sigs) - called_names):
         ln = sig_linenos.get(name, 0)
-        errors.append(f"Unused: {name} (line {ln})")
+        errors.append(ValidationResult("error", f"Unused: {name} (line {ln})"))
 
     # Acyclicity: no circular type dependencies
     cycle = _find_cycle(_type_deps(sigs))
     if cycle:
         first = cycle[0]
         ln = sig_linenos.get(first, 0)
-        errors.append(f"Cycle: {' \u2192 '.join(cycle)} (line {ln})")
+        errors.append(ValidationResult(
+            "error", f"Cycle: {' \u2192 '.join(cycle)} (line {ln})",
+        ))
 
     # Type compatibility: argument types match parameter annotations
     errors += _check_types(sigs, calls, var_types)
@@ -219,7 +364,359 @@ def validate(source: str) -> list[str]:
     # Minimum decomposition: at least 3 substantive phases
     errors += _check_min_decomposition(sigs)
 
+    # Gather consumption: intent-aware convergence check
+    errors += _check_gather_consumption(entry, sigs=sigs)
+
+    # Advisory: pure serial chain with single-use types may be fabricated
+    errors += _check_topology_consistency(sigs, calls)
+
+    # Intent coverage (when intents source provided)
+    if intents_source is not None:
+        errors += validate_coverage(source, intents_source)
+
     return errors
+
+
+def validate_roadmap(source: str) -> list[ValidationResult]:
+    """Validate a roadmap.md milestone graph (DB-08 format).
+
+    Parses the markdown *source* for milestone annotations, then runs
+    structural validation (cycles, dangling refs, consistency).
+    Returns an empty list when the roadmap is valid.
+
+    Also accepts legacy roadmap.py Python source for backward
+    compatibility: if the source fails markdown parsing (no milestones
+    found) AND looks like Python, falls back to compose.py validation
+    with relaxed decomposition.
+    """
+    graph = parse_roadmap_annotations(source)
+    if graph.milestones:
+        return validate_roadmap_annotations(graph)
+
+    # Legacy fallback: try as Python source (roadmap.py format).
+    try:
+        all_results = validate(source)
+        return [r for r in all_results if "Under-decomposed" not in r.message]
+    except Exception:
+        return [ValidationResult("error", "No milestones found in roadmap")]
+
+
+def extract_roadmap_data(
+    source: str,
+) -> tuple[list[dict[str, str]], dict[str, list[str]]]:
+    """Extract milestone graph from roadmap source.
+
+    Tries DB-08 markdown format first. Falls back to legacy roadmap.py
+    Python source if no milestones are found in markdown.
+    """
+    graph = parse_roadmap_annotations(source)
+    if graph.milestones:
+        tasks = [{"name": name, "status": entry.status}
+                 for name, entry in graph.milestones.items()]
+        deps: dict[str, list[str]] = {
+            name: list(entry.depends_on)
+            for name, entry in graph.milestones.items()
+        }
+        return tasks, deps
+    return extract_dag_data(source)
+
+
+# ---------------------------------------------------------------------------
+# Roadmap annotation parsing (DB-08 markdown format)
+# ---------------------------------------------------------------------------
+
+_MILESTONE_RE = re.compile(
+    r"^###\s+(\d+)\.\s+(.+)$",
+    re.MULTILINE,
+)
+_FIELD_RE = re.compile(
+    r"^\*\*(\w[\w\s]*?):\*\*\s*(.*)$",
+    re.MULTILINE,
+)
+
+
+def parse_roadmap_annotations(markdown: str) -> RoadmapGraph:
+    """Parse roadmap.md content and extract milestone annotations.
+
+    Handles the DB-08 schema format::
+
+        ### 3. dashboard
+        **Status:** pending
+        **Summary:** Main dashboard with analytics widgets
+        **Depends on:** user-authentication
+        **Independent of:** payment-integration
+
+    Returns a ``RoadmapGraph`` with milestone names mapped to their
+    parsed entries.  If the markdown contains no milestone headers,
+    returns an empty graph.
+    """
+    # Find all milestone headers with their positions.
+    headers: list[tuple[int, str, str]] = []  # (pos, number, name)
+    for m in _MILESTONE_RE.finditer(markdown):
+        headers.append((m.start(), m.group(1), m.group(2).strip()))
+
+    if not headers:
+        return RoadmapGraph(milestones={}, order=())
+
+    milestones: dict[str, MilestoneEntry] = {}
+    order: list[str] = []
+
+    for i, (pos, _num, name) in enumerate(headers):
+        # Extract the block between this header and the next (or end).
+        end = headers[i + 1][0] if i + 1 < len(headers) else len(markdown)
+        block = markdown[pos:end]
+
+        # Parse fields from the block.
+        fields: dict[str, str] = {}
+        for fm in _FIELD_RE.finditer(block):
+            key = fm.group(1).strip().lower()
+            val = fm.group(2).strip()
+            fields[key] = val
+
+        status = fields.get("status", "pending")
+        summary = fields.get("summary", "")
+
+        depends_raw = fields.get("depends on", "")
+        depends_on = tuple(
+            d.strip() for d in depends_raw.split(",") if d.strip()
+        ) if depends_raw else ()
+
+        independent_raw = fields.get("independent of", "")
+        # Strip parenthetical notes like "(candidate for parallel coordinator)".
+        independent_of = tuple(
+            re.sub(r"\s*\(.*?\)\s*$", "", d.strip())
+            for d in independent_raw.split(",")
+            if d.strip()
+        ) if independent_raw else ()
+
+        entry = MilestoneEntry(
+            name=name,
+            status=status,
+            summary=summary,
+            depends_on=depends_on,
+            independent_of=independent_of,
+        )
+        milestones[name] = entry
+        order.append(name)
+
+    return RoadmapGraph(milestones=milestones, order=tuple(order))
+
+
+def validate_roadmap_annotations(
+    graph: RoadmapGraph,
+    milestone_dirs: list[str] | None = None,
+) -> list[ValidationResult]:
+    """Validate a parsed roadmap graph for structural consistency.
+
+    Checks:
+    - Cycle detection in the ``Depends on`` graph (DFS).
+    - Dangling references: names in ``Depends on`` / ``Independent of``
+      must exist as milestone entries.
+    - Consistency: a milestone cannot both depend on and be independent
+      of the same milestone.
+    - Name resolution: when *milestone_dirs* is provided, milestone
+      names must resolve to existing directory names.
+
+    Returns a list of ``ValidationResult`` (empty = valid).
+    """
+    errors: list[ValidationResult] = []
+    known = set(graph.milestones)
+
+    # Dangling references.
+    for name, entry in graph.milestones.items():
+        for dep in entry.depends_on:
+            if dep not in known:
+                errors.append(ValidationResult(
+                    "error",
+                    f"Dangling dependency: '{name}' depends on "
+                    f"'{dep}' which is not a milestone",
+                ))
+        for ind in entry.independent_of:
+            if ind not in known:
+                errors.append(ValidationResult(
+                    "error",
+                    f"Dangling reference: '{name}' declares independence "
+                    f"from '{ind}' which is not a milestone",
+                ))
+
+    # Consistency: Depends on X AND Independent of X is a contradiction.
+    for name, entry in graph.milestones.items():
+        contradictions = set(entry.depends_on) & set(entry.independent_of)
+        for c in sorted(contradictions):
+            errors.append(ValidationResult(
+                "error",
+                f"Contradiction: '{name}' both depends on and is "
+                f"independent of '{c}'",
+            ))
+
+    # Cycle detection via DFS on the depends_on graph.
+    deps_graph: dict[str, set[str]] = {
+        name: set(entry.depends_on) & known
+        for name, entry in graph.milestones.items()
+    }
+    cycle = _find_cycle(deps_graph)
+    if cycle:
+        errors.append(ValidationResult(
+            "error",
+            f"Dependency cycle: {' -> '.join(cycle)}",
+        ))
+
+    # Name resolution against milestone directories.
+    if milestone_dirs is not None:
+        dir_set = set(milestone_dirs)
+        for name in graph.milestones:
+            if name not in dir_set:
+                errors.append(ValidationResult(
+                    "advisory",
+                    f"Milestone '{name}' has no matching directory",
+                ))
+
+    return errors
+
+
+def compute_independent_sets(graph: RoadmapGraph) -> list[list[str]]:
+    """Compute layered sets of milestones for parallel dispatch.
+
+    Uses the ``Depends on`` graph to compute topological layers
+    (same Kahn's algorithm as ``compute_layers``).  Within each layer,
+    milestones are candidates for concurrent dispatch.
+
+    When no ``Independent of`` annotations exist anywhere in the graph,
+    returns a fully serial ordering (one milestone per layer) to
+    preserve backward compatibility.
+    """
+    known = set(graph.milestones)
+    if not known:
+        return []
+
+    # Check if any independence annotations exist.
+    has_independence = any(
+        entry.independent_of
+        for entry in graph.milestones.values()
+    )
+
+    # Build dependency graph restricted to known milestones.
+    deps: dict[str, set[str]] = {
+        name: set(entry.depends_on) & known
+        for name, entry in graph.milestones.items()
+    }
+
+    # Kahn's algorithm for topological layers.
+    in_degree: dict[str, int] = {name: len(d) for name, d in deps.items()}
+    dependents: dict[str, list[str]] = {name: [] for name in known}
+    for name, dep_set in deps.items():
+        for dep in dep_set:
+            dependents[dep].append(name)
+
+    layers: list[list[str]] = []
+    assigned: set[str] = set()
+
+    from collections import deque
+
+    queue: deque[str] = deque(
+        n for n, d in in_degree.items() if d == 0
+    )
+
+    while queue:
+        layer = sorted(queue)
+        layers.append(layer)
+        assigned.update(layer)
+        next_queue: deque[str] = deque()
+        for name in layer:
+            for dep in dependents[name]:
+                in_degree[dep] -= 1
+                if in_degree[dep] == 0:
+                    next_queue.append(dep)
+        queue = next_queue
+
+    # Handle cycles: append remaining as final layer.
+    remaining = sorted(known - assigned)
+    if remaining:
+        layers.append(remaining)
+
+    # If no independence annotations exist, serialize to one-per-layer.
+    if not has_independence:
+        serial: list[list[str]] = []
+        for layer in layers:
+            for name in layer:
+                serial.append([name])
+        return serial
+
+    return layers
+
+
+def validate_coverage(
+    compose_source: str,
+    intents_source: str,
+) -> list[ValidationResult]:
+    """Check that every intent in intents.md has a covering task in compose.py.
+
+    Returns a list of typed results (empty = full coverage).
+    Intent coverage gaps are errors; untraced tasks and missing
+    docstrings are advisories.
+    """
+    import re
+
+    # Extract intent identifiers from intents.md (lines like "## I1: ..."
+    # or "- I1: ..." or numbered "1. ...").
+    intent_pattern = re.compile(
+        r"^(?:##?\s*|[-*]\s*)"          # heading or list marker
+        r"(I\d+)\s*[:—–\-]?\s*(.+)",    # I<n>: description
+        re.MULTILINE,
+    )
+    intents: dict[str, str] = {}
+    for m in intent_pattern.finditer(intents_source):
+        intents[m.group(1)] = m.group(2).strip()
+
+    if not intents:
+        # No structured intents found — cannot check coverage.
+        return []
+
+    # Extract task docstrings from compose.py.
+    try:
+        tree = ast.parse(compose_source)
+    except SyntaxError:
+        return []
+
+    task_docs: dict[str, str] = {}
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name not in _ENTRY_NAMES:
+            doc = ast.get_docstring(node) or ""
+            task_docs[node.name] = doc
+
+    results: list[ValidationResult] = []
+
+    # Check each intent has a covering task.
+    for intent_id, intent_desc in intents.items():
+        covered = False
+        for _task_name, doc in task_docs.items():
+            if intent_id in doc or intent_desc.lower()[:30] in doc.lower():
+                covered = True
+                break
+        if not covered:
+            results.append(ValidationResult(
+                "error",
+                f"Intent {intent_id} ({intent_desc[:50]}) "
+                f"has no covering task in compose.py",
+            ))
+
+    # Check each task traces to at least one intent (advisory).
+    for task_name, doc in task_docs.items():
+        if task_name in _NON_TASK_NAMES:
+            continue
+        traces = any(iid in doc for iid in intents)
+        if not traces:
+            if not doc.strip():
+                results.append(ValidationResult(
+                    "advisory", f"Task '{task_name}' has no docstring",
+                ))
+            else:
+                results.append(ValidationResult(
+                    "advisory",
+                    f"Task '{task_name}' does not trace to any intent",
+                ))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +737,9 @@ def _extract_sigs(tree: ast.Module) -> dict[str, Sig]:
                 for a in node.args.args
             )
             ret = ast.unparse(node.returns) if node.returns else None
+            doc = ast.get_docstring(node)
             bounds = _extract_resource_bounds(node)
-            sigs[node.name] = Sig(node.name, params, ret, bounds)
+            sigs[node.name] = Sig(node.name, params, ret, doc, bounds)
     return sigs
 
 
@@ -323,7 +821,7 @@ def _check_width(
     sigs: dict[str, Sig],
     entry: ast.AsyncFunctionDef,
     calls: list[_Call],
-) -> list[str]:
+) -> list[ValidationResult]:
     """Warn if a multi-task graph has no concurrent phases.
 
     If there are more than 2 task functions and no gather() call in
@@ -351,47 +849,206 @@ def _check_width(
             return []
 
     n = len(task_names)
-    return [
+    return [ValidationResult(
+        "advisory",
         f"No concurrent phases in a {n}-task graph "
-        f"\u2014 verify all tasks have sequential data dependencies"
-    ]
+        f"\u2014 verify all tasks have sequential data dependencies",
+    )]
 
 
-def _check_min_decomposition(sigs: dict[str, Sig]) -> list[str]:
+def _check_min_decomposition(sigs: dict[str, Sig]) -> list[ValidationResult]:
     """Error if there are fewer than 3 substantive task phases."""
     task_count = sum(1 for n in sigs if n not in _NON_TASK_NAMES)
     if task_count <= 2:
-        return [
+        return [ValidationResult(
+            "error",
             "Under-decomposed milestone "
-            "\u2014 identify at least 3 substantive phases"
-        ]
+            "\u2014 identify at least 3 substantive phases",
+        )]
     return []
 
 
 def _check_resource_bounds(
     sigs: dict[str, Sig],
     sig_linenos: dict[str, int],
-) -> list[str]:
+) -> list[ValidationResult]:
     """Validate @resource_bounds values are positive when present."""
-    errors: list[str] = []
+    errors: list[ValidationResult] = []
     for sig in sigs.values():
         if sig.resource_bounds is None:
             continue
         ln = sig_linenos.get(sig.name, 0)
         if sig.resource_bounds.tokens is not None and sig.resource_bounds.tokens <= 0:
-            errors.append(
+            errors.append(ValidationResult(
+                "error",
                 f"Invalid resource_bounds on {sig.name}: "
-                f"tokens must be positive (line {ln})"
-            )
+                f"tokens must be positive (line {ln})",
+            ))
         if (
             sig.resource_bounds.timeout_seconds is not None
             and sig.resource_bounds.timeout_seconds <= 0
         ):
-            errors.append(
+            errors.append(ValidationResult(
+                "error",
                 f"Invalid resource_bounds on {sig.name}: "
-                f"timeout_seconds must be positive (line {ln})"
-            )
+                f"timeout_seconds must be positive (line {ln})",
+            ))
     return errors
+
+
+def _check_gather_consumption(
+    entry: ast.AsyncFunctionDef,
+    sigs: dict[str, Sig] | None = None,
+) -> list[ValidationResult]:
+    """Error if gather() results unused AND tasks share intent coverage.
+
+    Advisory if gather() results unused but intents are disjoint.
+    Hard error if gather() results unused AND intent IDs overlap
+    across tasks in the gather group — shared intents require a
+    convergence point to verify integration.
+    """
+    errors: list[ValidationResult] = []
+
+    for stmt in entry.body:
+        # Only check assigned gather() calls: `x, y = await gather(...)`
+        if not (
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Await)
+            and isinstance(stmt.value.value, ast.Call)
+            and _call_name(stmt.value.value) == "gather"
+        ):
+            continue
+
+        # Get the target variable names from this gather assignment.
+        targets = _target_names(stmt.targets[0])
+        if not targets:
+            continue
+
+        # Check if any target variable is consumed by a later statement.
+        consumed = False
+        found_gather = False
+        for later in entry.body:
+            if later is stmt:
+                found_gather = True
+                continue
+            if not found_gather:
+                continue
+            # Walk the later statement for Name references.
+            for node in ast.walk(later):
+                if isinstance(node, ast.Name) and node.id in targets:
+                    consumed = True
+                    break
+            if consumed:
+                break
+
+        if consumed:
+            continue
+
+        # Gather results are not consumed — determine severity.
+        gather_call = stmt.value.value
+        task_names_in_gather: list[str] = []
+        for arg in gather_call.args:
+            if isinstance(arg, ast.Call):
+                task_names_in_gather.append(_call_name(arg))
+
+        # Extract intent IDs from docstrings if sigs are available.
+        if sigs and task_names_in_gather:
+            intent_re = re.compile(r"\bI\d+\b")
+            task_intents: dict[str, set[str]] = {}
+            has_any_intents = False
+            for tname in task_names_in_gather:
+                sig = sigs.get(tname)
+                if sig and sig.docstring:
+                    intents = set(intent_re.findall(sig.docstring))
+                    if intents:
+                        has_any_intents = True
+                        task_intents[tname] = intents
+                else:
+                    task_intents[tname] = set()
+
+            if has_any_intents:
+                # Check for overlapping intents across tasks.
+                all_tasks = list(task_intents.keys())
+                overlaps: list[tuple[str, str, str]] = []
+                for i in range(len(all_tasks)):
+                    for j in range(i + 1, len(all_tasks)):
+                        a, b = all_tasks[i], all_tasks[j]
+                        shared = task_intents[a] & task_intents[b]
+                        for intent_id in sorted(shared):
+                            overlaps.append((a, b, intent_id))
+
+                if overlaps:
+                    # Hard error: shared intents without convergence.
+                    for a, b, intent_id in overlaps:
+                        errors.append(ValidationResult(
+                            "error",
+                            f"Tasks {a}, {b} share intent {intent_id} "
+                            f"but gather() results are not consumed "
+                            f"— add a convergence task",
+                        ))
+                    continue
+
+        # No overlap (or no intents / no sigs) — advisory.
+        errors.append(ValidationResult(
+            "advisory",
+            "gather() results not consumed "
+            "— consider whether an integration phase is needed",
+        ))
+
+    return errors
+
+
+def _check_topology_consistency(
+    sigs: dict[str, Sig],
+    calls: list[tuple[str, list[tuple[str, str]], list[str]]],
+) -> list[ValidationResult]:
+    """Advisory: flag if all tasks could be independent but are serialized.
+
+    Heuristic: if every non-root, non-leaf task in a pure serial chain has
+    exactly one producer and one consumer, and every intermediate type is
+    used by only one consumer, the topology may be fabricated — the
+    structural signature of autoregressive ordering bias.
+
+    Requires at least 4 task calls to trigger (short chains are often
+    genuinely serial).
+    """
+    task_calls = [c for c in calls if c[0] in sigs and c[0] not in _NON_TASK_NAMES]
+    if len(task_calls) < 4:
+        return []
+
+    produced_by: dict[str, str] = {}
+    for func, _, targets in task_calls:
+        for var in targets:
+            produced_by[var] = func
+
+    var_consumer_count: dict[str, int] = {}
+    for _, args, _ in task_calls:
+        for _, var in args:
+            if var in produced_by:
+                var_consumer_count[var] = var_consumer_count.get(var, 0) + 1
+
+    is_pure_chain = True
+    for i, (func, args, targets) in enumerate(task_calls):
+        if i == 0:
+            continue
+        task_args = [var for _, var in args if var in produced_by]
+        if len(task_args) != 1:
+            is_pure_chain = False
+            break
+        var = task_args[0]
+        if var_consumer_count.get(var, 0) != 1:
+            is_pure_chain = False
+            break
+
+    if not is_pure_chain:
+        return []
+
+    n = len(task_calls)
+    return [ValidationResult(
+        "advisory",
+        f"Pure serial chain ({n} tasks) with single-use intermediate types "
+        f"— verify dependencies are genuine, not ordering bias",
+    )]
 
 
 def _find_entry(tree: ast.Module) -> ast.AsyncFunctionDef | None:
@@ -589,9 +1246,9 @@ def _check_types(
     sigs: dict[str, Sig],
     calls: list[_Call],
     var_types: dict[str, str | None],
-) -> list[str]:
+) -> list[ValidationResult]:
     """Check that argument types match parameter annotations."""
-    errors: list[str] = []
+    errors: list[ValidationResult] = []
     for func, args, _ in calls:
         if func not in sigs:
             continue
@@ -602,10 +1259,11 @@ def _check_types(
             expected = sig.params[pos][1]
             actual = var_types.get(var)
             if expected and actual and expected != actual:
-                errors.append(
+                errors.append(ValidationResult(
+                    "error",
                     f"Type mismatch: {func}() param '{sig.params[pos][0]}' "
-                    f"expects {expected}, got {actual} (from '{var}')"
-                )
+                    f"expects {expected}, got {actual} (from '{var}')",
+                ))
     return errors
 
 
