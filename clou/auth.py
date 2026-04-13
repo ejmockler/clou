@@ -83,25 +83,93 @@ def check_auth_status(cli_path: str) -> AuthStatus:
         )
 
 
-def run_auth_command() -> None:
-    """Entry point for ``clou auth`` — prints status and setup guidance."""
+def run_login(cli_path: str) -> bool:
+    """Run ``claude auth login`` interactively.
+
+    Returns True if login succeeded.
+    """
+    try:
+        result = subprocess.run([cli_path, "auth", "login"])
+        if result.returncode != 0:
+            return False
+        status = check_auth_status(cli_path)
+        return status.logged_in
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def ensure_authenticated() -> AuthStatus:
+    """Check auth at startup.  Returns status or exits.
+
+    Called before the TUI launches. If not authenticated, offers
+    interactive login. Exits with code 1 if auth cannot be established.
+    """
     cli_path = find_claude_cli()
 
     if cli_path is None:
         print("Claude CLI not found.\n")
         print("Install it with:")
         print("  npm install -g @anthropic-ai/claude-code\n")
-        print("Then run:")
-        print("  clou auth")
         sys.exit(1)
 
     status = check_auth_status(cli_path)
+    if status.logged_in:
+        return status
+
+    print("Not authenticated.\n")
+    try:
+        answer = input("Log in now? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(1)
+
+    if answer in ("", "y", "yes"):
+        if run_login(cli_path):
+            return check_auth_status(cli_path)
+        else:
+            print("\nLogin failed.")
+            sys.exit(1)
+    else:
+        print("\nRun `clou auth login` to authenticate.")
+        sys.exit(1)
+
+
+def run_auth_command() -> None:
+    """Entry point for ``clou auth`` — status, login, or logout."""
+    args = sys.argv[2:]  # after "clou auth"
+
+    cli_path = find_claude_cli()
+    if cli_path is None:
+        print("Claude CLI not found.\n")
+        print("Install it with:")
+        print("  npm install -g @anthropic-ai/claude-code\n")
+        sys.exit(1)
+
+    if args and args[0] == "login":
+        if run_login(cli_path):
+            status = check_auth_status(cli_path)
+            print(f"\nAuthenticated as {status.email}")
+        else:
+            print("Login failed.")
+            sys.exit(1)
+        return
+
+    if args and args[0] == "logout":
+        try:
+            subprocess.run([cli_path, "auth", "logout"])
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"Logout failed: {exc}")
+            sys.exit(1)
+        return
+
+    # Default: show status
+    status = check_auth_status(cli_path)
 
     if not status.logged_in:
-        print(f"Claude CLI found: {cli_path}")
+        print(f"Claude CLI: {cli_path}")
         print("Status: not logged in\n")
         print("Log in with:")
-        print("  claude auth login")
+        print("  clou auth login")
         sys.exit(1)
 
     print(f"Claude CLI: {cli_path}")

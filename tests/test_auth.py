@@ -139,7 +139,7 @@ def test_run_auth_not_logged_in(
 
     out = capsys.readouterr().out
     assert "not logged in" in out
-    assert "claude auth login" in out
+    assert "clou auth login" in out
 
 
 def test_run_auth_success(

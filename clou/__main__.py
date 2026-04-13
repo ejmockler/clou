@@ -56,8 +56,11 @@ def main() -> None:
 
     from pathlib import Path
 
+    from clou.auth import ensure_authenticated
     from clou.project import resolve_project_dir_or_exit
     from clou.ui.app import ClouApp
+
+    ensure_authenticated()
 
     resume_id = _parse_resume_flag()
 
