@@ -322,7 +322,7 @@ def parse_escalation(path: Path) -> dict[str, Any]:
 
     return {
         "classification": sections.get("classification", ""),
-        "issue": sections.get("issue", ""),
+        "issue": sections.get("issue", "") or sections.get("problem", ""),
         "options": options,
         "recommendation": sections.get("recommendation", ""),
     }

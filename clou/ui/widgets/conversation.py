@@ -37,9 +37,9 @@ from clou.ui.theme import PALETTE
 from clou.ui.turn_controller import TurnController
 from clou.ui.widgets.agent_disclosure import AgentDisclosure
 from clou.ui.widgets.edit_disclosure import (
-    DISCLOSURE_PRUNE,
     EditDisclosure,
 )
+from clou.ui.widgets.tool_result_disclosure import ToolResultDisclosure
 from clou.ui.widgets.gate import GateWidget
 from clou.ui.widgets.message_widgets import MarkdownMessage, UserMessage
 from clou.ui.widgets.prompt_input import PromptInput
@@ -105,6 +105,7 @@ class ConversationWidget(DragScrollMixin, Widget):
         self._init_drag_scroll()
         self._disclosure_timer: Timer | None = None
         self._pending_agents: dict[str, AgentDisclosure] = {}
+        self._pending_tools: dict[str, ToolResultDisclosure] = {}
 
     def compose(self) -> ComposeResult:
         from clou.ui.widgets.command_palette import CommandPalette
@@ -160,23 +161,15 @@ class ConversationWidget(DragScrollMixin, Widget):
         """Check disclosure widgets for lifecycle transitions and prune stale ones."""
         now = time.monotonic()
         any_active = False
-        to_remove: list[EditDisclosure] = []
         for widget in self.query(EditDisclosure):
             if not widget._pinned and widget._expanded:
                 any_active = True
             if widget.update_lifecycle(now):
                 widget.refresh()
-            if (
-                not widget._pinned
-                and not widget._expanded
-                and widget._collapsed_at > 0
-                and (now - widget._collapsed_at) >= DISCLOSURE_PRUNE
-            ):
-                to_remove.append(widget)
-        for widget in to_remove:
-            widget.remove()
+        # Disclosures persist in collapsed form — never removed from DOM.
+        # They remain as a permanent record of edits in the conversation.
         has_pending = any(
-            not w._pinned and not w._expanded and w._collapsed_at > 0
+            not w._pinned and w._expanded
             for w in self.query(EditDisclosure)
         )
         if not any_active and not has_pending and self._disclosure_timer is not None:
@@ -204,6 +197,7 @@ class ConversationWidget(DragScrollMixin, Widget):
         self._tc.reset()
         self._stop_timer()
         self._pending_agents.clear()
+        self._pending_tools.clear()
         self._clear_tail()
         for um in self.query(UserMessage):
             um.mark_active()
@@ -437,16 +431,29 @@ class ConversationWidget(DragScrollMixin, Widget):
         if msg.name in ("Edit", "MultiEdit", "Write"):
             styled = build_edit_summary(msg.name, msg.tool_input)
             self._append_edit(msg.name, msg.tool_input, styled)
+        elif msg.name.startswith("mcp__"):
+            # MCP tools get a disclosure with breathing dot while running,
+            # result content rendered on completion — violet left edge.
+            disclosure = ToolResultDisclosure(
+                msg.tool_use_id, summary, classes="msg tool-result-disclosure",
+            )
+            self._mount_msg(disclosure)
+            if msg.tool_use_id:
+                self._pending_tools[msg.tool_use_id] = disclosure
         else:
             self._append(Text(f"{glyph} {summary}", style=_DIM_HEX), "tool-activity")
 
     def on_clou_tool_result(self, msg: ClouToolResult) -> None:
-        """Route tool results — agent results fill disclosures, errors whisper."""
+        """Route tool results — agent/MCP fill disclosures, errors whisper."""
         if self._initializing:
             return
         disclosure = self._pending_agents.pop(msg.tool_use_id, None)
         if disclosure is not None:
             disclosure.complete(msg.content, msg.is_error)
+            return
+        tool_disclosure = self._pending_tools.pop(msg.tool_use_id, None)
+        if tool_disclosure is not None:
+            tool_disclosure.complete(msg.content, msg.is_error)
             return
         if msg.is_error:
             content = _strip_ansi(msg.content)

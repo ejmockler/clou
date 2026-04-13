@@ -4,18 +4,63 @@ Agent-to-task fuzzy matching, status transition logic, tool call recording.
 No UI dependencies -- consumed by TaskGraphWidget in the widget layer.
 
 Public API:
+    ToolInvocation     -- per-tool-call metadata dataclass
     TaskState          -- per-task state dataclass
     TaskGraphModel     -- model holding all task states + dependency layers
     match_agent_to_task -- pure function for fuzzy agent-description matching
+    categorize_tool    -- map tool name to activity category
+    MAX_TOOL_HISTORY   -- upper bound on retained tool invocations per task
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MAX_TOOL_HISTORY: int = 500
+
+# ---------------------------------------------------------------------------
+# Tool categorization
+# ---------------------------------------------------------------------------
+
+_TOOL_CATEGORIES: dict[str, str] = {
+    "Read": "reads",
+    "Glob": "reads",
+    "Edit": "writes",
+    "Write": "writes",
+    "MultiEdit": "writes",
+    "NotebookEdit": "writes",
+    "Bash": "shell",
+    "Grep": "searches",
+    "WebSearch": "searches",
+    "WebFetch": "searches",
+}
+
+
+def categorize_tool(name: str) -> str:
+    """Return the activity category for a tool name."""
+    return _TOOL_CATEGORIES.get(name, "other")
+
 
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolInvocation:
+    """A single tool call by an agent, with metadata."""
+
+    name: str  # Tool name (Read, Edit, Bash, etc.)
+    timestamp: float  # time.monotonic() when recorded
+    category: str = "other"  # reads | writes | shell | searches | other
+    input_summary: str = ""  # Brief description (for future SDK enrichment)
+    output_summary: str = ""  # Brief result (for future SDK enrichment)
+    duration_ms: float | None = None  # Optional duration
 
 
 @dataclass
@@ -24,10 +69,15 @@ class TaskState:
 
     status: str = "pending"  # pending | active | complete | failed | aborted
     agent_id: str | None = None
-    tool_count: int = 0
+    tool_count: int = 0  # SDK's cumulative count (may differ from len(tool_invocations) on batched events)
     last_tool: str | None = None
     summary: str | None = None
-    tool_calls: list[tuple[str, str]] = field(default_factory=list)
+    tool_invocations: list[ToolInvocation] = field(default_factory=list)
+
+    @property
+    def tool_calls(self) -> list[tuple[str, str]]:
+        """Backward-compatible accessor for legacy code."""
+        return [(inv.name, inv.input_summary) for inv in self.tool_invocations]
 
 
 # ---------------------------------------------------------------------------
@@ -103,49 +153,7 @@ def match_agent_to_task(
 # ---------------------------------------------------------------------------
 
 
-def _compute_layers(
-    task_names: list[str],
-    deps: dict[str, list[str]],
-) -> list[list[str]]:
-    """Group tasks into layers by dependency depth.
-
-    Replicates the algorithm from ``clou/ui/widgets/dag.py`` without
-    importing from the widget layer.
-    """
-    task_set = set(task_names)
-    depth: dict[str, int] = {}
-    visiting: set[str] = set()
-
-    def _get_depth(name: str, level: int = 0) -> int:
-        if level > 200:
-            depth[name] = level
-            return level
-        if name in depth:
-            return depth[name]
-        if name in visiting:
-            depth[name] = 0  # Break cycle.
-            return 0
-        visiting.add(name)
-        task_deps = deps.get(name, [])
-        valid_deps = [dep for dep in task_deps if dep in task_set]
-        if not valid_deps:
-            depth[name] = 0
-            visiting.discard(name)
-            return 0
-        d = max(_get_depth(dep, level + 1) for dep in valid_deps) + 1
-        depth[name] = d
-        visiting.discard(name)
-        return d
-
-    for name in task_names:
-        _get_depth(name)
-
-    max_depth = max(depth.values()) if depth else 0
-    layers: list[list[str]] = [[] for _ in range(max_depth + 1)]
-    for name in task_names:
-        layers[depth.get(name, 0)].append(name)
-
-    return layers
+from clou.graph import compute_layers as _compute_layers  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +178,7 @@ class TaskGraphModel:
             name: TaskState() for name in task_names
         }
         self.deps: dict[str, list[str]] = dict(deps)
-        self.layers: list[list[str]] = _compute_layers(task_names, deps)
+        self.layers: list[list[str]] = _compute_layers(tasks, deps)
         self.unmapped_agents: dict[str, TaskState] = {}
 
     # -- Agent matching ----------------------------------------------------
@@ -212,6 +220,8 @@ class TaskGraphModel:
         state = self.task_states.get(task_name)
         if state is None:
             return
+        if status == "completed":
+            status = "complete"
         state.status = status
         state.summary = summary
 
@@ -220,9 +230,28 @@ class TaskGraphModel:
         task_name: str,
         tool_name: str,
         brief: str,
-    ) -> None:
-        """Append a tool call record to the task's history."""
+        output_summary: str = "",
+    ) -> ToolInvocation | None:
+        """Append a tool invocation to the task's history.
+
+        Returns the new invocation, or ``None`` if the task is unknown.
+        Also checks ``unmapped_agents`` when the task is not in
+        ``task_states``.
+        """
         state = self.task_states.get(task_name)
         if state is None:
-            return
-        state.tool_calls.append((tool_name, brief))
+            state = self.unmapped_agents.get(task_name)
+        if state is None:
+            return None
+        invocation = ToolInvocation(
+            name=tool_name,
+            timestamp=time.monotonic(),
+            category=categorize_tool(tool_name),
+            input_summary=brief,
+            output_summary=output_summary,
+        )
+        state.tool_invocations.append(invocation)
+        # Enforce bounded history.
+        if len(state.tool_invocations) > MAX_TOOL_HISTORY:
+            state.tool_invocations = state.tool_invocations[-MAX_TOOL_HISTORY:]
+        return invocation

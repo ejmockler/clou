@@ -11,6 +11,7 @@ from pathlib import Path
 from textual.message import Message
 
 from clou.ui.mode import Mode
+from clou.ui.task_graph import ToolInvocation
 
 # Re-export so ``from clou.ui.messages import Mode`` keeps working.
 __all__ = ["Mode"]
@@ -299,6 +300,28 @@ class ClouHandoff(Message):
     def __init__(self, milestone: str, handoff_path: Path) -> None:
         self.milestone = milestone
         self.handoff_path = handoff_path
+        super().__init__()
+
+
+# ---------------------------------------------------------------------------
+# Agent observability messages
+# ---------------------------------------------------------------------------
+
+
+class ClouToolCallRecorded(Message):
+    """A new tool call was recorded for an agent task."""
+
+    def __init__(self, task_name: str, invocation: ToolInvocation) -> None:
+        self.task_name = task_name
+        self.invocation = invocation
+        super().__init__()
+
+
+class RequestAgentDetail(Message):
+    """Request to push the agent detail screen for a task."""
+
+    def __init__(self, task_name: str) -> None:
+        self.task_name = task_name
         super().__init__()
 
 

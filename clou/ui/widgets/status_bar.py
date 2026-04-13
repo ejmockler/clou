@@ -144,9 +144,16 @@ class ClouStatusBar(Static):
     cost_usd: reactive[float] = reactive(0.0)
     rate_limited: reactive[bool] = reactive(False)
     context_pressure: reactive[str] = reactive("none")
+    exit_hint: reactive[str] = reactive("")
 
     def render(self) -> RenderResult:
         """Render the status bar content using Rich Text.assemble()."""
+        if self.exit_hint:
+            return Text.assemble(
+                ("clou", "bold"),
+                ("  ", ""),
+                (self.exit_hint, f"{_ROSE_HEX}"),
+            )
         return render_status_bar(
             milestone=self.milestone,
             cycle_type=self.cycle_type,

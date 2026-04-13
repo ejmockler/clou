@@ -11,6 +11,7 @@ Public API:
 from __future__ import annotations
 
 import time
+from collections import Counter
 from typing import ClassVar
 
 from rich.color import Color
@@ -21,6 +22,7 @@ from textual.reactive import reactive
 from textual.strip import Strip
 from textual.widget import Widget
 
+from clou.ui.messages import ClouToolCallRecorded, RequestAgentDetail
 from clou.ui.task_graph import TaskGraphModel
 from clou.ui.theme import PALETTE, OklchColor, breath_modulate
 from clou.ui.widgets.breath import (
@@ -71,16 +73,19 @@ _TEXT_MUTED_L: float = 0.45
 #: Luminance boost for focused row.
 _FOCUS_BOOST: float = 0.15
 
+#: Category display order for categorized activity summary.
+_CAT_ORDER: list[str] = ["reads", "writes", "shell", "searches", "other"]
+
 # ---------------------------------------------------------------------------
 # Row map types
 # ---------------------------------------------------------------------------
 
 # Each entry in _row_map is (row_type, data):
-#   ("header", layer_index)            -- phase group header
+#   ("edge", layer_index)              -- dependency edge between layers
 #   ("task", task_name)                -- a task row
-#   ("spacer", None)                   -- blank line between groups
-#   ("tool_call", (task_name, index))  -- drill-down tool call line
+#   ("tool_groups", task_name)         -- categorized tool activity summary
 #   ("summary", task_name)             -- drill-down summary line
+#   ("spacer", None)                   -- blank line between groups
 _RowEntry = tuple[str, object]
 
 # ---------------------------------------------------------------------------
@@ -231,6 +236,17 @@ class TaskGraphWidget(Widget):
         self._frame_time = time.monotonic()
         self.refresh()
 
+    # -- message handlers ----------------------------------------------------
+
+    def on_clou_tool_call_recorded(self, msg: ClouToolCallRecorded) -> None:
+        """Rebuild row map when a new tool call is recorded for any task."""
+        if self._model is None:
+            return
+        # Only rebuild if the affected task is currently expanded.
+        if msg.task_name in self._expanded:
+            self._rebuild_row_map()
+            self.refresh(layout=True)
+
     # -- focus helpers -------------------------------------------------------
 
     def _task_names_ordered(self) -> list[str]:
@@ -273,6 +289,12 @@ class TaskGraphWidget(Widget):
             event.stop()
         elif event.key == "enter":
             self._toggle_expand()
+            event.prevent_default()
+            event.stop()
+        elif event.key == "d":
+            task_name = self._focused_task_name()
+            if task_name is not None:
+                self.post_message(RequestAgentDetail(task_name=task_name))
             event.prevent_default()
             event.stop()
         elif event.key == "escape":
@@ -368,21 +390,16 @@ class TaskGraphWidget(Widget):
                 if task_name in self._expanded and self._model is not None:
                     state = self._model.task_states.get(task_name)
                     if state is not None:
-                        if state.tool_calls:
+                        if state.tool_invocations:
                             rows.append(("tool_groups", task_name))
                         if state.summary:
                             rows.append(("summary", task_name))
 
-        # Unmapped agents: active work that doesn't match compose.py tasks.
-        active_unmapped = {
-            name: st
-            for name, st in self._model.unmapped_agents.items()
-            if st.status == "active"
-        }
-        if active_unmapped:
+        # Unmapped agents: work that doesn't match compose.py tasks.
+        if self._model.unmapped_agents:
             if rows:
                 rows.append(("spacer", None))
-            for agent_name in active_unmapped:
+            for agent_name in self._model.unmapped_agents:
                 rows.append(("task", agent_name))
 
         self._row_map = rows
@@ -414,12 +431,6 @@ class TaskGraphWidget(Widget):
 
         if row_type == "tool_groups":
             return self._render_tool_groups(width, str(data))
-
-        if row_type == "tool_call":
-            task_name, tc_idx = data  # type: ignore[misc]
-            return self._render_tool_call(
-                width, str(task_name), int(tc_idx)
-            )
 
         if row_type == "summary":
             return self._render_summary(width, str(data))
@@ -599,69 +610,66 @@ class TaskGraphWidget(Widget):
 
         return Strip(segments, width)
 
-    def _render_tool_call(
-        self, width: int, task_name: str, tc_idx: int
-    ) -> Strip:
-        """Render a drill-down tool call line."""
-        if self._model is None:
-            return Strip([Segment(" " * width, Style())], width)
-
-        state = self._model.task_states.get(task_name)
-        if state is None:
-            state = self._model.unmapped_agents.get(task_name)
-        if state is None or tc_idx >= len(state.tool_calls):
-            return Strip([Segment(" " * width, Style())], width)
-
-        tool_name, brief = state.tool_calls[tc_idx]
-        text = f"    \u2192 {tool_name}: {brief}"
-        if len(text) < width:
-            text = text + " " * (width - len(text))
-        elif len(text) > width:
-            text = text[:width]
-
-        # Compute luminance from expansion animation.
-        now = time.monotonic()
-        expanded_at = self._expansion_states.get(task_name, now)
-        l_val = _expansion_luminance(expanded_at, now)
-
-        r, g, b = luminance_to_rgb(l_val)
-        style = Style(color=Color.from_rgb(r, g, b))
-        segments = [Segment(ch, style) for ch in text]
-        return Strip(segments, width)
-
     def _render_tool_groups(self, width: int, task_name: str) -> Strip:
-        """Render a grouped tool call summary (e.g. '3× Glob · 8× Read')."""
+        """Render a categorized activity summary with breathing dot for active tasks.
+
+        Shows counts grouped by category (reads/writes/shell/searches/other)
+        instead of raw tool name counts.  Active tasks get a breathing dot
+        at position 4 using accent-gold with breath_modulate.
+        """
         if self._model is None:
             return Strip([Segment(" " * width, Style())], width)
 
         state = self._model.task_states.get(task_name)
         if state is None:
             state = self._model.unmapped_agents.get(task_name)
-        if state is None or not state.tool_calls:
+        if state is None or not state.tool_invocations:
             return Strip([Segment(" " * width, Style())], width)
 
-        # Count occurrences preserving first-seen order.
-        counts: dict[str, int] = {}
-        for name, _ in state.tool_calls:
-            counts[name] = counts.get(name, 0) + 1
-        parts = [
-            f"{count}\u00d7 {name}" if count > 1 else name
-            for name, count in counts.items()
-        ]
-        text = f"    {' \u00b7 '.join(parts)}"
+        # Count by category.
+        cat_counts: Counter[str] = Counter(
+            inv.category for inv in state.tool_invocations
+        )
+        parts: list[str] = []
+        for cat in _CAT_ORDER:
+            count = cat_counts.get(cat, 0)
+            if count > 0:
+                parts.append(f"{count} {cat}")
+
+        is_active = state.status == "active"
+        dot = "\u25cf " if is_active else "  "
+        category_text = " \u00b7 ".join(parts)
+        text = f"    {dot}{category_text}"
         if len(text) < width:
             text = text + " " * (width - len(text))
         elif len(text) > width:
             text = text[:width]
 
-        # Compute luminance from expansion animation.
+        # Compute base luminance from expansion animation.
         now = time.monotonic()
         expanded_at = self._expansion_states.get(task_name, now)
         l_val = _expansion_luminance(expanded_at, now)
 
-        r, g, b = luminance_to_rgb(l_val)
-        style = Style(color=Color.from_rgb(r, g, b))
-        segments = [Segment(ch, style) for ch in text]
+        r_base, g_base, b_base = luminance_to_rgb(l_val)
+        base_style = Style(color=Color.from_rgb(r_base, g_base, b_base))
+
+        # Per-character rendering with breathing dot coloring.
+        segments: list[Segment] = []
+        for x in range(len(text)):
+            char = text[x]
+            if is_active and x == 4 and char == "\u25cf":
+                # Breathing dot: accent-gold with breath_modulate.
+                base_col = PALETTE["accent-gold"]
+                modulated_l = breath_modulate(base_col.l, self.breath_phase)
+                r, g, b = _oklch_to_rgb(
+                    OklchColor(modulated_l, base_col.c, base_col.h)
+                )
+                segments.append(
+                    Segment(char, Style(color=Color.from_rgb(r, g, b)))
+                )
+            else:
+                segments.append(Segment(char, base_style))
+
         return Strip(segments, width)
 
     def _render_summary(self, width: int, task_name: str) -> Strip:

@@ -73,6 +73,11 @@ def tool_summary(name: str, tool_input: dict[str, object]) -> str:
     if name == "WebSearch":
         query = str(tool_input.get("query", ""))
         return f'search "{query[:40]}"' if query else name
+    if name.startswith("mcp__"):
+        # mcp__brutalist__roast → "brutalist roast"
+        parts = name.split("__")
+        short = " ".join(parts[1:]) if len(parts) > 1 else name
+        return short
     return name
 
 

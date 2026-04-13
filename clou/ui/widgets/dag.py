@@ -95,47 +95,7 @@ def render_dag(
     return result
 
 
-def _compute_layers(
-    tasks: list[dict[str, str]],
-    deps: dict[str, list[str]],
-) -> list[list[str]]:
-    """Group tasks into layers by dependency depth."""
-    task_names = [t["name"] for t in tasks]
-    task_set = set(task_names)
-    depth: dict[str, int] = {}
-    visiting: set[str] = set()
-
-    def _get_depth(name: str, level: int = 0) -> int:
-        if level > 200:
-            depth[name] = level
-            return level
-        if name in depth:
-            return depth[name]
-        if name in visiting:
-            depth[name] = 0  # Break cycle.
-            return 0
-        visiting.add(name)
-        task_deps = deps.get(name, [])
-        valid_deps = [dep for dep in task_deps if dep in task_set]
-        if not valid_deps:
-            depth[name] = 0
-            visiting.discard(name)
-            return 0
-        d = max(_get_depth(dep, level + 1) for dep in valid_deps) + 1
-        depth[name] = d
-        visiting.discard(name)
-        return d
-
-    for name in task_names:
-        _get_depth(name)
-
-    # Group by depth.
-    max_depth = max(depth.values()) if depth else 0
-    layers: list[list[str]] = [[] for _ in range(max_depth + 1)]
-    for name in task_names:
-        layers[depth.get(name, 0)].append(name)
-
-    return layers
+from clou.graph import compute_layers as _compute_layers  # noqa: E402
 
 
 def _draw_connections(

@@ -27,7 +27,9 @@ from textual.worker import Worker, WorkerState
 
 from clou import telemetry
 from clou.session import Session
+from clou.transcript import get_store as _get_transcript_store
 from clou.ui.bridge import _strip_ansi
+from clou.ui.rendering.tool_summary import tool_summary as _tool_summary
 from clou.ui.history import ConversationEntry
 from clou.ui.messages import (
     ClouAgentComplete,
@@ -45,8 +47,10 @@ from clou.ui.messages import (
     ClouProcessingStarted,
     ClouRateLimit,
     ClouStatusUpdate,
+    ClouToolCallRecorded,
     ClouTurnComplete,
     ClouTurnContentReady,
+    RequestAgentDetail,
 )
 from clou.ui.mode import TIMING, BreathState, BreathStateMachine, Mode, get_transition
 from clou.ui.screens.context import ContextScreen
@@ -122,9 +126,10 @@ class ClouApp(App[None]):
 
     BINDINGS: ClassVar[list[BindingType]] = [
         # Copy-on-select handles clipboard via pbcopy on drag release.
-        # These priority no-ops prevent Screen.copy_text (non-priority)
-        # and Textual's default ctrl+c → quit from overwriting.
-        Binding("ctrl+c,super+c", "noop", show=False, priority=True),
+        # super+c no-op prevents Screen.copy_text (non-priority) from
+        # overwriting.  ctrl+c drives double-press exit.
+        Binding("ctrl+c", "exit_signal", show=False, priority=True),
+        Binding("super+c", "noop", show=False, priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("ctrl+l", "clear", "Clear"),
         Binding("ctrl+g", "show_context", "Context", show=False),
@@ -166,6 +171,8 @@ class ClouApp(App[None]):
         self._synthetic_dag: bool = False
         self._agent_task_map: dict[str, str] = {}  # task_id → task_name
         self._session_start_time: float = time.monotonic()
+        self._exit_pending: bool = False
+        self._exit_timer: Timer | None = None
         self._conversation_history: list[ConversationEntry] = []
         # Compact state machine (request/completion handshake with orchestrator).
         self._compact = CompactionState()
@@ -724,7 +731,29 @@ class ClouApp(App[None]):
         return any(isinstance(s, screen_type) for s in self.screen_stack)
 
     def action_noop(self) -> None:
-        """Intentional no-op — absorbs SkipAction from ctrl+c copy."""
+        """Intentional no-op — absorbs SkipAction from super+c copy."""
+
+    def action_exit_signal(self) -> None:
+        """Double ctrl-c exit: first press shows rose hint, second exits."""
+        if self._exit_pending:
+            self.exit()
+            return
+        self._exit_pending = True
+        bar = self.query_one(ClouStatusBar)
+        bar.exit_hint = "ctrl-c to exit"
+        if self._exit_timer is not None:
+            self._exit_timer.stop()
+        self._exit_timer = self.set_timer(2.0, self._clear_exit_hint)
+
+    def _clear_exit_hint(self) -> None:
+        """Reset exit signal after the 2 s window expires."""
+        self._exit_pending = False
+        self._exit_timer = None
+        try:
+            bar = self.query_one(ClouStatusBar)
+            bar.exit_hint = ""
+        except Exception:
+            pass
 
     def action_clear(self) -> None:
         """Clear the conversation history and any active stream."""
@@ -947,8 +976,9 @@ class ClouApp(App[None]):
             # Use description as display name; store in agent map for
             # progress/completion lookup.
             desc = description.strip()[:60] or "agent"
-            self._agent_task_map[task_id] = desc
-            model.unmapped_agents[desc] = TaskState(
+            key = f"{desc}:{task_id}"
+            self._agent_task_map[task_id] = key
+            model.unmapped_agents[key] = TaskState(
                 status="active", agent_id=task_id,
             )
 
@@ -979,15 +1009,16 @@ class ClouApp(App[None]):
         compose.py exists (e.g. during PLAN #1).
         """
         desc = description.strip()[:60] or "agent"
+        key = f"{desc}:{task_id}"
         if self._task_graph_model is None:
             self._task_graph_model = TaskGraphModel(
-                tasks=[{"name": desc}], deps={},
+                tasks=[{"name": key}], deps={},
             )
             self._synthetic_dag = True
-        elif desc not in self._task_graph_model.task_states:
+        elif key not in self._task_graph_model.task_states:
             # Rebuild with the new task, preserving existing states.
             existing = list(self._task_graph_model.task_states.keys())
-            existing.append(desc)
+            existing.append(key)
             old_states = dict(self._task_graph_model.task_states)
             self._task_graph_model = TaskGraphModel(
                 tasks=[{"name": n} for n in existing], deps={},
@@ -996,8 +1027,8 @@ class ClouApp(App[None]):
                 if name in self._task_graph_model.task_states:
                     self._task_graph_model.task_states[name] = state
 
-        self._agent_task_map[task_id] = desc
-        self._task_graph_model.activate_task(desc, task_id)
+        self._agent_task_map[task_id] = key
+        self._task_graph_model.activate_task(key, task_id)
         try:
             self.query_one(TaskGraphWidget).update_model(
                 self._task_graph_model
@@ -1019,8 +1050,27 @@ class ClouApp(App[None]):
             state = model.unmapped_agents.get(task_name)
         if state is None:
             return
+        # tool_count tracks the SDK's cumulative tool_uses counter.  It may
+        # exceed len(tool_invocations) when batched progress events skip
+        # intermediate counts -- this is intentional.  tool_count gates new-
+        # tool detection; tool_invocations records only the calls we observe.
         if msg.tool_uses > state.tool_count and msg.last_tool:
-            state.tool_calls.append((msg.last_tool, ""))
+            # Look up the latest transcript entry for live enrichment.
+            _entry = _get_transcript_store().get_latest_entry(msg.task_id)
+            if _entry is not None and _entry.tool_name == msg.last_tool:
+                _input_summary = _tool_summary(_entry.tool_name, _entry.tool_input)
+                _output_summary = _entry.tool_response
+            else:
+                _input_summary = ""
+                _output_summary = ""
+            invocation = model.add_tool_call(
+                task_name, msg.last_tool, _input_summary,
+                output_summary=_output_summary,
+            )
+            if invocation is not None:
+                self.post_message(ClouToolCallRecorded(
+                    task_name=task_name, invocation=invocation,
+                ))
         state.tool_count = msg.tool_uses
         state.last_tool = msg.last_tool
         try:
@@ -1048,12 +1098,39 @@ class ClouApp(App[None]):
             model.complete_task(task_name, msg.status, summary)
         elif task_name in model.unmapped_agents:
             state = model.unmapped_agents[task_name]
-            state.status = msg.status
+            _status = msg.status
+            if _status == "completed":
+                _status = "complete"
+            state.status = _status
             state.summary = summary
         try:
             self.query_one(TaskGraphWidget).update_model(model)
         except LookupError:
             pass
+
+    def on_request_agent_detail(self, msg: RequestAgentDetail) -> None:
+        """Push the agent detail screen for the requested task."""
+        from clou.ui.screens.agent_detail import AgentDetailScreen
+
+        if self._has_screen(AgentDetailScreen):
+            return
+        model = self._task_graph_model
+        if model is None:
+            return
+        state = model.task_states.get(msg.task_name)
+        if state is None:
+            state = model.unmapped_agents.get(msg.task_name)
+
+        # Enrich tool invocations from transcript data (completed agents only).
+        if state is not None:
+            from clou.ui.enrich import enrich_invocations
+
+            enrich_invocations(msg.task_name, state)
+
+        self.push_screen(AgentDetailScreen(
+            task_name=msg.task_name,
+            task_state=state,
+        ))
 
     def on_clou_escalation_arrived(self, msg: ClouEscalationArrived) -> None:
         """Escalation arrived — queue and enter decision mode."""
