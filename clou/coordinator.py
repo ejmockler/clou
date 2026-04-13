@@ -53,8 +53,12 @@ from clou.ui.bridge import is_task_complete, is_task_progress, is_task_started
 from clou.ui.task_graph import match_agent_to_task
 from clou.prompts import build_cycle_prompt, load_prompt
 from clou.recovery import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_RETRY_COOLDOWN,
+    ErrorKind,
     archive_milestone_episodic,
     attempt_self_heal,
+    classify_error,
     consolidate_milestone,
     determine_next_cycle,
     git_commit_phase,
@@ -98,6 +102,7 @@ _NEXT_STEP: dict[str, str] = {
     "PLAN": "EXECUTE",
     "EXECUTE": "ASSESS",
     "ASSESS": "VERIFY",
+    "REPLAN": "EXECUTE",
     "VERIFY": "EXIT",
     "EXIT": "COMPLETE",
 }
@@ -105,6 +110,69 @@ _MAX_VALIDATION_RETRIES = 3
 _MAX_CRASH_RETRIES = 3
 _STALENESS_THRESHOLD = 3
 _MAX_BUDGET_USD: float | None = None  # No per-cycle cost cap by default
+_MAX_TURNS: int = 200  # Per-cycle turn limit — prevents infinite agent loops
+
+
+class StalenessState:
+    """Mutable staleness tracking state -- extracted for testability."""
+
+    __slots__ = (
+        "count", "prev_cycle_type", "prev_phases_completed",
+        "saw_type_change", "last_cycle_outcome",
+    )
+
+    def __init__(
+        self,
+        *,
+        count: int = 0,
+        prev_cycle_type: str | None = None,
+        prev_phases_completed: int = -1,
+        saw_type_change: bool = False,
+        last_cycle_outcome: str = "ADVANCED",
+    ) -> None:
+        self.count = count
+        self.prev_cycle_type = prev_cycle_type
+        self.prev_phases_completed = prev_phases_completed
+        self.saw_type_change = saw_type_change
+        self.last_cycle_outcome = last_cycle_outcome
+
+
+def update_staleness(
+    state: StalenessState,
+    cycle_type: str,
+    phases_completed: int,
+) -> None:
+    """Update staleness state after a cycle completes.
+
+    Rules:
+    - INCONCLUSIVE / INTERRUPTED outcome: reset counter (not stuck).
+    - Cycle type changed: track the change, reset counter to 1.
+    - Phase advancement: reset counter to 1 (real progress).
+    - Same type, no advancement, but type changed since last reset:
+      reset counter to 1 (rework pattern, not staleness).
+    - Otherwise: increment counter.
+    """
+    if state.last_cycle_outcome in ("INCONCLUSIVE", "INTERRUPTED"):
+        state.count = 0
+        state.prev_cycle_type = cycle_type
+        state.prev_phases_completed = phases_completed
+        state.saw_type_change = False
+    elif cycle_type != state.prev_cycle_type:
+        state.saw_type_change = True
+        state.count = 1
+        state.prev_cycle_type = cycle_type
+        state.prev_phases_completed = phases_completed
+    elif phases_completed != state.prev_phases_completed:
+        state.count = 1
+        state.saw_type_change = False
+        state.prev_phases_completed = phases_completed
+    else:
+        if state.saw_type_change:
+            state.saw_type_change = False
+            state.count = 1
+        else:
+            state.count += 1
+
 
 # Encapsulated coordinator state — no module-level mutable variables.
 # Access via get_active_app() / set_active_app() rather than global keyword.
@@ -169,6 +237,88 @@ def _compute_abort_set(
 
     # Only abort tasks that are actually still active.
     return to_abort & active_tasks
+
+
+# ---------------------------------------------------------------------------
+# Timeout classification
+# ---------------------------------------------------------------------------
+
+
+def classify_timeout(
+    last_messages: list[object],
+    active_task_ids: set[str],
+    task_start_times: dict[str, float],
+    effective_timeout: float,
+) -> tuple[str, str]:
+    """Classify a timeout event as an interruption or a genuine crash.
+
+    Inspects the message history and agent activity to distinguish between
+    sleep/network interruptions (where the agent was recently active) and
+    genuine process crashes (where the agent was never active or stopped
+    responding long ago).
+
+    Returns ``(classification, evidence)`` where *classification* is
+    ``"interrupted"`` or ``"crashed"``.
+
+    Classification rules (evaluated in order):
+    1. No messages ever received from any task -> ``"crashed"``
+       (process never started).
+    2. Last message was a ``TaskNotificationMessage`` with status ``"failed"``
+       -> ``"crashed"`` (agent reported its own failure).
+    3. Active agents still running -> ``"interrupted"`` (agents are alive
+       but blocked on long-running tool calls, e.g. MCP brutalist panel).
+    4. Last message was a task progress message with recent tool use
+       -> ``"interrupted"`` (agent was active, likely waiting on network/sleep).
+    5. Default: ``"crashed"`` (conservative -- false negatives are worse
+       than false positives).
+    """
+    # Rule 1: no messages at all.
+    if not last_messages:
+        return ("crashed", "no messages received from any task")
+
+    last = last_messages[-1]
+
+    # Rule 2: last message reports a task failure.
+    if (
+        isinstance(last, TaskNotificationMessage)
+        and getattr(last, "status", None) == "failed"
+    ):
+        summary = getattr(last, "summary", "")
+        return (
+            "crashed",
+            f"last message was task failure notification: {summary!r}",
+        )
+
+    # Rule 3: agents are still active (spawned but not yet completed).
+    # They may be blocked on a long-running MCP tool call (e.g. the
+    # brutalist multi-model panel takes 2-12 minutes).  During that
+    # time no TaskProgressMessage is emitted because the agent is
+    # waiting for the tool response, not making new tool calls.
+    # This is work-in-progress, not a crash.
+    if active_task_ids:
+        return (
+            "interrupted",
+            f"{len(active_task_ids)} agent(s) still active "
+            f"(likely blocked on in-flight tool call)",
+        )
+
+    # Rule 4: last message was a progress message (agent was actively
+    # using tools).  The idle watchdog already only fires after
+    # effective_timeout seconds of silence, so if the *last* message
+    # in our ring buffer is a progress message, it means the agent was
+    # working right up until the timeout -- likely a long-running
+    # network call or sleep.
+    if is_task_progress(last):
+        tool = getattr(last, "last_tool_name", "unknown")
+        return (
+            "interrupted",
+            f"last message was task progress (tool={tool!r}); "
+            f"agent was active before timeout",
+        )
+
+    # Rule 5: conservative default.
+    msg_type = type(last).__name__
+    return ("crashed", f"conservative default (last message type: {msg_type})")
 
 
 def _write_failure_shard(
@@ -319,10 +469,10 @@ async def run_coordinator(
     _pending_working_tree: str | None = None
 
     # Staleness detection state (F3).
-    _prev_cycle_type: str | None = None
-    _prev_phases_completed: int = -1
-    _staleness_count: int = _initial_cp.staleness_count if _initial_cp else 0
-    _saw_type_change: bool = False  # True if cycle type changed since last reset
+    _stale = StalenessState(
+        count=_initial_cp.staleness_count if _initial_cp else 0,
+        last_cycle_outcome=_initial_cp.cycle_outcome if _initial_cp else "ADVANCED",
+    )
 
     decisions_path = clou_dir / "milestones" / milestone / "decisions.md"
     seen_path = clou_dir / "active" / "seen-escalations.txt"
@@ -336,17 +486,34 @@ async def run_coordinator(
     if esc_dir.is_dir() and checkpoint_path.exists():
         esc_files = sorted(esc_dir.glob("*.md"))
         latest = esc_files[-1] if esc_files else None
+        _esc_text = latest.read_text(encoding="utf-8") if latest else ""
         resolved = bool(
             latest
             and re.search(
                 r"(?m)^status:\s*(resolved|overridden)",
-                latest.read_text(encoding="utf-8"),
+                _esc_text,
             )
         )
         if resolved:
-            # Only reset if not already consumed (prevent replay on re-spawn).
+            # Only act if not already consumed (prevent replay on re-spawn).
             cp = parse_checkpoint(checkpoint_path.read_text())
             if cp.cycle > 0:
+                # Emit escalation.resolved telemetry (G4).
+                # Inside cp.cycle > 0 guard to prevent replay on restart.
+                # Classification uses markdown bold format: **Classification:** ...
+                _esc_class_match = re.search(
+                    r"\*\*Classification:\*\*\s*(.+)",
+                    _esc_text,
+                )
+                telemetry.event(
+                    "escalation.resolved",
+                    milestone=milestone,
+                    cycle_num=cp.cycle + 1,
+                    classification=(
+                        _esc_class_match.group(1).strip()
+                        if _esc_class_match else "unknown"
+                    ),
+                )
                 checkpoint_path.write_text(
                     render_checkpoint(
                         cycle=0,
@@ -359,6 +526,9 @@ async def run_coordinator(
                         readiness_retries=cp.readiness_retries,
                         crash_retries=cp.crash_retries,
                         staleness_count=cp.staleness_count,
+                        cycle_outcome=cp.cycle_outcome,
+                        valid_findings=cp.valid_findings,
+                        consecutive_zero_valid=cp.consecutive_zero_valid,
                     )
                 )
             log.info(
@@ -408,11 +578,11 @@ async def run_coordinator(
     milestone_marker.write_text(milestone)
 
     def _persist_retry_counters() -> None:
-        """Merge current retry counters into the checkpoint file.
+        """Merge current retry counters and cycle outcome into the checkpoint.
 
         Reads the existing checkpoint, re-renders it with the current
-        retry counter values, and writes it back.  No-op if the
-        checkpoint does not exist yet.
+        retry counter values and cycle outcome, and writes it back.
+        No-op if the checkpoint does not exist yet.
         """
         if not checkpoint_path.exists():
             return
@@ -428,11 +598,15 @@ async def run_coordinator(
                 validation_retries=validation_retries,
                 readiness_retries=readiness_retries,
                 crash_retries=crash_retries,
-                staleness_count=_staleness_count,
+                staleness_count=_stale.count,
+                cycle_outcome=_stale.last_cycle_outcome,
+                valid_findings=cp.valid_findings,
+                consecutive_zero_valid=cp.consecutive_zero_valid,
             )
         )
 
     _ms_outcome = "unknown"
+    _last_rework_decision_cycle: int | None = None  # G6: decision outcome tracking
     telemetry.event("milestone.start", milestone=milestone)
     try:
         while True:
@@ -502,6 +676,7 @@ async def run_coordinator(
             # Check checkpoint for rework before determine_next_cycle
             # collapses the next_step variants (DB-18).
             _rework_requested = False
+            _cp_pre = None
             if checkpoint_path.exists():
                 _cp_pre = parse_checkpoint(checkpoint_path.read_text())
                 if "rework" in _cp_pre.next_step.lower():
@@ -524,6 +699,61 @@ async def run_coordinator(
                     to_step="EXECUTE",
                     phase=_cp_pre.current_phase,
                 )
+                _last_rework_decision_cycle = (
+                    read_cycle_count(checkpoint_path) + 1
+                )
+
+            try:
+                telemetry.event(
+                    "read_set.composition",
+                    milestone=milestone,
+                    cycle_num=read_cycle_count(checkpoint_path) + 1,
+                    cycle_type=cycle_type,
+                    file_count=len(read_set),
+                    files=read_set,
+                )
+            except Exception:
+                pass  # telemetry must never break the orchestrator
+
+            # Emit quality gate decision telemetry (I3/F3).
+            # _cp_pre.step tells us what the previous cycle type was;
+            # cycle_type tells us what comes next after the gate.
+            # Use _cp_pre.cycle + 1 for the current cycle number —
+            # consistent with _run_single_cycle's cycle_num parameter.
+            if _cp_pre is not None:
+                try:
+                    _prev_step = _cp_pre.step
+                    _current_cycle_num = _cp_pre.cycle + 1
+                    if _prev_step == "ASSESS":
+                        if cycle_type == "EXECUTE" and _rework_requested:
+                            _gate_decision = "rework"
+                        elif cycle_type == "EXECUTE":
+                            _gate_decision = "advance"
+                        else:
+                            _gate_decision = "accept"
+                        telemetry.event(
+                            "quality_gate.decision",
+                            milestone=milestone,
+                            cycle_num=_current_cycle_num,
+                            gate_type="assess",
+                            decision=_gate_decision,
+                        )
+                    elif _prev_step == "VERIFY":
+                        if cycle_type == "EXECUTE" and _rework_requested:
+                            _gate_decision = "rework"
+                        elif cycle_type == "EXECUTE":
+                            _gate_decision = "advance"
+                        else:
+                            _gate_decision = "accept"
+                        telemetry.event(
+                            "quality_gate.decision",
+                            milestone=milestone,
+                            cycle_num=_current_cycle_num,
+                            gate_type="verify",
+                            decision=_gate_decision,
+                        )
+                except Exception:
+                    log.warning("Gate telemetry emission failed", exc_info=True)
 
             if cycle_type == "COMPLETE":
                 log.info("Milestone %r complete", milestone)
@@ -553,39 +783,19 @@ async def run_coordinator(
                 else None
             )
             _phases_now = _cp_now.phases_completed if _cp_now else 0
-            if cycle_type != _prev_cycle_type:
-                # Cycle type changed (e.g. EXECUTE→ASSESS or ASSESS→EXECUTE).
-                # Track the change but don't count as staleness.
-                _saw_type_change = True
-                _staleness_count = 1
-                _prev_cycle_type = cycle_type
-                _prev_phases_completed = _phases_now
-            elif _phases_now != _prev_phases_completed:
-                # Phase advancement — real progress.
-                _staleness_count = 1
-                _saw_type_change = False
-                _prev_phases_completed = _phases_now
-            else:
-                # Same cycle type, same phases_completed.
-                # Only count as stale if we haven't seen a type change
-                # (i.e. an ASSESS cycle) since the last reset.
-                # EXECUTE→ASSESS→EXECUTE(rework) is progress, not staleness.
-                if _saw_type_change:
-                    _saw_type_change = False
-                    _staleness_count = 1
-                else:
-                    _staleness_count += 1
 
-            if _staleness_count >= _STALENESS_THRESHOLD:
+            update_staleness(_stale, cycle_type, _phases_now)
+
+            if _stale.count >= _STALENESS_THRESHOLD:
                 _cp_next = _cp_now.next_step if _cp_now else "unknown"
                 log.warning(
                     "Staleness detected for %r: %s repeated %d times "
                     "with phases_completed=%d",
-                    milestone, cycle_type, _staleness_count, _phases_now,
+                    milestone, cycle_type, _stale.count, _phases_now,
                 )
                 await write_staleness_escalation(
                     project_dir, milestone, cycle_type,
-                    _staleness_count, _phases_now, _cp_next,
+                    _stale.count, _phases_now, _cp_next,
                 )
                 telemetry.event(
                     "escalation.created", milestone=milestone,
@@ -668,6 +878,40 @@ async def run_coordinator(
                 except Exception:
                     pass
 
+            # Compute routing context for ASSESS cycles — deterministic
+            # graph computation so the coordinator only judges findings.
+            _routing_context: dict[str, Any] | None = None
+            if cycle_type == "ASSESS" and dag_data is not None:
+                try:
+                    from clou.graph import compute_layers
+
+                    _cp_rc = parse_checkpoint(checkpoint_path.read_text())
+                    tasks_list_rc, deps_dict_rc = dag_data
+                    layers_rc = compute_layers(tasks_list_rc, deps_dict_rc)
+
+                    # Find current layer and next phase
+                    current_layer: list[str] = []
+                    next_phase = "all_complete"
+                    for i, layer in enumerate(layers_rc):
+                        if _cp_rc.current_phase in layer:
+                            current_layer = layer
+                            if i + 1 < len(layers_rc):
+                                next_phase = layers_rc[i + 1][0]
+                            break
+
+                    _routing_context = {
+                        "current_layer": current_layer,
+                        "next_phase": next_phase,
+                        "layer_size": len(current_layer),
+                        "phases_completed": _cp_rc.phases_completed,
+                        "phases_total": _cp_rc.phases_total,
+                    }
+                except Exception:
+                    log.debug(
+                        "Could not compute routing context for ASSESS",
+                        exc_info=True,
+                    )
+
             prompt = build_cycle_prompt(
                 project_dir,
                 milestone,
@@ -678,6 +922,7 @@ async def run_coordinator(
                 dag_data=dag_data if cycle_type == "EXECUTE" else None,
                 working_tree_state=env_state,
                 current_phase=_current_phase,
+                routing_context=_routing_context,
             )
             pending_validation_errors = None  # consumed
             _pending_working_tree = None
@@ -710,17 +955,92 @@ async def run_coordinator(
             _tracker.reset_cycle_peak()
             with telemetry.span(
                 "cycle", milestone=milestone, cycle_num=cycle_count + 1,
-                cycle_type=cycle_type,
+                cycle_type=cycle_type, phase=_current_phase or "",
             ) as _cy:
+                _crash_context: dict[str, str] = {}
                 status = await _run_single_cycle(
                     project_dir, milestone, cycle_type, prompt,
                     cycle_num=cycle_count + 1, template=tmpl, app=app,
+                    crash_context=_crash_context,
                 )
                 _tok_after = _tracker.coordinator(milestone)
                 _cy["outcome"] = status
                 _cy["input_tokens"] = _tok_after["input"] - _tok_before["input"]
                 _cy["output_tokens"] = _tok_after["output"] - _tok_before["output"]
                 _cy["peak_input_tokens"] = _tracker.cycle_peak_input
+
+                # Convergence tracking: enrich cycle span with checkpoint
+                # convergence fields written by the coordinator agent.
+                if checkpoint_path.exists():
+                    try:
+                        _cp_post = parse_checkpoint(
+                            checkpoint_path.read_text()
+                        )
+                        _cy["valid_findings"] = _cp_post.valid_findings
+                        _cy["consecutive_zero_valid"] = (
+                            _cp_post.consecutive_zero_valid
+                        )
+                    except Exception:
+                        pass
+
+            # Compositional telemetry: reference density (DB-18).
+            try:
+                from clou.telemetry import compute_reference_density
+                ms_dir = clou_dir / "milestones" / milestone
+                output_parts = []
+                for f in ["status.md", "decisions.md", "active/coordinator.md"]:
+                    p = ms_dir / f
+                    if p.exists():
+                        output_parts.append(p.read_text(encoding="utf-8"))
+                output_text = "\n".join(output_parts)
+                refs = compute_reference_density(read_set, output_text)
+                referenced = sum(refs.values())
+                telemetry.event(
+                    "read_set.reference_density",
+                    milestone=milestone,
+                    cycle_num=cycle_count + 1,
+                    referenced_count=referenced,
+                    total_count=len(refs),
+                    density=round(referenced / len(refs), 3) if refs else 0.0,
+                    unreferenced=sorted(f for f, r in refs.items() if not r),
+                )
+            except Exception:
+                pass  # telemetry must never break the orchestrator
+
+            # Decision accuracy feedback (G6): after an ASSESS cycle that
+            # follows a rework EXECUTE, check whether the rework was productive.
+            # Must run after the cycle completes so the post-ASSESS checkpoint
+            # has valid_findings set by the coordinator agent.
+            if (
+                _last_rework_decision_cycle is not None
+                and cycle_type == "ASSESS"
+                and checkpoint_path.exists()
+            ):
+                try:
+                    _cp_g6 = parse_checkpoint(checkpoint_path.read_text())
+                    if _cp_g6.valid_findings >= 0:
+                        telemetry.event(
+                            "quality_gate.decision_outcome",
+                            milestone=milestone,
+                            cycle_num=cycle_count + 1,
+                            original_decision="rework",
+                            rework_cycle=_last_rework_decision_cycle,
+                            subsequent_valid_findings=_cp_g6.valid_findings,
+                            was_productive=_cp_g6.valid_findings > 0,
+                        )
+                        _last_rework_decision_cycle = None
+                except Exception:
+                    pass
+
+            # Classify cycle outcome for staleness tracking.
+            if status == "failed":
+                _stale.last_cycle_outcome = "FAILED"
+            elif status == "agent_team_crash":
+                _stale.last_cycle_outcome = "FAILED"
+            elif status in ("exhausted", "interrupted"):
+                _stale.last_cycle_outcome = "INTERRUPTED"
+            else:
+                _stale.last_cycle_outcome = "ADVANCED"
 
             if status == "failed":
                 crash_retries += 1
@@ -736,7 +1056,10 @@ async def run_coordinator(
                 )
                 if crash_retries >= _MAX_CRASH_RETRIES:
                     log.error("Milestone %r hit crash retry limit", milestone)
-                    await write_agent_crash_escalation(project_dir, milestone)
+                    await write_agent_crash_escalation(
+                        project_dir, milestone,
+                        error_detail=_crash_context.get("detail"),
+                    )
                     telemetry.event(
                         "escalation.created", milestone=milestone,
                         cycle_num=cycle_count + 1,
@@ -755,7 +1078,10 @@ async def run_coordinator(
                     cycle_num=cycle_count + 1,
                 )
                 log.error("Agent team crash for %r, escalating", milestone)
-                await write_agent_crash_escalation(project_dir, milestone)
+                await write_agent_crash_escalation(
+                    project_dir, milestone,
+                    error_detail=_crash_context.get("detail"),
+                )
                 telemetry.event(
                     "escalation.created", milestone=milestone,
                     cycle_num=cycle_count + 1,
@@ -765,6 +1091,25 @@ async def run_coordinator(
                 _post_new_escalations()
                 _ms_outcome = "escalated_agent_crash"
                 return "escalated_agent_crash"
+
+            if status == "interrupted":
+                telemetry.event(
+                    "timeout_interrupted", milestone=milestone,
+                    cycle_num=cycle_count + 1, cycle_type=cycle_type,
+                )
+                log.warning(
+                    "Timeout classified as interruption for %r, "
+                    "continuing from checkpoint",
+                    milestone,
+                )
+                # Interruption is not a crash -- the agent was recently
+                # active (e.g. waiting on network/sleep).  Don't
+                # increment crash_retries; persist checkpoint and retry.
+                # Apply cooldown before retrying to avoid rapid restart
+                # loops (R4: configurable cooldown for transient errors).
+                await asyncio.sleep(DEFAULT_RETRY_COOLDOWN)
+                _persist_retry_counters()
+                continue
 
             if status == "exhausted":
                 telemetry.event(
@@ -899,6 +1244,13 @@ async def run_coordinator(
                 _persist_retry_counters()
                 continue
             else:
+                # Distribution distance telemetry for PLAN cycles (DB-18).
+                if cycle_type == "PLAN":
+                    try:
+                        from clou.telemetry import emit_distribution_distance
+                        emit_distribution_distance(milestone, validation_retries)
+                    except Exception:
+                        pass  # telemetry must never break the orchestrator
                 validation_retries = 0
                 readiness_retries = 0
                 crash_retries = 0
@@ -955,6 +1307,13 @@ async def run_coordinator(
         except Exception:
             log.warning("telemetry summary write failed for %r", milestone, exc_info=True)
 
+        try:
+            from clou.telemetry import emit_channel_capacity
+            ms_dir = clou_dir / "milestones" / milestone
+            emit_channel_capacity(ms_dir, milestone)
+        except Exception:
+            pass  # telemetry must never break the orchestrator
+
         # Consolidate operational memory and archive episodic files (DB-18).
         # Runs after metrics.md is written so consolidation can read it.
         # Archive only if consolidation succeeded — don't delete episodic
@@ -997,10 +1356,22 @@ async def _run_single_cycle(
     cycle_num: int = 0,
     template: HarnessTemplate | None = None,
     app: ClouApp | None = None,
+    crash_context: dict[str, str] | None = None,
 ) -> str:
-    """Run one coordinator cycle as a fresh session."""
+    """Run one coordinator cycle as a fresh session.
+
+    *crash_context*, when provided, is a mutable dict that crash sites
+    populate with ``"detail"`` — the error message or evidence string
+    from the failing agent.  The caller reads it after the function
+    returns to include in escalation files.
+    """
     if template is None:
         template = load_template("software-construction")
+
+    # Clear transcript store at cycle start so each cycle gets a fresh slate.
+    from clou.transcript import get_store as _get_transcript_store
+
+    _get_transcript_store().clear()
 
     hooks = to_sdk_hooks(
         build_hooks(
@@ -1016,6 +1387,7 @@ async def _run_single_cycle(
         agents=_build_agents(project_dir, milestone, template),
         hooks=hooks,
         max_budget_usd=_MAX_BUDGET_USD,
+        max_turns=_MAX_TURNS,
         effort="max" if cycle_type in ("ASSESS", "VERIFY") else "high",
         mcp_servers={
             **template_mcp_servers(template),
@@ -1073,6 +1445,25 @@ async def _run_single_cycle(
     _task_start_time: dict[str, float] = {}  # task_id -> monotonic start time
     _aborted_task_ids: set[str] = set()  # task_ids already being aborted
 
+    # Agent tier tracking: description -> tier, task_id -> tier.
+    _desc_to_tier: dict[str, str] = {}
+    _task_id_to_tier: dict[str, str] = {}
+    if template is not None:
+        for _agent_spec in template.agents.values():
+            _desc_to_tier[_agent_spec.description] = _agent_spec.tier
+
+    # Per-task retry counts for transient error classification (R4).
+    # Tracks how many times each task has been retried within this cycle.
+    # Reset per-cycle (does not survive across cycles).
+    _task_retry_counts: dict[str, int] = {}
+    # Whether this cycle had any terminal task failures (drives crash_retries).
+    _had_terminal_failure: bool = False
+
+    # Ring buffer of recent coordinator messages for timeout classification.
+    # Keeps the last 3 messages so classify_timeout() can inspect what the
+    # agent was doing when the idle watchdog fired.
+    _recent_messages: deque[object] = deque(maxlen=3)
+
     # Compute effective wall-clock timeout for the entire dispatch.
     # Uses the maximum timeout_seconds across all tasks with resource
     # bounds, falling back to _DEFAULT_TIMEOUT_SECONDS.  This provides
@@ -1118,16 +1509,18 @@ async def _run_single_cycle(
             await coordinator.query(prompt)
 
             try:
-                # Idle watchdog: the timeout is rescheduled on every
-                # coordinator message, so it only fires when no progress
-                # arrives for _effective_timeout seconds.  Agents actively
-                # working emit TaskProgressMessage on every tool use, so
-                # a long-running dispatch with healthy progress will never
-                # hit this timeout.
+                # Idle watchdog: fires only when the system is genuinely
+                # idle — no active agents AND no coordinator messages for
+                # _effective_timeout seconds.  While agents are active
+                # (spawned but not yet completed), the watchdog is
+                # suppressed — the system is working, just waiting on
+                # tool responses (e.g. MCP brutalist panel, 2-12 min).
+                # Per-task resource bounds handle individual agent
+                # timeouts; the idle watchdog catches coordinator stalls.
                 loop = asyncio.get_event_loop()
                 async with asyncio.timeout(_effective_timeout) as _idle_cm:
                     async for msg in coordinator.receive_response():
-                        _idle_cm.reschedule(loop.time() + _effective_timeout)
+                        _recent_messages.append(msg)
                         _track(msg, tier="coordinator", milestone=milestone)
 
                         if app is not None:
@@ -1154,24 +1547,46 @@ async def _run_single_cycle(
 
                         # Agent lifecycle telemetry -- uses shared classification
                         # helpers from bridge.py instead of duplicating duck-typing.
+                        # NOTE: This block runs BEFORE the timeout reschedule
+                        # so that _active_task_ids is populated when the
+                        # multiplier check fires.  Previously, the reschedule
+                        # ran first, creating a race where TaskStartedMessage
+                        # processing added the task AFTER the multiplier check
+                        # had already used the un-extended timeout.
                         if is_task_started(msg):
+                            _tier = _desc_to_tier.get(
+                                msg.description, "unknown",
+                            )
+                            _task_id_to_tier[msg.task_id] = _tier
                             telemetry.event(
                                 "agent.start",
                                 milestone=milestone,
                                 cycle_num=cycle_num,
                                 task_id=msg.task_id,
                                 description=msg.description,
+                                tier=_tier,
                             )
-                            # Map task_id to task_name via fuzzy matching.
+                            # Always track as active — the idle watchdog
+                            # needs to know ANY agent is alive, not just
+                            # DAG-matched ones.  ASSESS agents (brutalist
+                            # quality gate) don't match DAG task names but
+                            # are still legitimate work-in-progress.
+                            _active_task_ids.add(msg.task_id)
+                            # Map task_id to task_name via fuzzy matching
+                            # (for per-task resource enforcement).
                             matched = match_agent_to_task(
                                 msg.description, _dag_task_names,
                             )
                             if matched:
                                 _task_id_to_name[msg.task_id] = matched
-                                _active_task_ids.add(msg.task_id)
                                 _task_tokens.setdefault(matched, 0)
                                 import time as _time_mod
                                 _task_start_time[msg.task_id] = _time_mod.monotonic()
+                                # Register agent_id -> task_name for
+                                # transcript UI lookup.
+                                _get_transcript_store().register_task_mapping(
+                                    msg.task_id, matched,
+                                )
 
                         elif is_task_progress(msg):
                             # TaskProgressMessage -- track quality gate tools.
@@ -1238,20 +1653,27 @@ async def _run_single_cycle(
                                             msg.task_id, exc_info=True,
                                         )
                                     # Write failure shard.
-                                    _current_phase = None
-                                    try:
-                                        from clou.recovery import parse_checkpoint as _pc
-                                        cp_path = (
-                                            clou_dir / "milestones" / milestone
-                                            / "active" / "coordinator.md"
-                                        )
-                                        if cp_path.exists():
-                                            _current_phase = _pc(
-                                                cp_path.read_text(encoding="utf-8")
-                                            ).current_phase
-                                    except Exception:
-                                        pass
-                                    if _current_phase:
+                                    # Use the task's own function name as
+                                    # the phase directory — workers write
+                                    # shards under phases/{function_name}/,
+                                    # not under the coordinator's
+                                    # current_phase.  Fall back to
+                                    # current_phase for backward compat.
+                                    _shard_phase = task_name
+                                    if not _shard_phase:
+                                        try:
+                                            from clou.recovery import parse_checkpoint as _pc
+                                            cp_path = (
+                                                clou_dir / "milestones" / milestone
+                                                / "active" / "coordinator.md"
+                                            )
+                                            if cp_path.exists():
+                                                _shard_phase = _pc(
+                                                    cp_path.read_text(encoding="utf-8")
+                                                ).current_phase
+                                        except Exception:
+                                            pass
+                                    if _shard_phase:
                                         active_names = {
                                             _task_id_to_name[tid]
                                             for tid in _active_task_ids
@@ -1268,7 +1690,7 @@ async def _run_single_cycle(
                                             clou_dir / "milestones" / milestone
                                         )
                                         _write_failure_shard(
-                                            ms_dir, _current_phase,
+                                            ms_dir, _shard_phase,
                                             task_name, _violation_type,
                                             _violation_detail,
                                             impact,
@@ -1283,10 +1705,28 @@ async def _run_single_cycle(
                                 task_id=msg.task_id,
                                 status=msg.status,
                                 total_tokens=_au.get("total_tokens", 0),
+                                input_tokens=_au.get("input_tokens", 0),
+                                output_tokens=_au.get("output_tokens", 0),
                                 tool_uses=_au.get("tool_uses", 0),
+                                tier=_task_id_to_tier.get(
+                                    msg.task_id, "unknown",
+                                ),
                             )
                             # Remove from active set.
                             _active_task_ids.discard(msg.task_id)
+
+                        # Reschedule the idle watchdog AFTER agent lifecycle
+                        # Reschedule the idle watchdog.  While agents are
+                        # active, suppress entirely — they may be blocked
+                        # on in-flight tool calls that emit no progress.
+                        # The per-task resource enforcement (budget and
+                        # wall-clock checks on TaskProgressMessage) handles
+                        # runaway agents.  The idle watchdog's job is to
+                        # catch coordinator stalls when NO work is happening.
+                        if _active_task_ids:
+                            _idle_cm.reschedule(loop.time() + 86400)
+                        else:
+                            _idle_cm.reschedule(loop.time() + _effective_timeout)
 
                         if _context_exhausted(msg):
                             log.warning(
@@ -1306,6 +1746,64 @@ async def _run_single_cycle(
                             failed_task_name = _task_id_to_name.get(msg.task_id)
                             _active_task_ids.discard(msg.task_id)
 
+                            # --- Error classification (R4) ---
+                            # Classify the error before deciding abort vs retry.
+                            _error_msg = getattr(msg, "summary", "") or ""
+                            _retry_count = _task_retry_counts.get(
+                                failed_task_name or "", 0,
+                            )
+                            _err_kind, _err_reason = classify_error(
+                                _error_msg,
+                                failed_task_name or "(unknown)",
+                                retry_count=_retry_count,
+                                max_retries=DEFAULT_MAX_RETRIES,
+                            )
+                            telemetry.event(
+                                "error_classification",
+                                milestone=milestone,
+                                cycle_num=cycle_num,
+                                task_name=failed_task_name or "(unknown)",
+                                error_kind=_err_kind.value,
+                                reason=_err_reason,
+                                retry_count=_retry_count,
+                            )
+
+                            if (
+                                _err_kind == ErrorKind.TRANSIENT
+                                and failed_task_name
+                            ):
+                                # Transient error: log and let siblings
+                                # continue.  Don't abort dependents -- the
+                                # task will be retried on the next cycle.
+                                _task_retry_counts[failed_task_name] = (
+                                    _retry_count + 1
+                                )
+                                log.warning(
+                                    "Transient error for task %r in %r, "
+                                    "retry %d/%d after cooldown: %s",
+                                    failed_task_name,
+                                    milestone,
+                                    _retry_count + 1,
+                                    DEFAULT_MAX_RETRIES,
+                                    _err_reason,
+                                )
+                                # Continue the message loop -- independent
+                                # siblings keep running, and this cycle will
+                                # return "interrupted" so the outer loop
+                                # retries without incrementing crash_retries.
+                                continue
+
+                            # Terminal error: mark the cycle and proceed
+                            # with existing abort/escalation logic.
+                            _had_terminal_failure = True
+                            log.warning(
+                                "Terminal error for task %r in %r, "
+                                "escalating immediately: %s",
+                                failed_task_name or "(unknown)",
+                                milestone,
+                                _err_reason,
+                            )
+
                             if not _dag_deps or not failed_task_name:
                                 # No DAG context or unknown task -- fall back to
                                 # original blanket-abort behavior.
@@ -1314,6 +1812,11 @@ async def _run_single_cycle(
                                     milestone,
                                     msg.summary,
                                 )
+                                if crash_context is not None:
+                                    crash_context["detail"] = (
+                                        f"Task {failed_task_name or '(unknown)'} "
+                                        f"failed: {msg.summary}"
+                                    )
                                 await coordinator.query(
                                     "Agent team member crashed. Preserve all "
                                     "execution.md entries. Do NOT retry. Write "
@@ -1363,6 +1866,12 @@ async def _run_single_cycle(
                             # tell the coordinator to checkpoint and exit.
                             remaining = active_names - abort_set
                             if not remaining:
+                                if crash_context is not None:
+                                    crash_context["detail"] = (
+                                        f"Task {failed_task_name!r} failed "
+                                        f"(all dependents aborted): "
+                                        f"{msg.summary}"
+                                    )
                                 await coordinator.query(
                                     f"Task {failed_task_name!r} failed. All "
                                     f"remaining tasks depend on it and are being "
@@ -1376,21 +1885,33 @@ async def _run_single_cycle(
 
             except TimeoutError:
                 # Idle watchdog fired -- no coordinator message for
-                # _effective_timeout seconds.  Something is stuck; write
-                # failure shards for all still-active tasks and return as
-                # agent_team_crash so the outer loop escalates properly.
-                log.warning(
-                    "Idle watchdog fired for %r after %.0fs of no progress",
-                    milestone, _effective_timeout,
+                # _effective_timeout seconds.  Classify whether this is
+                # an interruption (agent was recently active) or a
+                # genuine crash (agent stopped responding).
+                classification, evidence = classify_timeout(
+                    list(_recent_messages),
+                    _active_task_ids,
+                    _task_start_time,
+                    _effective_timeout,
                 )
-                _current_phase = None
+                log.warning(
+                    "Idle watchdog fired for %r after %.0fs: "
+                    "classification=%s, evidence=%s",
+                    milestone, _effective_timeout,
+                    classification, evidence,
+                )
+
+                # Read current_phase as fallback only — each task
+                # should use its own function name as the phase
+                # directory for shard placement.
+                _fallback_phase = None
                 try:
                     cp_path = (
                         clou_dir / "milestones" / milestone
                         / "active" / "coordinator.md"
                     )
                     if cp_path.exists():
-                        _current_phase = parse_checkpoint(
+                        _fallback_phase = parse_checkpoint(
                             cp_path.read_text(encoding="utf-8")
                         ).current_phase
                 except Exception:
@@ -1410,26 +1931,68 @@ async def _run_single_cycle(
                     impact = sorted(
                         _compute_abort_set(task_name, _dag_deps, active_names)
                     )
-                    if _current_phase:
+                    # Use the task's function name as the phase
+                    # directory; fall back to coordinator's
+                    # current_phase for backward compatibility.
+                    _shard_phase = task_name or _fallback_phase
+                    if _shard_phase:
                         _write_failure_shard(
-                            ms_dir, _current_phase,
+                            ms_dir, _shard_phase,
                             task_name, "timeout",
                             f"Task terminated after {int(_effective_timeout)}s "
                             f"idle (no coordinator progress)",
                             impact,
                         )
+
+                if classification == "interrupted":
+                    return "interrupted"
+                if crash_context is not None:
+                    crash_context["detail"] = (
+                        f"Idle watchdog timeout after {int(_effective_timeout)}s: "
+                        f"classification={classification}, evidence={evidence}"
+                    )
                 return "agent_team_crash"
 
         # Emit quality gate telemetry after ASSESS cycle completes (DB-18).
         if _qg_expected:
+            if _qg_seen == _qg_expected:
+                _qg_status = "full"
+            elif _qg_seen:
+                _qg_status = "partial"
+            else:
+                _qg_status = "degraded"
             telemetry.event(
                 "quality_gate.result",
                 milestone=milestone,
                 cycle_num=cycle_num,
+                status=_qg_status,
                 tools_invoked=sorted(_qg_seen),
                 tools_unavailable=sorted(_qg_expected - _qg_seen),
-                finding_count=len(_qg_seen),
+                tools_invoked_count=len(_qg_seen),
             )
+            if _qg_status == "degraded":
+                log.warning(
+                    "Quality gate degraded for %r cycle %d: "
+                    "no expected tools invoked (expected: %s)",
+                    milestone, cycle_num, sorted(_qg_expected),
+                )
+                telemetry.event(
+                    "quality_gate.degraded",
+                    milestone=milestone,
+                    cycle_num=cycle_num,
+                    expected_tools=sorted(_qg_expected),
+                )
+
+        # If the cycle had transient (but no terminal) failures,
+        # return "interrupted" so the outer loop retries without
+        # incrementing crash_retries (R4).
+        if _task_retry_counts and not _had_terminal_failure:
+            log.info(
+                "Cycle completed with transient failures for %r: %s",
+                milestone,
+                {k: v for k, v in _task_retry_counts.items()},
+            )
+            return "interrupted"
 
         return read_cycle_outcome(project_dir, milestone)
 

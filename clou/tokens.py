@@ -26,24 +26,24 @@ from enum import Enum
 
 # Model and context window configuration — single source of truth.
 MODEL = "opus"
-CONTEXT_WINDOW = 200_000  # Opus context window in tokens
+CONTEXT_WINDOW = 1_000_000  # Opus 4.6 1M context window
 
 # ---------------------------------------------------------------------------
 # Graduated context thresholds (derived from Claude Code's proven math)
 # ---------------------------------------------------------------------------
 # Reserve for model output during normal operation.
-_OUTPUT_BUDGET = 20_000
+_OUTPUT_BUDGET = 32_000
 # Effective context available for input (prompt + messages).
-EFFECTIVE_WINDOW = CONTEXT_WINDOW - _OUTPUT_BUDGET  # 180k
+EFFECTIVE_WINDOW = CONTEXT_WINDOW - _OUTPUT_BUDGET  # 968k
 
 # Buffers subtracted from EFFECTIVE_WINDOW to produce thresholds.
-WARN_BUFFER = 20_000      # Show ambient indicator
-COMPACT_BUFFER = 13_000   # Auto-trigger compaction
-BLOCK_BUFFER = 3_000      # Hard stop — force checkpoint
+WARN_BUFFER = 100_000     # Show ambient indicator
+COMPACT_BUFFER = 65_000   # Auto-trigger compaction
+BLOCK_BUFFER = 15_000     # Hard stop — force checkpoint
 
-WARN_THRESHOLD = EFFECTIVE_WINDOW - WARN_BUFFER       # 140k
-COMPACT_THRESHOLD = EFFECTIVE_WINDOW - COMPACT_BUFFER  # 167k
-BLOCK_THRESHOLD = EFFECTIVE_WINDOW - BLOCK_BUFFER      # 177k
+WARN_THRESHOLD = EFFECTIVE_WINDOW - WARN_BUFFER       # 868k
+COMPACT_THRESHOLD = EFFECTIVE_WINDOW - COMPACT_BUFFER  # 903k
+BLOCK_THRESHOLD = EFFECTIVE_WINDOW - BLOCK_BUFFER      # 953k
 
 
 class ContextPressure(Enum):

@@ -15,15 +15,25 @@ format tokens are wasted LLM capacity.
 Public API:
     render_checkpoint(cycle, step, next_step, ...) -> str
     render_status(milestone, phase, cycle, next_step, phase_progress) -> str
+    render_status_from_checkpoint(milestone, checkpoint, phase_names) -> str
     render_execution_summary(status, tasks_total, ...) -> str
     render_execution_task(task_id, name, status, ...) -> str
     assemble_execution(summary, tasks) -> str
     sanitize_phase(phase) -> str
+
+Internal (shared across modules):
+    _extract_phase_names(ms_dir) -> list[str]
 """
 
 from __future__ import annotations
 
+import logging
 import re
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from clou.recovery_checkpoint import Checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -31,11 +41,12 @@ import re
 # validation.py and recovery.py should import these, not redefine them.
 # ---------------------------------------------------------------------------
 
-VALID_STEPS = frozenset({"PLAN", "EXECUTE", "ASSESS", "VERIFY", "EXIT"})
+VALID_STEPS = frozenset({"PLAN", "EXECUTE", "ASSESS", "REPLAN", "VERIFY", "EXIT"})
 VALID_NEXT_STEPS = frozenset({
     "PLAN", "EXECUTE", "EXECUTE (rework)", "EXECUTE (additional verification)",
-    "ASSESS", "VERIFY", "EXIT", "COMPLETE", "none",
+    "ASSESS", "REPLAN", "VERIFY", "EXIT", "COMPLETE", "none",
 })
+VALID_CYCLE_OUTCOMES = frozenset({"ADVANCED", "INCONCLUSIVE", "INTERRUPTED", "FAILED"})
 TASK_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
 PHASE_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
 
@@ -61,6 +72,30 @@ def sanitize_phase(phase: str) -> str:
     return phase
 
 
+_log = logging.getLogger(__name__)
+
+
+def _extract_phase_names(ms_dir: Path) -> list[str]:
+    """Extract ordered phase names from compose.py via the DAG parser.
+
+    Returns an empty list if compose.py does not exist or cannot be parsed.
+    Phase names are the function names from ``extract_dag_data()``, in
+    the order they appear in the source.
+    """
+    compose_path = ms_dir / "compose.py"
+    if not compose_path.exists():
+        return []
+    try:
+        from clou.graph import extract_dag_data
+
+        source = compose_path.read_text(encoding="utf-8")
+        tasks, _deps = extract_dag_data(source)
+        return [t["name"] for t in tasks]
+    except Exception:
+        _log.warning("Could not extract phase names from compose.py", exc_info=True)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint: active/coordinator.md
 # ---------------------------------------------------------------------------
@@ -78,14 +113,17 @@ def render_checkpoint(
     readiness_retries: int = 0,
     crash_retries: int = 0,
     staleness_count: int = 0,
+    cycle_outcome: str = "ADVANCED",
+    valid_findings: int = -1,
+    consecutive_zero_valid: int = 0,
 ) -> str:
     """Render a coordinator checkpoint file.
 
     All fields are always written explicitly — no omissions, no aliases,
     no ambiguity for ``parse_checkpoint()`` or ``validate_checkpoint()``.
 
-    Retry counters are keyword-only to avoid breaking existing callers
-    that pass positional arguments.
+    Retry counters, cycle_outcome, and convergence fields are keyword-only
+    to avoid breaking existing callers that pass positional arguments.
     """
     if cycle < 0:
         raise ValueError(f"cycle must be non-negative, got {cycle}")
@@ -102,6 +140,8 @@ def render_checkpoint(
             f"phases_completed ({phases_completed}) exceeds "
             f"phases_total ({phases_total})"
         )
+    if cycle_outcome not in VALID_CYCLE_OUTCOMES:
+        raise ValueError(f"invalid cycle_outcome {cycle_outcome!r}")
 
     return (
         f"cycle: {cycle}\n"
@@ -114,6 +154,9 @@ def render_checkpoint(
         f"readiness_retries: {readiness_retries}\n"
         f"crash_retries: {crash_retries}\n"
         f"staleness_count: {staleness_count}\n"
+        f"cycle_outcome: {cycle_outcome}\n"
+        f"valid_findings: {valid_findings}\n"
+        f"consecutive_zero_valid: {consecutive_zero_valid}\n"
     )
 
 
@@ -172,6 +215,52 @@ def render_status(
         lines.extend(["", "## Notes", notes])
 
     return "\n".join(lines) + "\n"
+
+
+def render_status_from_checkpoint(
+    milestone: str,
+    checkpoint: Checkpoint,
+    phase_names: list[str] | None = None,
+) -> str:
+    """Derive a status.md rendering entirely from a Checkpoint instance.
+
+    ``checkpoint`` is a ``Checkpoint`` dataclass from
+    ``clou.recovery_checkpoint``.
+
+    ``phase_names`` is the ordered list of phase names from compose.py.
+    When provided, phase progress is derived:
+      - phases before ``phases_completed`` index -> "completed"
+      - the phase at ``phases_completed`` index (if it matches
+        ``current_phase``) -> "in_progress"
+      - remaining phases -> "pending"
+
+    When ``phase_names`` is None or empty, falls back to a single-row
+    table showing ``current_phase`` as in_progress.
+    """
+    current_phase: str = checkpoint.current_phase or ""
+    cycle: int = checkpoint.cycle
+    next_step: str = checkpoint.next_step
+    phases_completed: int = checkpoint.phases_completed
+
+    phase_progress: dict[str, str] | None = None
+
+    if phase_names:
+        phase_progress = {}
+        for i, name in enumerate(phase_names):
+            if i < phases_completed:
+                phase_progress[name] = "completed"
+            elif name == current_phase:
+                phase_progress[name] = "in_progress"
+            else:
+                phase_progress[name] = "pending"
+
+    return render_status(
+        milestone=milestone,
+        phase=current_phase or "unknown",
+        cycle=cycle,
+        next_step=next_step,
+        phase_progress=phase_progress,
+    )
 
 
 # ---------------------------------------------------------------------------

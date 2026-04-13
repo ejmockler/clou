@@ -346,16 +346,7 @@ _INLINE_FALLBACK = HarnessTemplate(
             tier="brutalist",
             tools=[
                 "Read", "Write", "Grep", "Glob",
-                "mcp__brutalist__roast_codebase",
-                "mcp__brutalist__roast_architecture",
-                "mcp__brutalist__roast_security",
-                "mcp__brutalist__roast_product",
-                "mcp__brutalist__roast_infrastructure",
-                "mcp__brutalist__roast_file_structure",
-                "mcp__brutalist__roast_dependencies",
-                "mcp__brutalist__roast_test_coverage",
-                "mcp__brutalist__roast_cli_debate",
-                "mcp__brutalist__brutalist_discover",
+                "mcp__brutalist__roast",
             ],
         ),
         "assess-evaluator": AgentSpec(

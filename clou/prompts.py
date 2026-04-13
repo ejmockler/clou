@@ -7,17 +7,21 @@ Public API:
 
 from __future__ import annotations
 
+import ast
 import json
-from collections import deque
+import re
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from clou.harness import HarnessTemplate
 
 #: Bundled prompt templates shipped with the package — global, not per-project.
 _BUNDLED_PROMPTS = Path(__file__).parent / "_prompts"
+
+#: Regex for intent IDs (I1, I2, …) in compose.py docstrings.
+_INTENT_RE = re.compile(r"\bI\d+\b")
 
 
 def load_prompt(tier: str, project_dir: Path, **kwargs: str) -> str:
@@ -37,44 +41,7 @@ def load_prompt(tier: str, project_dir: Path, **kwargs: str) -> str:
     return prompt
 
 
-def _compute_layers(
-    tasks: list[dict[str, str]],
-    deps: dict[str, list[str]],
-) -> list[list[str]]:
-    """Group tasks into topological layers for parallel dispatch.
-
-    Layer 0 contains tasks with no dependencies.  Layer N contains tasks
-    whose dependencies are all in layers < N.  Tasks in the same layer can
-    be dispatched simultaneously via ``gather()``.
-    """
-    task_names = {t["name"] for t in tasks}
-    # in-degree per task (only count deps that are in our task set)
-    in_degree: dict[str, int] = {
-        name: sum(1 for d in deps.get(name, []) if d in task_names)
-        for name in task_names
-    }
-    # Reverse map: dependency -> list of dependents
-    dependents: dict[str, list[str]] = {name: [] for name in task_names}
-    for name in task_names:
-        for dep in deps.get(name, []):
-            if dep in task_names:
-                dependents[dep].append(name)
-
-    layers: list[list[str]] = []
-    queue: deque[str] = deque(n for n, d in in_degree.items() if d == 0)
-
-    while queue:
-        layer = sorted(queue)  # deterministic ordering
-        layers.append(layer)
-        next_queue: deque[str] = deque()
-        for name in layer:
-            for dep in dependents[name]:
-                in_degree[dep] -= 1
-                if in_degree[dep] == 0:
-                    next_queue.append(dep)
-        queue = next_queue
-
-    return layers
+from clou.graph import compute_layers as _compute_layers  # noqa: E402
 
 
 def build_cycle_prompt(
@@ -87,6 +54,7 @@ def build_cycle_prompt(
     dag_data: tuple[list[dict[str, str]], dict[str, list[str]]] | None = None,
     working_tree_state: str | None = None,
     current_phase: str | None = None,
+    routing_context: dict[str, Any] | None = None,
 ) -> str:
     """Construct targeted prompt for a single cycle.
 
@@ -116,18 +84,36 @@ def build_cycle_prompt(
             f"- {milestone_prefix}/phases/{{phase}}/phase.md  (phase specs — one per phase you create)",
         ]
     elif cycle_type == "EXECUTE":
-        write_paths += [
-            f"- {milestone_prefix}/phases/{phase_name}/execution.md  (agent results)",
-        ]
-        # For gather() layers, also list shard write paths so the
-        # coordinator knows which files workers will produce.
+        # List execution.md write paths for all phases in the current
+        # layer so the coordinator knows which files workers will produce.
+        if dag_data is not None and current_phase:
+            layers = _compute_layers(*dag_data)
+            colayer_names: list[str] = []
+            for layer in layers:
+                if current_phase in layer:
+                    colayer_names = layer
+                    break
+            if colayer_names:
+                for name in colayer_names:
+                    write_paths.append(
+                        f"- {milestone_prefix}/phases/{name}/execution.md  (agent results)"
+                    )
+            else:
+                write_paths.append(
+                    f"- {milestone_prefix}/phases/{phase_name}/execution.md  (agent results)"
+                )
+        else:
+            write_paths.append(
+                f"- {milestone_prefix}/phases/{phase_name}/execution.md  (agent results)"
+            )
+        # For gather() layers, also list shard write paths.
         if dag_data is not None:
             tasks_list_wr, deps_dict_wr = dag_data
             layers_wr = _compute_layers(tasks_list_wr, deps_dict_wr)
             gather_layers = [layer for layer in layers_wr if len(layer) > 1]
             if gather_layers:
                 write_paths.append(
-                    f"- {milestone_prefix}/phases/{phase_name}/"
+                    f"- {milestone_prefix}/phases/{{task}}/"
                     f"execution-{{task}}.md  (per-task shards for gather() groups)"
                 )
     elif cycle_type in ("ASSESS", "VERIFY"):
@@ -162,6 +148,40 @@ def build_cycle_prompt(
             f"Tasks: {json.dumps(tasks_list)}\n"
             f"Dependencies: {json.dumps(deps_dict)}\n"
             f"Layers: {json.dumps(layers)}"
+        )
+
+    # Extract intent→task mapping from compose.py docstrings.
+    # Shared between EXECUTE (for dispatch) and ASSESS (for per-intent evaluation).
+    if cycle_type in ("EXECUTE", "ASSESS"):
+        intent_map: dict[str, list[str]] = {}
+        compose_path = (
+            project_dir / ".clou" / "milestones" / milestone / "compose.py"
+        )
+        if compose_path.exists():
+            try:
+                _tree = ast.parse(compose_path.read_text(encoding="utf-8"))
+                for node in ast.iter_child_nodes(_tree):
+                    if isinstance(node, ast.AsyncFunctionDef):
+                        doc = ast.get_docstring(node) or ""
+                        ids = list(dict.fromkeys(_INTENT_RE.findall(doc)))
+                        if ids:
+                            intent_map[node.name] = ids
+            except Exception:
+                pass
+
+        if intent_map:
+            prompt += f"\nIntent mapping: {json.dumps(intent_map)}"
+
+    if routing_context is not None and cycle_type == "ASSESS":
+        rc = routing_context
+        prompt += (
+            "\n\n## Routing Context\n"
+            "Computed by the orchestrator — use for phase advancement.\n\n"
+            f"current_layer: {rc['current_layer']}\n"
+            f"next_phase: {rc['next_phase']}\n"
+            f"layer_size: {rc['layer_size']}\n"
+            f"phases_completed: {rc['phases_completed']}\n"
+            f"phases_total: {rc['phases_total']}\n"
         )
 
     if template:
