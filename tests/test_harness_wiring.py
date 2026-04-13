@@ -337,22 +337,22 @@ def test_convergence_recognizes_quality_gate_header() -> None:
 
     decisions = (
         "## Cycle 3 — Quality Gate Assessment\n\n"
-        "### Overridden: some finding\n"
-        "**Finding:** \"blah\"\n"
-        "**Action:** Override\n"
+        "### Noise: some finding\n"
+        "**Classification:** noise\n"
+        "**Action:** Dismissed — no changes\n"
         "**Reasoning:** not needed\n\n"
         "## Cycle 2 — Quality Gate Assessment\n\n"
-        "### Overridden: another finding\n"
-        "**Finding:** \"blah\"\n"
-        "**Action:** Override\n"
+        "### Noise: another finding\n"
+        "**Classification:** noise\n"
+        "**Action:** Dismissed — no changes\n"
         "**Reasoning:** not needed\n\n"
         "## Cycle 1 — Quality Gate Assessment\n\n"
-        "### Accepted: first finding\n"
-        "**Finding:** \"blah\"\n"
+        "### Valid: first finding\n"
+        "**Classification:** valid\n"
         "**Action:** fix it\n"
         "**Reasoning:** needed\n"
     )
-    result = assess_convergence(decisions, threshold=2)
+    result = assess_convergence(None, decisions_content=decisions, threshold=2)
     assert result.total_assess_cycles == 3
     assert result.consecutive_zero_accepts == 2
     assert result.converged is True
@@ -364,17 +364,17 @@ def test_convergence_still_recognizes_brutalist_header() -> None:
 
     decisions = (
         "## Cycle 2 — Brutalist Assessment\n\n"
-        "### Overridden: x\n"
-        "**Finding:** \"y\"\n"
-        "**Action:** Override\n"
+        "### Noise: x\n"
+        "**Classification:** noise\n"
+        "**Action:** Dismissed — no changes\n"
         "**Reasoning:** z\n\n"
         "## Cycle 1 — Brutalist Assessment\n\n"
-        "### Accepted: first\n"
-        "**Finding:** \"a\"\n"
+        "### Valid: first\n"
+        "**Classification:** valid\n"
         "**Action:** fix\n"
         "**Reasoning:** b\n"
     )
-    result = assess_convergence(decisions, threshold=1)
+    result = assess_convergence(None, decisions_content=decisions, threshold=1)
     assert result.total_assess_cycles == 2
     assert result.consecutive_zero_accepts == 1
     assert result.converged is True

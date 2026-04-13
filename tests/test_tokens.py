@@ -105,26 +105,26 @@ class TestTrack:
 
 
 class TestContextExhausted:
-    """TokenTracker.is_context_exhausted checks against 200K window."""
+    """TokenTracker.is_context_exhausted checks against 1M window."""
 
     def test_below_threshold(self) -> None:
         t = TokenTracker()
-        assert t.is_context_exhausted({"input_tokens": 100_000}) is False
+        assert t.is_context_exhausted({"input_tokens": 500_000}) is False
 
     def test_above_threshold(self) -> None:
         t = TokenTracker()
-        assert t.is_context_exhausted({"input_tokens": 160_000}) is True
+        assert t.is_context_exhausted({"input_tokens": 800_000}) is True
 
     def test_exact_threshold_is_not_exhausted(self) -> None:
         t = TokenTracker()
-        # 200_000 * 0.75 == 150_000; equal is NOT greater-than.
-        assert t.is_context_exhausted({"input_tokens": 150_000}) is False
+        # 1_000_000 * 0.75 == 750_000; equal is NOT greater-than.
+        assert t.is_context_exhausted({"input_tokens": 750_000}) is False
 
     def test_custom_threshold(self) -> None:
         t = TokenTracker()
-        # 200_000 * 0.5 == 100_000
-        assert t.is_context_exhausted({"input_tokens": 100_001}, threshold=0.5) is True
-        assert t.is_context_exhausted({"input_tokens": 100_000}, threshold=0.5) is False
+        # 1_000_000 * 0.5 == 500_000
+        assert t.is_context_exhausted({"input_tokens": 500_001}, threshold=0.5) is True
+        assert t.is_context_exhausted({"input_tokens": 500_000}, threshold=0.5) is False
 
     def test_missing_input_tokens(self) -> None:
         t = TokenTracker()

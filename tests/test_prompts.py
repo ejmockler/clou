@@ -371,6 +371,104 @@ class TestBuildCyclePromptDagContext:
             )
             assert "DAG Context" not in result, f"DAG Context in {cycle_type} prompt"
 
+    def test_execute_prompt_includes_intent_mapping(
+        self,
+        tmp_path: Path,
+        dag_data: tuple[list[dict[str, str]], dict[str, list[str]]],
+    ) -> None:
+        """EXECUTE cycle includes intent mapping when compose.py has docstrings."""
+        # Create compose.py with intent IDs in docstrings.
+        ms_dir = tmp_path / ".clou" / "milestones" / "m01"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "compose.py").write_text(
+            'async def validation_scoping():\n'
+            '    """Scope validation rules. I1 I2"""\n'
+            '    pass\n'
+            '\n'
+            'async def dag_dispatch_context():\n'
+            '    """Add DAG context. I3"""\n'
+            '    pass\n'
+        )
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m01",
+            cycle_type="EXECUTE",
+            read_set=["status.md"],
+            dag_data=dag_data,
+        )
+        assert "Intent mapping:" in result
+        assert '"validation_scoping": ["I1", "I2"]' in result
+        assert '"dag_dispatch_context": ["I3"]' in result
+
+    def test_assess_prompt_includes_intent_mapping(
+        self,
+        tmp_path: Path,
+        dag_data: tuple[list[dict[str, str]], dict[str, list[str]]],
+    ) -> None:
+        """ASSESS cycle includes intent mapping for per-intent evaluation."""
+        ms_dir = tmp_path / ".clou" / "milestones" / "m01"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "compose.py").write_text(
+            'async def validation_scoping():\n'
+            '    """Scope validation rules. I1 I2"""\n'
+            '    pass\n'
+            '\n'
+            'async def dag_dispatch_context():\n'
+            '    """Add DAG context. I3"""\n'
+            '    pass\n'
+        )
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m01",
+            cycle_type="ASSESS",
+            read_set=["status.md"],
+            dag_data=dag_data,
+        )
+        # ASSESS should NOT get DAG Context section.
+        assert "DAG Context" not in result
+        # But ASSESS SHOULD get intent mapping.
+        assert "Intent mapping:" in result
+        assert '"validation_scoping": ["I1", "I2"]' in result
+        assert '"dag_dispatch_context": ["I3"]' in result
+
+    def test_assess_prompt_no_intent_mapping_without_compose(
+        self,
+        tmp_path: Path,
+        dag_data: tuple[list[dict[str, str]], dict[str, list[str]]],
+    ) -> None:
+        """ASSESS cycle without compose.py omits intent mapping."""
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m01",
+            cycle_type="ASSESS",
+            read_set=["status.md"],
+            dag_data=dag_data,
+        )
+        assert "Intent mapping:" not in result
+
+    def test_plan_prompt_no_intent_mapping(
+        self,
+        tmp_path: Path,
+        dag_data: tuple[list[dict[str, str]], dict[str, list[str]]],
+    ) -> None:
+        """PLAN and VERIFY cycles do not include intent mapping."""
+        ms_dir = tmp_path / ".clou" / "milestones" / "m01"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "compose.py").write_text(
+            'async def some_task():\n'
+            '    """Does stuff. I1"""\n'
+            '    pass\n'
+        )
+        for cycle_type in ("PLAN", "VERIFY"):
+            result = build_cycle_prompt(
+                project_dir=tmp_path,
+                milestone="m01",
+                cycle_type=cycle_type,
+                read_set=["status.md"],
+                dag_data=dag_data,
+            )
+            assert "Intent mapping:" not in result, f"Intent mapping in {cycle_type}"
+
     def test_dag_context_coexists_with_validation_errors(
         self,
         tmp_path: Path,

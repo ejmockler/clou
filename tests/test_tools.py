@@ -187,7 +187,7 @@ def test_init_copies_prompt_files(tmp_path: Path) -> None:
         for f in _BUNDLED_PROMPTS.iterdir()
         if f.is_file() and f.name != "__init__.py"
     )
-    assert len(expected) == 16
+    assert len(expected) == 17
     assert copied == expected
 
 

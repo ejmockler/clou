@@ -62,7 +62,7 @@ class TestInitFromDagData:
     def test_empty_tasks(self) -> None:
         model = _make_model(tasks=[], deps={})
         assert model.task_states == {}
-        assert model.layers == [[]]
+        assert model.layers == []
 
 
 # ---------------------------------------------------------------------------
@@ -353,3 +353,53 @@ class TestAbortedStatus:
         assert model.task_states["build_model"].status == "failed"
         assert model.task_states["build_widget"].status == "aborted"
         assert model.task_states["build_model"].status != model.task_states["build_widget"].status
+
+
+# ---------------------------------------------------------------------------
+# T12: add_tool_call with output_summary
+# ---------------------------------------------------------------------------
+
+
+class TestAddToolCallOutputSummary:
+    def test_output_summary_stored(self) -> None:
+        model = _make_model()
+        model.activate_task("build_model", "agent-1")
+        inv = model.add_tool_call(
+            "build_model", "Read", "Read file.py", output_summary="42 lines"
+        )
+        assert inv is not None
+        assert inv.output_summary == "42 lines"
+
+    def test_output_summary_defaults_to_empty(self) -> None:
+        model = _make_model()
+        model.activate_task("build_model", "agent-1")
+        inv = model.add_tool_call("build_model", "Read", "Read file.py")
+        assert inv is not None
+        assert inv.output_summary == ""
+
+    def test_backward_compatible_existing_callers(self) -> None:
+        """Existing 3-arg calls continue to work without output_summary."""
+        model = _make_model()
+        model.activate_task("build_model", "agent-1")
+        inv = model.add_tool_call("build_model", "Edit", "Edit line 42")
+        assert inv is not None
+        assert inv.input_summary == "Edit line 42"
+        assert inv.output_summary == ""
+
+    def test_output_summary_on_unknown_task(self) -> None:
+        model = _make_model()
+        result = model.add_tool_call(
+            "nonexistent", "Read", "x", output_summary="data"
+        )
+        assert result is None
+
+    def test_output_summary_persisted_in_invocation_list(self) -> None:
+        model = _make_model()
+        model.activate_task("build_model", "agent-1")
+        model.add_tool_call(
+            "build_model", "Read", "a.py", output_summary="contents of a.py"
+        )
+        model.add_tool_call("build_model", "Edit", "b.py")
+        invocations = model.task_states["build_model"].tool_invocations
+        assert invocations[0].output_summary == "contents of a.py"
+        assert invocations[1].output_summary == ""

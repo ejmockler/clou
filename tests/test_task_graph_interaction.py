@@ -412,7 +412,7 @@ class TestDrillDownShowsToolCalls:
         assert len(tg_rows) == 1
 
     def test_tool_groups_text_content(self) -> None:
-        """Tool groups row renders grouped tool counts."""
+        """Tool groups row renders categorized activity counts."""
         w = _make_sized_widget()
         model = _make_model()
         model.add_tool_call("build_model", "Read", "main.py")
@@ -428,9 +428,9 @@ class TestDrillDownShowsToolCalls:
             if rt == "tool_groups":
                 strip = w.render_line(y)
                 text = _strip_text(strip)
-                assert "Read" in text
-                assert "Grep" in text
-                assert "2\u00d7" in text  # 2× Read
+                # Now shows categorized: "2 reads" and "1 searches"
+                assert "2 reads" in text
+                assert "1 searches" in text
                 return
         raise AssertionError("No tool_groups row found")
 

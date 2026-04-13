@@ -9,6 +9,7 @@ Mock strategy (design principle #2 — mock at the boundary of your control):
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -209,7 +210,7 @@ class TestContextExhausted:
         assert _context_exhausted(msg) is False
 
     def test_above_threshold(self) -> None:
-        msg = _make_result(usage={"input_tokens": 200_000})
+        msg = _make_result(usage={"input_tokens": 800_000})
         assert _context_exhausted(msg) is True
 
 
@@ -260,7 +261,7 @@ class TestRunSingleCycle:
         self, project_dir: Path
     ) -> None:
         """When input_tokens exceed threshold, send checkpoint query."""
-        exhausted_msg = _make_result(usage={"input_tokens": 200_000})
+        exhausted_msg = _make_result(usage={"input_tokens": 800_000})
         client = _mock_sdk_client([exhausted_msg])
 
         with patch(f"{_PC}.ClaudeSDKClient", return_value=client):
@@ -493,7 +494,9 @@ class TestRunCoordinator:
             result = await run_coordinator(project_dir, "auth")
 
         assert result == "escalated_agent_crash"
-        mock_esc.assert_called_once_with(project_dir, "auth")
+        mock_esc.assert_called_once_with(
+            project_dir, "auth", error_detail=None,
+        )
 
     @pytest.mark.asyncio
     async def test_failed_cycle_retries(self, project_dir: Path) -> None:
@@ -745,7 +748,9 @@ class TestRunCoordinator:
             result = await run_coordinator(project_dir, "auth")
 
         assert result == "escalated_crash_loop"
-        mock_esc.assert_called_once_with(project_dir, "auth")
+        mock_esc.assert_called_once_with(
+            project_dir, "auth", error_detail=None,
+        )
 
     @pytest.mark.asyncio
     @patch(f"{_PC}._STALENESS_THRESHOLD", 100)
@@ -1934,3 +1939,848 @@ class TestAskUserTool:
         ask_user = next(t for t in captured_tools if t.name == "ask_user")
         result = await ask_user.handler({})
         assert result["is_error"] is True
+
+
+# ---------------------------------------------------------------------------
+# Parallel dispatch — clou_spawn_parallel_coordinators
+# ---------------------------------------------------------------------------
+
+
+class TestParallelDispatch:
+    """Test the clou_spawn_parallel_coordinators MCP tool.
+
+    Covers: concurrent dispatch, failure isolation, serial fallback,
+    validation failure, single milestone degenerate case.
+    """
+
+    @staticmethod
+    def _extract_parallel_handler(tmp_path: Path) -> Any:
+        """Build the MCP server and extract the parallel dispatch handler."""
+        from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server as _orig
+
+        from clou.orchestrator import _build_mcp_server
+
+        captured_tools: list[SdkMcpTool[Any]] = []
+
+        def _capture_create(name: str, **kwargs: Any) -> Any:
+            tools = kwargs.get("tools", [])
+            captured_tools.extend(tools or [])
+            return _orig(name, **kwargs)
+
+        with patch(f"{_P}.create_sdk_mcp_server", side_effect=_capture_create):
+            _build_mcp_server(tmp_path)
+
+        parallel_tool = next(
+            t for t in captured_tools
+            if t.name == "clou_spawn_parallel_coordinators"
+        )
+        return parallel_tool.handler
+
+    @pytest.mark.asyncio
+    async def test_empty_milestones_returns_error(self, tmp_path: Path) -> None:
+        """No milestones provided returns an error."""
+        handler = self._extract_parallel_handler(tmp_path)
+        result = await handler({"milestones": []})
+        assert result["is_error"] is True
+
+    @pytest.mark.asyncio
+    async def test_single_milestone_dispatches_serially(
+        self, tmp_path: Path,
+    ) -> None:
+        """Single milestone degenerates to serial dispatch."""
+        handler = self._extract_parallel_handler(tmp_path)
+
+        ms_dir = tmp_path / ".clou" / "milestones" / "auth"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "milestone.md").write_text("# Auth\n")
+
+        with patch(
+            f"{_P}.run_coordinator",
+            new_callable=AsyncMock,
+            return_value="completed",
+        ):
+            result = await handler({"milestones": ["auth"]})
+
+        text = result["content"][0]["text"]
+        assert "auth" in text
+        assert "completed" in text
+
+    @pytest.mark.asyncio
+    async def test_concurrent_dispatch_both_succeed(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two independent milestones dispatch concurrently and both succeed."""
+        handler = self._extract_parallel_handler(tmp_path)
+
+        # Set up milestone directories.
+        for ms in ("auth", "payments"):
+            ms_dir = tmp_path / ".clou" / "milestones" / ms
+            ms_dir.mkdir(parents=True)
+            (ms_dir / "milestone.md").write_text(f"# {ms}\n")
+
+        # Write roadmap with independence annotations.
+        roadmap = tmp_path / ".clou" / "roadmap.md"
+        roadmap.write_text(
+            "# Roadmap\n\n## Milestones\n\n"
+            "### 1. auth\n"
+            "**Status:** pending\n"
+            "**Summary:** Authentication\n"
+            "**Independent of:** payments\n\n"
+            "### 2. payments\n"
+            "**Status:** pending\n"
+            "**Summary:** Payment integration\n"
+            "**Independent of:** auth\n"
+        )
+
+        execution_order: list[str] = []
+
+        async def _mock_coordinator(
+            project_dir: Path, milestone: str, **kwargs: Any,
+        ) -> str:
+            execution_order.append(f"start:{milestone}")
+            await asyncio.sleep(0)  # yield to event loop
+            execution_order.append(f"end:{milestone}")
+            return "completed"
+
+        with patch(
+            f"{_P}.run_coordinator",
+            side_effect=_mock_coordinator,
+        ):
+            result = await handler({"milestones": ["auth", "payments"]})
+
+        text = result["content"][0]["text"]
+        assert "[auth]" in text
+        assert "[payments]" in text
+        assert "completed" in text
+
+        # Verify concurrent execution: both started before either ended.
+        assert execution_order[0].startswith("start:")
+        assert execution_order[1].startswith("start:")
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_one_fails_other_succeeds(
+        self, tmp_path: Path,
+    ) -> None:
+        """One coordinator fails, other completes successfully."""
+        handler = self._extract_parallel_handler(tmp_path)
+
+        for ms in ("auth", "payments"):
+            ms_dir = tmp_path / ".clou" / "milestones" / ms
+            ms_dir.mkdir(parents=True)
+            (ms_dir / "milestone.md").write_text(f"# {ms}\n")
+
+        roadmap = tmp_path / ".clou" / "roadmap.md"
+        roadmap.write_text(
+            "# Roadmap\n\n## Milestones\n\n"
+            "### 1. auth\n"
+            "**Status:** pending\n"
+            "**Summary:** Authentication\n"
+            "**Independent of:** payments\n\n"
+            "### 2. payments\n"
+            "**Status:** pending\n"
+            "**Summary:** Payment integration\n"
+            "**Independent of:** auth\n"
+        )
+
+        async def _mock_coordinator(
+            project_dir: Path, milestone: str, **kwargs: Any,
+        ) -> str:
+            if milestone == "auth":
+                raise RuntimeError("SDK connection lost")
+            return "completed"
+
+        with patch(
+            f"{_P}.run_coordinator",
+            side_effect=_mock_coordinator,
+        ):
+            result = await handler({"milestones": ["auth", "payments"]})
+
+        text = result["content"][0]["text"]
+        # Auth failed but payments succeeded.
+        assert "[payments]" in text
+        assert "completed" in text
+        # Auth error is reported.
+        assert "[auth]" in text
+        assert "error" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_one_escalates_other_succeeds(
+        self, tmp_path: Path,
+    ) -> None:
+        """One coordinator escalates, other completes successfully."""
+        handler = self._extract_parallel_handler(tmp_path)
+
+        for ms in ("auth", "payments"):
+            ms_dir = tmp_path / ".clou" / "milestones" / ms
+            ms_dir.mkdir(parents=True)
+            (ms_dir / "milestone.md").write_text(f"# {ms}\n")
+
+        roadmap = tmp_path / ".clou" / "roadmap.md"
+        roadmap.write_text(
+            "# Roadmap\n\n## Milestones\n\n"
+            "### 1. auth\n"
+            "**Status:** pending\n"
+            "**Summary:** Authentication\n"
+            "**Independent of:** payments\n\n"
+            "### 2. payments\n"
+            "**Status:** pending\n"
+            "**Summary:** Payment integration\n"
+            "**Independent of:** auth\n"
+        )
+
+        async def _mock_coordinator(
+            project_dir: Path, milestone: str, **kwargs: Any,
+        ) -> str:
+            if milestone == "auth":
+                return "escalated_cycle_limit"
+            return "completed"
+
+        with patch(
+            f"{_P}.run_coordinator",
+            side_effect=_mock_coordinator,
+        ):
+            result = await handler({"milestones": ["auth", "payments"]})
+
+        text = result["content"][0]["text"]
+        assert "[payments]" in text
+        assert "completed" in text
+        assert "[auth]" in text
+        assert "escalated" in text
+
+    @pytest.mark.asyncio
+    async def test_serial_fallback_no_independence_annotations(
+        self, tmp_path: Path,
+    ) -> None:
+        """No Independence of annotations triggers serial fallback."""
+        handler = self._extract_parallel_handler(tmp_path)
+
+        for ms in ("auth", "payments"):
+            ms_dir = tmp_path / ".clou" / "milestones" / ms
+            ms_dir.mkdir(parents=True)
+            (ms_dir / "milestone.md").write_text(f"# {ms}\n")
+
+        # Roadmap without independence annotations.
+        roadmap = tmp_path / ".clou" / "roadmap.md"
+        roadmap.write_text(
+            "# Roadmap\n\n## Milestones\n\n"
+            "### 1. auth\n"
+            "**Status:** pending\n"
+            "**Summary:** Authentication\n\n"
+            "### 2. payments\n"
+            "**Status:** pending\n"
+            "**Summary:** Payment integration\n"
+        )
+
+        call_order: list[str] = []
+
+        async def _mock_coordinator(
+            project_dir: Path, milestone: str, **kwargs: Any,
+        ) -> str:
+            call_order.append(milestone)
+            return "completed"
+
+        with patch(
+            f"{_P}.run_coordinator",
+            side_effect=_mock_coordinator,
+        ):
+            result = await handler({"milestones": ["auth", "payments"]})
+
+        text = result["content"][0]["text"]
+        assert "Serial fallback" in text
+        assert "pairwise independence" in text.lower()
+        # Both milestones ran serially.
+        assert call_order == ["auth", "payments"]
+
+    @pytest.mark.asyncio
+    async def test_serial_fallback_validation_cycle_detected(
+        self, tmp_path: Path,
+    ) -> None:
+        """Dependency cycle in roadmap triggers serial fallback."""
+        handler = self._extract_parallel_handler(tmp_path)
+
+        for ms in ("auth", "payments"):
+            ms_dir = tmp_path / ".clou" / "milestones" / ms
+            ms_dir.mkdir(parents=True)
+            (ms_dir / "milestone.md").write_text(f"# {ms}\n")
+
+        # Roadmap with a cycle: auth depends on payments, payments depends on auth.
+        roadmap = tmp_path / ".clou" / "roadmap.md"
+        roadmap.write_text(
+            "# Roadmap\n\n## Milestones\n\n"
+            "### 1. auth\n"
+            "**Status:** pending\n"
+            "**Summary:** Authentication\n"
+            "**Depends on:** payments\n"
+            "**Independent of:** payments\n\n"
+            "### 2. payments\n"
+            "**Status:** pending\n"
+            "**Summary:** Payment integration\n"
+            "**Depends on:** auth\n"
+            "**Independent of:** auth\n"
+        )
+
+        async def _mock_coordinator(
+            project_dir: Path, milestone: str, **kwargs: Any,
+        ) -> str:
+            return "completed"
+
+        with patch(
+            f"{_P}.run_coordinator",
+            side_effect=_mock_coordinator,
+        ):
+            result = await handler({"milestones": ["auth", "payments"]})
+
+        text = result["content"][0]["text"]
+        assert "Serial fallback" in text
+        assert "Validation errors" in text
+
+    @pytest.mark.asyncio
+    async def test_serial_fallback_no_roadmap_file(
+        self, tmp_path: Path,
+    ) -> None:
+        """Missing roadmap.md triggers serial fallback."""
+        handler = self._extract_parallel_handler(tmp_path)
+
+        for ms in ("auth", "payments"):
+            ms_dir = tmp_path / ".clou" / "milestones" / ms
+            ms_dir.mkdir(parents=True)
+            (ms_dir / "milestone.md").write_text(f"# {ms}\n")
+
+        # Ensure roadmap does NOT exist.
+        roadmap = tmp_path / ".clou" / "roadmap.md"
+        if roadmap.exists():
+            roadmap.unlink()
+
+        async def _mock_coordinator(
+            project_dir: Path, milestone: str, **kwargs: Any,
+        ) -> str:
+            return "completed"
+
+        with patch(
+            f"{_P}.run_coordinator",
+            side_effect=_mock_coordinator,
+        ):
+            result = await handler({"milestones": ["auth", "payments"]})
+
+        text = result["content"][0]["text"]
+        assert "Serial fallback" in text
+        assert "No roadmap.md found" in text
+
+    @pytest.mark.asyncio
+    async def test_serial_fallback_cross_layer_milestones(
+        self, tmp_path: Path,
+    ) -> None:
+        """Milestones in different dependency layers trigger serial fallback.
+
+        auth and dashboard declare pairwise independence, passing the
+        pairwise check. But dashboard depends on api (a third milestone),
+        placing it in a later layer than auth. The cross-layer check fires.
+        """
+        handler = self._extract_parallel_handler(tmp_path)
+
+        for ms in ("auth", "api", "dashboard"):
+            ms_dir = tmp_path / ".clou" / "milestones" / ms
+            ms_dir.mkdir(parents=True)
+            (ms_dir / "milestone.md").write_text(f"# {ms}\n")
+
+        roadmap = tmp_path / ".clou" / "roadmap.md"
+        roadmap.write_text(
+            "# Roadmap\n\n## Milestones\n\n"
+            "### 1. auth\n"
+            "**Status:** pending\n"
+            "**Summary:** Authentication\n"
+            "**Independent of:** dashboard\n\n"
+            "### 2. api\n"
+            "**Status:** pending\n"
+            "**Summary:** API layer\n\n"
+            "### 3. dashboard\n"
+            "**Status:** pending\n"
+            "**Summary:** Dashboard\n"
+            "**Depends on:** api\n"
+            "**Independent of:** auth\n"
+        )
+
+        call_order: list[str] = []
+
+        async def _mock_coordinator(
+            project_dir: Path, milestone: str, **kwargs: Any,
+        ) -> str:
+            call_order.append(milestone)
+            return "completed"
+
+        with patch(
+            f"{_P}.run_coordinator",
+            side_effect=_mock_coordinator,
+        ):
+            result = await handler({"milestones": ["dashboard", "auth"]})
+
+        text = result["content"][0]["text"]
+        assert "Serial fallback" in text
+        assert "different dependency layers" in text
+        # F12: auth (layer 0) runs before dashboard (layer 1) regardless
+        # of caller-provided order.
+        assert call_order == ["auth", "dashboard"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_milestone_name_rejected(
+        self, tmp_path: Path,
+    ) -> None:
+        """Invalid milestone names are rejected before dispatch."""
+        handler = self._extract_parallel_handler(tmp_path)
+        with pytest.raises(ValueError, match="Invalid milestone name"):
+            await handler({"milestones": ["../evil", "auth"]})
+
+    @pytest.mark.asyncio
+    async def test_all_coordinators_fail(
+        self, tmp_path: Path,
+    ) -> None:
+        """All coordinators failing produces combined error guidance (F20)."""
+        handler = self._extract_parallel_handler(tmp_path)
+
+        for ms in ("auth", "payments"):
+            ms_dir = tmp_path / ".clou" / "milestones" / ms
+            ms_dir.mkdir(parents=True)
+            (ms_dir / "milestone.md").write_text(f"# {ms}\n")
+
+        roadmap = tmp_path / ".clou" / "roadmap.md"
+        roadmap.write_text(
+            "# Roadmap\n\n## Milestones\n\n"
+            "### 1. auth\n"
+            "**Status:** pending\n"
+            "**Summary:** Authentication\n"
+            "**Independent of:** payments\n\n"
+            "### 2. payments\n"
+            "**Status:** pending\n"
+            "**Summary:** Payment integration\n"
+            "**Independent of:** auth\n"
+        )
+
+        async def _mock_coordinator(
+            project_dir: Path, milestone: str, **kwargs: Any,
+        ) -> str:
+            return "error"
+
+        with patch(
+            f"{_P}.run_coordinator",
+            side_effect=_mock_coordinator,
+        ):
+            result = await handler({"milestones": ["auth", "payments"]})
+
+        text = result["content"][0]["text"]
+        assert "[auth]" in text
+        assert "[payments]" in text
+        assert "error" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_serial_fallback_valueerror_during_spawn(
+        self, tmp_path: Path,
+    ) -> None:
+        """ValueError during clou_spawn_coordinator in serial fallback
+        is caught; subsequent milestones still execute (F21)."""
+        handler = self._extract_parallel_handler(tmp_path)
+
+        # Only create payments directory; auth is missing to trigger
+        # the ValueError from clou_spawn_coordinator.
+        ms_dir = tmp_path / ".clou" / "milestones" / "payments"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "milestone.md").write_text("# payments\n")
+
+        # No roadmap -> serial fallback.
+
+        async def _mock_coordinator(
+            project_dir: Path, milestone: str, **kwargs: Any,
+        ) -> str:
+            return "completed"
+
+        with patch(
+            f"{_P}.run_coordinator",
+            side_effect=_mock_coordinator,
+        ):
+            result = await handler({"milestones": ["auth", "payments"]})
+
+        text = result["content"][0]["text"]
+        # auth should have an error entry from the ValueError.
+        assert "[auth]" in text
+        assert "ERROR" in text
+        # payments should still have completed.
+        assert "[payments]" in text
+        assert "completed" in text
+
+    @pytest.mark.asyncio
+    async def test_duplicate_milestone_deduped(
+        self, tmp_path: Path,
+    ) -> None:
+        """Duplicate milestone in input list is deduped (F22).
+        Only one coordinator dispatched."""
+        handler = self._extract_parallel_handler(tmp_path)
+
+        ms_dir = tmp_path / ".clou" / "milestones" / "auth"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "milestone.md").write_text("# auth\n")
+
+        call_count = 0
+
+        async def _mock_coordinator(
+            project_dir: Path, milestone: str, **kwargs: Any,
+        ) -> str:
+            nonlocal call_count
+            call_count += 1
+            return "completed"
+
+        with patch(
+            f"{_P}.run_coordinator",
+            side_effect=_mock_coordinator,
+        ):
+            result = await handler({"milestones": ["auth", "auth"]})
+
+        text = result["content"][0]["text"]
+        assert "auth" in text
+        assert "completed" in text
+        # Only one coordinator should have been dispatched (deduped to single).
+        assert call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Parallel dispatch helpers — _run_single_coordinator, _build_milestone_guidance
+# ---------------------------------------------------------------------------
+
+
+class TestBuildMilestoneGuidance:
+    """Test the _build_milestone_guidance helper."""
+
+    def test_completed_guidance(self, tmp_path: Path) -> None:
+        from clou.orchestrator import _build_milestone_guidance
+
+        guidance = _build_milestone_guidance(tmp_path, "auth", "completed")
+        assert "auth" in guidance
+        assert "completed" in guidance
+        assert "handoff.md" in guidance
+
+    def test_paused_guidance(self, tmp_path: Path) -> None:
+        from clou.orchestrator import _build_milestone_guidance
+
+        guidance = _build_milestone_guidance(tmp_path, "auth", "paused")
+        assert "paused" in guidance
+        assert "input queue" in guidance
+
+    def test_stopped_guidance(self, tmp_path: Path) -> None:
+        from clou.orchestrator import _build_milestone_guidance
+
+        guidance = _build_milestone_guidance(tmp_path, "auth", "stopped")
+        assert "stopped" in guidance
+
+    def test_escalated_guidance(self, tmp_path: Path) -> None:
+        from clou.orchestrator import _build_milestone_guidance
+
+        guidance = _build_milestone_guidance(tmp_path, "auth", "escalated_cycle_limit")
+        assert "escalated" in guidance
+        assert "escalations" in guidance
+
+    def test_error_guidance(self, tmp_path: Path) -> None:
+        from clou.orchestrator import _build_milestone_guidance
+
+        guidance = _build_milestone_guidance(tmp_path, "auth", "error")
+        assert "error" in guidance
+
+
+class TestRunSingleCoordinator:
+    """Test the _run_single_coordinator helper."""
+
+    @pytest.mark.asyncio
+    async def test_normal_completion(self, tmp_path: Path) -> None:
+        from clou.orchestrator import _run_single_coordinator
+
+        with patch(
+            f"{_P}.run_coordinator",
+            new_callable=AsyncMock,
+            return_value="completed",
+        ):
+            ms, result = await _run_single_coordinator(tmp_path, "auth")
+
+        assert ms == "auth"
+        assert result == "completed"
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_error(self, tmp_path: Path) -> None:
+        from clou.orchestrator import _run_single_coordinator
+
+        with patch(
+            f"{_P}.run_coordinator",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        ):
+            ms, result = await _run_single_coordinator(tmp_path, "auth")
+
+        assert ms == "auth"
+        assert result == "error"
+
+    @pytest.mark.asyncio
+    async def test_posts_spawned_message_to_app(self, tmp_path: Path) -> None:
+        from clou.orchestrator import _run_single_coordinator
+
+        mock_app = MagicMock()
+        posted: list[Any] = []
+        mock_app.post_message.side_effect = lambda msg: posted.append(msg)
+
+        with patch(
+            f"{_P}.run_coordinator",
+            new_callable=AsyncMock,
+            return_value="completed",
+        ):
+            await _run_single_coordinator(tmp_path, "auth", app=mock_app)
+
+        from clou.ui.messages import ClouCoordinatorSpawned, ClouCoordinatorComplete
+
+        spawned = [m for m in posted if isinstance(m, ClouCoordinatorSpawned)]
+        assert len(spawned) == 1
+        assert spawned[0].milestone == "auth"
+
+        completed = [m for m in posted if isinstance(m, ClouCoordinatorComplete)]
+        assert len(completed) == 1
+        assert completed[0].milestone == "auth"
+        assert completed[0].result == "completed"
+
+
+# ---------------------------------------------------------------------------
+# cleanup_obsolete_files tests
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupObsoleteFiles:
+    """Tests for cleanup_obsolete_files orchestrator helper."""
+
+    def _write(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+    def test_cleanup_after_completion(self, tmp_path: Path) -> None:
+        """Flagged file is deleted when coordinator completes."""
+        from clou.orchestrator import cleanup_obsolete_files
+
+        clou_dir = tmp_path / ".clou"
+        # Create the flagged file.
+        target = clou_dir / "roadmap.py.example"
+        self._write(target, "legacy content")
+        assert target.exists()
+
+        # Create handoff.md with an Obsolete flag.
+        self._write(
+            clou_dir / "milestones" / "m1" / "handoff.md",
+            "# Handoff\n\n"
+            "## Known Limitations\n"
+            "- Legacy file. Obsolete: `.clou/roadmap.py.example`\n",
+        )
+
+        deleted = cleanup_obsolete_files(tmp_path, "m1")
+        assert ".clou/roadmap.py.example" in deleted
+        assert not target.exists()
+
+    def test_no_flags_no_action(self, tmp_path: Path) -> None:
+        """Handoff.md with no Obsolete flags results in no deletions."""
+        from clou.orchestrator import cleanup_obsolete_files
+
+        clou_dir = tmp_path / ".clou"
+        self._write(
+            clou_dir / "milestones" / "m1" / "handoff.md",
+            "# Handoff\n\n"
+            "## Known Limitations\n"
+            "- Some limitation without flags.\n",
+        )
+
+        deleted = cleanup_obsolete_files(tmp_path, "m1")
+        assert deleted == []
+
+    def test_missing_handoff_no_error(self, tmp_path: Path) -> None:
+        """Missing handoff.md results in empty list, no error."""
+        from clou.orchestrator import cleanup_obsolete_files
+
+        (tmp_path / ".clou" / "milestones" / "m1").mkdir(parents=True)
+        deleted = cleanup_obsolete_files(tmp_path, "m1")
+        assert deleted == []
+
+    def test_permission_guard_rejects(self, tmp_path: Path) -> None:
+        """Flagged path outside cleanup scope is not deleted."""
+        from clou.orchestrator import cleanup_obsolete_files
+
+        clou_dir = tmp_path / ".clou"
+        # Create a file that does NOT match CLEANUP_SCOPE patterns.
+        target = clou_dir / "project.md"
+        self._write(target, "important config")
+
+        self._write(
+            clou_dir / "milestones" / "m1" / "handoff.md",
+            "# Handoff\n\n"
+            "## Known Limitations\n"
+            "- Obsolete: `.clou/project.md`\n",
+        )
+
+        deleted = cleanup_obsolete_files(tmp_path, "m1")
+        assert deleted == []
+        assert target.exists()  # file preserved
+
+    def test_flagged_file_already_absent(self, tmp_path: Path) -> None:
+        """Flagged file that does not exist results in no error."""
+        from clou.orchestrator import cleanup_obsolete_files
+
+        clou_dir = tmp_path / ".clou"
+        self._write(
+            clou_dir / "milestones" / "m1" / "handoff.md",
+            "# Handoff\n\n"
+            "## Known Limitations\n"
+            "- Obsolete: `.clou/gone.old`\n",
+        )
+
+        deleted = cleanup_obsolete_files(tmp_path, "m1")
+        assert deleted == []
+
+    def test_nested_path_rejected(self, tmp_path: Path) -> None:
+        """Flagged path in nested directory is rejected by permission guard."""
+        from clou.orchestrator import cleanup_obsolete_files
+
+        clou_dir = tmp_path / ".clou"
+        target = clou_dir / "milestones" / "m1" / "old.bak"
+        self._write(target, "nested file")
+
+        self._write(
+            clou_dir / "milestones" / "m1" / "handoff.md",
+            "# Handoff\n\n"
+            "## Known Limitations\n"
+            "- Obsolete: `.clou/milestones/m1/old.bak`\n",
+        )
+
+        deleted = cleanup_obsolete_files(tmp_path, "m1")
+        assert deleted == []
+        assert target.exists()
+
+    @pytest.mark.asyncio
+    async def test_run_single_coordinator_triggers_cleanup(
+        self, tmp_path: Path,
+    ) -> None:
+        """_run_single_coordinator calls cleanup on completion."""
+        from clou.orchestrator import _run_single_coordinator
+
+        clou_dir = tmp_path / ".clou"
+        target = clou_dir / "legacy.example"
+        self._write(target, "old template")
+
+        self._write(
+            clou_dir / "milestones" / "auth" / "handoff.md",
+            "# Handoff\n\n"
+            "## Known Limitations\n"
+            "- Obsolete: `.clou/legacy.example`\n",
+        )
+
+        with patch(
+            f"{_P}.run_coordinator",
+            new_callable=AsyncMock,
+            return_value="completed",
+        ):
+            ms, result = await _run_single_coordinator(tmp_path, "auth")
+
+        assert result == "completed"
+        assert not target.exists()
+
+    @pytest.mark.asyncio
+    async def test_run_single_coordinator_no_cleanup_on_error(
+        self, tmp_path: Path,
+    ) -> None:
+        """_run_single_coordinator does not clean up when coordinator errors."""
+        from clou.orchestrator import _run_single_coordinator
+
+        clou_dir = tmp_path / ".clou"
+        target = clou_dir / "legacy.example"
+        self._write(target, "old template")
+
+        self._write(
+            clou_dir / "milestones" / "auth" / "handoff.md",
+            "# Handoff\n\n"
+            "## Known Limitations\n"
+            "- Obsolete: `.clou/legacy.example`\n",
+        )
+
+        with patch(
+            f"{_P}.run_coordinator",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        ):
+            ms, result = await _run_single_coordinator(tmp_path, "auth")
+
+        assert result == "error"
+        assert target.exists()  # file preserved on error
+
+    def test_oserror_on_unlink_handled_gracefully(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F16: OSError during unlink() is caught and does not crash."""
+        from clou.orchestrator import cleanup_obsolete_files
+
+        clou_dir = tmp_path / ".clou"
+        target = clou_dir / "problem.example"
+        self._write(target, "locked content")
+
+        self._write(
+            clou_dir / "milestones" / "m1" / "handoff.md",
+            "# Handoff\n\n"
+            "## Known Limitations\n"
+            "- Obsolete: `.clou/problem.example`\n",
+        )
+
+        # Make unlink() raise PermissionError (subclass of OSError).
+        original_unlink = Path.unlink
+
+        def _failing_unlink(self_path: Path, *args: object, **kwargs: object) -> None:
+            if self_path.name == "problem.example":
+                raise PermissionError("Permission denied")
+            original_unlink(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", _failing_unlink)
+
+        # Should not raise — error is caught internally.
+        deleted = cleanup_obsolete_files(tmp_path, "m1")
+        assert deleted == []
+        assert target.exists()  # file preserved on error
+
+    def test_non_clou_prefix_path_skipped(self, tmp_path: Path) -> None:
+        """F17: Flagged path without .clou/ prefix is not deleted."""
+        from clou.orchestrator import cleanup_obsolete_files
+
+        clou_dir = tmp_path / ".clou"
+        # Create a file outside .clou/ that happens to exist.
+        outside_file = tmp_path / "some" / "other" / "path.bak"
+        self._write(outside_file, "external content")
+
+        self._write(
+            clou_dir / "milestones" / "m1" / "handoff.md",
+            "# Handoff\n\n"
+            "## Known Limitations\n"
+            "- Obsolete: `some/other/path.bak`\n",
+        )
+
+        deleted = cleanup_obsolete_files(tmp_path, "m1")
+        assert deleted == []
+        assert outside_file.exists()  # file not touched
+
+    def test_symlink_target_skipped(self, tmp_path: Path) -> None:
+        """F9: Symlink targets are refused for safety."""
+        from clou.orchestrator import cleanup_obsolete_files
+
+        clou_dir = tmp_path / ".clou"
+        # Create a real file and a symlink to it.
+        real_file = tmp_path / "real-data.txt"
+        real_file.write_text("important data")
+
+        symlink_target = clou_dir / "evil.example"
+        symlink_target.parent.mkdir(parents=True, exist_ok=True)
+        symlink_target.symlink_to(real_file)
+
+        self._write(
+            clou_dir / "milestones" / "m1" / "handoff.md",
+            "# Handoff\n\n"
+            "## Known Limitations\n"
+            "- Obsolete: `.clou/evil.example`\n",
+        )
+
+        deleted = cleanup_obsolete_files(tmp_path, "m1")
+        assert deleted == []
+        assert symlink_target.is_symlink()  # symlink preserved
+        assert real_file.exists()  # real file preserved

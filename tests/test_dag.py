@@ -12,7 +12,7 @@ class TestComputeLayers:
 
     def test_no_tasks(self) -> None:
         layers = _compute_layers([], {})
-        assert layers == [[]]
+        assert layers == []
 
     def test_single_task_no_deps(self) -> None:
         tasks = [{"name": "a", "status": "pending"}]

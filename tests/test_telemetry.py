@@ -382,8 +382,8 @@ class TestWriteMilestoneSummary:
                 c["output_tokens"] = 1000
             event(
                 "quality_gate.result", milestone="m1", cycle_num=3,
-                tools_invoked=["roast_codebase", "roast_security"],
-                tools_unavailable=["roast_architecture"],
+                tools_invoked=["roast"],
+                tools_unavailable=["roast_cli_debate"],
                 finding_count=7,
             )
             write_milestone_summary(tmp_path, "m1", "completed")
@@ -391,8 +391,8 @@ class TestWriteMilestoneSummary:
                 tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
             ).read_text()
             assert "## Quality Gate" in content
-            assert "roast_codebase, roast_security" in content
-            assert "roast_architecture" in content
+            assert "roast" in content
+            assert "roast_cli_debate" in content
             assert "7" in content
         finally:
             telemetry._log = old
@@ -994,7 +994,7 @@ class TestSectionOrdering:
             # Quality gate
             event(
                 "quality_gate.result", milestone="m1", cycle_num=3,
-                tools_invoked=["roast_codebase"], tools_unavailable=[],
+                tools_invoked=["roast"], tools_unavailable=[],
                 finding_count=2,
             )
             write_milestone_summary(tmp_path, "m1", "completed")

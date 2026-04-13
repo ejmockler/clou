@@ -17,8 +17,10 @@ from clou.ui.messages import (
     ClouBreathEvent,
     ClouCoordinatorSpawned,
     ClouDagUpdate,
+    ClouToolCallRecorded,
     Mode,
 )
+from clou.ui.task_graph import ToolInvocation
 from clou.ui.widgets.breath import BreathWidget
 from clou.ui.widgets.task_graph import TaskGraphWidget
 
@@ -181,7 +183,33 @@ class TestAgentSpawnActivatesTask:
             await pilot.pause()
             tg = pilot.app.query_one(TaskGraphWidget)
             assert tg._model is not None
-            assert "completely_unrelated_task" in tg._model.unmapped_agents
+            assert "completely_unrelated_task:agent-x" in tg._model.unmapped_agents
+
+    @pytest.mark.asyncio
+    async def test_duplicate_description_unmapped_agents_distinct(self) -> None:
+        """Two unmapped agents with same description but different task_ids get distinct keys."""
+        async with ClouApp().run_test() as pilot:
+            pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
+            await pilot.pause()
+            pilot.app.post_message(
+                ClouDagUpdate(tasks=SAMPLE_TASKS, deps=SAMPLE_DEPS)
+            )
+            await pilot.pause()
+            # Spawn two agents with identical descriptions but different task_ids.
+            pilot.app.post_message(
+                ClouAgentSpawned(task_id="agent-dup-1", description="same_desc")
+            )
+            await pilot.pause()
+            pilot.app.post_message(
+                ClouAgentSpawned(task_id="agent-dup-2", description="same_desc")
+            )
+            await pilot.pause()
+            tg = pilot.app.query_one(TaskGraphWidget)
+            assert tg._model is not None
+            unmapped = tg._model.unmapped_agents
+            assert len(unmapped) == 2
+            assert "same_desc:agent-dup-1" in unmapped
+            assert "same_desc:agent-dup-2" in unmapped
 
     @pytest.mark.asyncio
     async def test_early_spawn_synthetic_model(self) -> None:
@@ -201,8 +229,8 @@ class TestAgentSpawnActivatesTask:
             # Synthetic model created — task graph is visible.
             assert tg._model is not None
             assert pilot.app._synthetic_dag is True
-            assert "build_model" in tg._model.task_states
-            assert tg._model.task_states["build_model"].status == "active"
+            assert "build_model:agent-early" in tg._model.task_states
+            assert tg._model.task_states["build_model:agent-early"].status == "active"
             assert len(tg._pending_spawns) == 1
 
             # Now provide the real DAG — replaces synthetic model.
@@ -575,3 +603,188 @@ class TestCoordinatorSpawnedResets:
             assert tg._model is None
             assert len(tg._row_map) == 0
             assert tg._focused_index == -1
+
+
+# ---------------------------------------------------------------------------
+# 11. TestProgressPostsClouToolCallRecorded
+# ---------------------------------------------------------------------------
+
+
+class TestProgressPostsClouToolCallRecorded:
+    """on_clou_agent_progress creates ToolInvocation and posts ClouToolCallRecorded."""
+
+    @pytest.mark.asyncio
+    async def test_progress_creates_tool_invocation(self) -> None:
+        """ClouAgentProgress with new tool creates a ToolInvocation in task state."""
+        async with ClouApp().run_test() as pilot:
+            pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
+            await pilot.pause()
+            pilot.app.post_message(
+                ClouDagUpdate(tasks=SAMPLE_TASKS, deps=SAMPLE_DEPS)
+            )
+            await pilot.pause()
+            pilot.app.post_message(
+                ClouAgentSpawned(
+                    task_id="agent-1", description="build_model",
+                )
+            )
+            await pilot.pause()
+            pilot.app.post_message(
+                ClouAgentProgress(
+                    task_id="agent-1",
+                    last_tool="Read",
+                    total_tokens=500,
+                    tool_uses=1,
+                )
+            )
+            await pilot.pause()
+            tg = pilot.app.query_one(TaskGraphWidget)
+            assert tg._model is not None
+            state = tg._model.task_states["build_model"]
+            # A ToolInvocation should have been created.
+            assert len(state.tool_invocations) == 1
+            inv = state.tool_invocations[0]
+            assert isinstance(inv, ToolInvocation)
+            assert inv.name == "Read"
+            assert inv.category == "reads"
+            assert inv.timestamp > 0
+
+    @pytest.mark.asyncio
+    async def test_progress_posts_tool_call_recorded_message(self) -> None:
+        """ClouAgentProgress posts ClouToolCallRecorded via post_message."""
+        from unittest.mock import patch
+
+        async with ClouApp().run_test() as pilot:
+            pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
+            await pilot.pause()
+            pilot.app.post_message(
+                ClouDagUpdate(tasks=SAMPLE_TASKS, deps=SAMPLE_DEPS)
+            )
+            await pilot.pause()
+            pilot.app.post_message(
+                ClouAgentSpawned(
+                    task_id="agent-1", description="build_model",
+                )
+            )
+            await pilot.pause()
+
+            recorded: list[ClouToolCallRecorded] = []
+            original_post = pilot.app.post_message.__func__  # type: ignore[union-attr]
+
+            def spy_post(self_app: ClouApp, msg: object) -> None:
+                if isinstance(msg, ClouToolCallRecorded):
+                    recorded.append(msg)
+                original_post(self_app, msg)
+
+            with patch.object(type(pilot.app), "post_message", spy_post):
+                pilot.app.post_message(
+                    ClouAgentProgress(
+                        task_id="agent-1",
+                        last_tool="Edit",
+                        total_tokens=1000,
+                        tool_uses=1,
+                    )
+                )
+                await pilot.pause()
+
+            assert len(recorded) >= 1
+            tool_recorded = [r for r in recorded if r.task_name == "build_model"]
+            assert len(tool_recorded) == 1
+            assert isinstance(tool_recorded[0].invocation, ToolInvocation)
+            assert tool_recorded[0].invocation.name == "Edit"
+            assert tool_recorded[0].invocation.category == "writes"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_tool_uses_no_double_recording(self) -> None:
+        """Same tool_uses count does not create duplicate ToolInvocation."""
+        async with ClouApp().run_test() as pilot:
+            pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
+            await pilot.pause()
+            pilot.app.post_message(
+                ClouDagUpdate(tasks=SAMPLE_TASKS, deps=SAMPLE_DEPS)
+            )
+            await pilot.pause()
+            pilot.app.post_message(
+                ClouAgentSpawned(
+                    task_id="agent-1", description="build_model",
+                )
+            )
+            await pilot.pause()
+            # First progress event.
+            pilot.app.post_message(
+                ClouAgentProgress(
+                    task_id="agent-1",
+                    last_tool="Read",
+                    total_tokens=500,
+                    tool_uses=1,
+                )
+            )
+            await pilot.pause()
+            # Second progress event with same tool_uses count.
+            pilot.app.post_message(
+                ClouAgentProgress(
+                    task_id="agent-1",
+                    last_tool="Read",
+                    total_tokens=600,
+                    tool_uses=1,
+                )
+            )
+            await pilot.pause()
+            tg = pilot.app.query_one(TaskGraphWidget)
+            assert tg._model is not None
+            state = tg._model.task_states["build_model"]
+            # Should only have one invocation, not two.
+            assert len(state.tool_invocations) == 1
+
+    @pytest.mark.asyncio
+    async def test_sequential_tools_recorded(self) -> None:
+        """Multiple progress events with increasing tool_uses each create invocations."""
+        async with ClouApp().run_test() as pilot:
+            pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
+            await pilot.pause()
+            pilot.app.post_message(
+                ClouDagUpdate(tasks=SAMPLE_TASKS, deps=SAMPLE_DEPS)
+            )
+            await pilot.pause()
+            pilot.app.post_message(
+                ClouAgentSpawned(
+                    task_id="agent-1", description="build_model",
+                )
+            )
+            await pilot.pause()
+            for i, tool in enumerate(["Read", "Grep", "Edit"], start=1):
+                pilot.app.post_message(
+                    ClouAgentProgress(
+                        task_id="agent-1",
+                        last_tool=tool,
+                        total_tokens=i * 500,
+                        tool_uses=i,
+                    )
+                )
+                await pilot.pause()
+            tg = pilot.app.query_one(TaskGraphWidget)
+            assert tg._model is not None
+            state = tg._model.task_states["build_model"]
+            assert len(state.tool_invocations) == 3
+            names = [inv.name for inv in state.tool_invocations]
+            assert names == ["Read", "Grep", "Edit"]
+
+
+# ---------------------------------------------------------------------------
+# 12. TestStatusVocabularyNormalization
+# ---------------------------------------------------------------------------
+
+
+class TestStatusVocabularyNormalization:
+    """Verify status normalization at storage boundary."""
+
+    def test_complete_task_normalizes_completed(self) -> None:
+        """complete_task('completed') stores 'complete'."""
+        from clou.ui.task_graph import TaskGraphModel, TaskState
+        model = TaskGraphModel(
+            tasks=[{"name": "t1"}],
+            deps={},
+        )
+        model.task_states["t1"] = TaskState(status="active")
+        model.complete_task("t1", "completed", "done")
+        assert model.task_states["t1"].status == "complete"

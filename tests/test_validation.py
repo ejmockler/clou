@@ -76,6 +76,9 @@ validation_retries: 0
 readiness_retries: 0
 crash_retries: 0
 staleness_count: 0
+cycle_outcome: ADVANCED
+valid_findings: -1
+consecutive_zero_valid: 0
 """
 
 
@@ -698,15 +701,13 @@ phase_evaluated: implementation
 
 ## Tools Invoked
 
-- roast_codebase: invoked
-- roast_architecture: invoked
-- roast_security: skipped (no auth code)
+- roast (domain=codebase): invoked
 
 ## Findings
 
 ### F1: Missing error handling in API client
 **Severity:** major
-**Source tool:** roast_codebase
+**Source tool:** roast
 **Source models:** claude, codex
 **Affected files:**
   - src/api.py
@@ -715,7 +716,7 @@ phase_evaluated: implementation
 
 ### F2: Inconsistent naming
 **Severity:** minor
-**Source tool:** roast_codebase
+**Source tool:** roast
 **Source models:** gemini
 **Affected files:**
   - src/utils.py

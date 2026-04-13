@@ -30,6 +30,8 @@ from clou.coordinator import (
     _DEFAULT_TIMEOUT_SECONDS,
     _run_single_cycle,
     _write_failure_shard,
+    classify_timeout,
+    run_coordinator,
 )
 
 
@@ -698,8 +700,11 @@ async def execute():
                 project_dir, "ms", "EXECUTE", "do work",
             )
 
-        # asyncio.timeout should have fired, returning agent_team_crash.
-        assert result == "agent_team_crash"
+        # asyncio.timeout should have fired.  With the agent still active
+        # (TaskStartedMessage was received), classify_timeout returns
+        # "interrupted" — the agent is blocked on a long-running call,
+        # not crashed.
+        assert result == "interrupted"
 
         # A failure shard should be written for the hung task.
         shard_dir = ms_dir / "phases" / "build-phase"
@@ -898,3 +903,788 @@ async def execute():
         assert result == "ASSESS"
         # Single-task DAG: shard should NOT be cleaned.
         assert shard.exists(), "Shard was incorrectly cleaned for single-task DAG"
+
+
+# ---------------------------------------------------------------------------
+# classify_timeout unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyTimeout:
+    """Unit tests for the timeout classification function."""
+
+    def test_no_messages_classified_as_crashed(self) -> None:
+        """No messages received -> crashed (process never started)."""
+        classification, evidence = classify_timeout(
+            last_messages=[],
+            active_task_ids={"tid-1"},
+            task_start_times={"tid-1": 0.0},
+            effective_timeout=600.0,
+        )
+        assert classification == "crashed"
+        assert "no messages" in evidence
+
+    def test_last_message_failed_notification_classified_as_crashed(self) -> None:
+        """Last message is a failed TaskNotificationMessage -> crashed."""
+        failed_msg = _make_task_notification("tid-1", "failed", "task crashed")
+        classification, evidence = classify_timeout(
+            last_messages=[
+                _make_task_progress("tid-1", total_tokens=100),
+                failed_msg,
+            ],
+            active_task_ids={"tid-1"},
+            task_start_times={"tid-1": 0.0},
+            effective_timeout=600.0,
+        )
+        assert classification == "crashed"
+        assert "failure notification" in evidence
+
+    def test_last_message_progress_classified_as_interrupted(self) -> None:
+        """Last message is a progress message -> interrupted (agent was active).
+
+        Rule 3 (active agents) takes precedence over rule 4 (progress
+        message) when active_task_ids is non-empty.
+        """
+        progress_msg = _make_task_progress("tid-1", total_tokens=500)
+        classification, evidence = classify_timeout(
+            last_messages=[
+                _make_task_started("tid-1", "my_task"),
+                progress_msg,
+            ],
+            active_task_ids={"tid-1"},
+            task_start_times={"tid-1": 0.0},
+            effective_timeout=600.0,
+        )
+        assert classification == "interrupted"
+        assert "active" in evidence
+
+    def test_last_message_progress_no_active_agents_classified_as_interrupted(self) -> None:
+        """Last message is progress but no active agents -> rule 4 fires (tool name in evidence)."""
+        progress_msg = _make_task_progress("tid-1", total_tokens=500)
+        classification, evidence = classify_timeout(
+            last_messages=[progress_msg],
+            active_task_ids=set(),
+            task_start_times={},
+            effective_timeout=600.0,
+        )
+        assert classification == "interrupted"
+        assert "Bash" in evidence  # default tool name from _make_task_progress
+
+    def test_last_message_result_classified_as_crashed(self) -> None:
+        """Last message is a ResultMessage (not progress) -> crashed (conservative)."""
+        result_msg = _make_result(usage={"input_tokens": 100})
+        classification, evidence = classify_timeout(
+            last_messages=[result_msg],
+            active_task_ids=set(),
+            task_start_times={},
+            effective_timeout=600.0,
+        )
+        assert classification == "crashed"
+        assert "conservative default" in evidence
+
+    def test_last_message_completed_notification_classified_as_crashed(self) -> None:
+        """Last message is a completed TaskNotificationMessage -> crashed (default).
+
+        A completed notification is not a progress message and not a failure,
+        so the conservative default applies.
+        """
+        completed_msg = _make_task_notification("tid-1", "completed", "done")
+        classification, evidence = classify_timeout(
+            last_messages=[completed_msg],
+            active_task_ids=set(),
+            task_start_times={},
+            effective_timeout=600.0,
+        )
+        assert classification == "crashed"
+        assert "conservative default" in evidence
+
+    def test_classification_uses_last_message_only(self) -> None:
+        """Classification is based on the last message, not earlier ones."""
+        # First message is progress, but last message is a failed notification.
+        progress_msg = _make_task_progress("tid-1", total_tokens=500)
+        failed_msg = _make_task_notification("tid-1", "failed", "task crashed")
+        classification, _ = classify_timeout(
+            last_messages=[progress_msg, failed_msg],
+            active_task_ids={"tid-1"},
+            task_start_times={"tid-1": 0.0},
+            effective_timeout=600.0,
+        )
+        assert classification == "crashed"
+
+    def test_started_then_nothing_with_active_agents_is_interrupted(self) -> None:
+        """Only a task-started message but agent still active -> interrupted.
+
+        The agent may be blocked on a long-running MCP tool call (e.g.
+        brutalist multi-model panel).  Active agents are work-in-progress,
+        not crashes.
+        """
+        started_msg = _make_task_started("tid-1", "my_task")
+        classification, evidence = classify_timeout(
+            last_messages=[started_msg],
+            active_task_ids={"tid-1"},
+            task_start_times={"tid-1": 0.0},
+            effective_timeout=600.0,
+        )
+        assert classification == "interrupted"
+        assert "active" in evidence
+
+    def test_started_then_nothing_no_active_agents_is_crashed(self) -> None:
+        """Task started but no longer in active set -> crashed (default)."""
+        started_msg = _make_task_started("tid-1", "my_task")
+        classification, evidence = classify_timeout(
+            last_messages=[started_msg],
+            active_task_ids=set(),
+            task_start_times={},
+            effective_timeout=600.0,
+        )
+        assert classification == "crashed"
+        assert "conservative default" in evidence
+
+
+# ---------------------------------------------------------------------------
+# Timeout classification integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutClassificationIntegration:
+    """Integration: idle watchdog fires with recent progress -> interrupted."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_prompt_io(self) -> Any:
+        with (
+            patch(f"{_PC}.load_prompt", return_value="<system/>"),
+            patch(f"{_PC}._build_agents", return_value={}),
+            patch(f"{_PC}.build_hooks", return_value={"PreToolUse": []}),
+        ):
+            yield
+
+    @pytest.fixture
+    def project_dir(self, tmp_path: Path) -> Path:
+        clou_dir = tmp_path / ".clou"
+        clou_dir.mkdir()
+        return tmp_path
+
+    @pytest.mark.asyncio
+    async def test_idle_watchdog_with_recent_progress_returns_interrupted(
+        self, project_dir: Path,
+    ) -> None:
+        """When the last message is a progress message, timeout -> interrupted."""
+        ms_dir = project_dir / ".clou" / "milestones" / "ms"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "compose.py").write_text('''
+class R: ...
+
+def resource_bounds(tokens=None, timeout_seconds=None):
+    def decorator(func):
+        return func
+    return decorator
+
+@resource_bounds(timeout_seconds=1)
+async def slow_task() -> R:
+    """Task that gets interrupted."""
+
+async def execute():
+    r = await slow_task()
+''', encoding="utf-8")
+
+        active_dir = ms_dir / "active"
+        active_dir.mkdir()
+        (active_dir / "coordinator.md").write_text(
+            "cycle: 1\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: build-phase\nphases_completed: 0\nphases_total: 1\n"
+        )
+
+        # The task starts, makes progress, then hangs (idle watchdog fires).
+        _hung = asyncio.Event()
+
+        async def _receive_with_progress():
+            yield _make_task_started("tid-slow", "slow_task")
+            yield _make_task_progress("tid-slow", total_tokens=500)
+            # Block indefinitely -- simulates waiting on network/sleep.
+            await _hung.wait()
+
+        client = MagicMock()
+        client.query = AsyncMock()
+        client.stop_task = MagicMock()
+        client.receive_response = _receive_with_progress
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(f"{_PC}.ClaudeSDKClient", return_value=client):
+            result = await _run_single_cycle(
+                project_dir, "ms", "EXECUTE", "do work",
+            )
+
+        # Last message was progress -> classification should be "interrupted".
+        assert result == "interrupted"
+
+    @pytest.mark.asyncio
+    async def test_idle_watchdog_no_messages_returns_crash(
+        self, project_dir: Path,
+    ) -> None:
+        """When no messages are received at all, timeout -> agent_team_crash."""
+        ms_dir = project_dir / ".clou" / "milestones" / "ms"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "compose.py").write_text('''
+class R: ...
+
+def resource_bounds(tokens=None, timeout_seconds=None):
+    def decorator(func):
+        return func
+    return decorator
+
+@resource_bounds(timeout_seconds=1)
+async def dead_task() -> R:
+    """Task that never sends messages."""
+
+async def execute():
+    r = await dead_task()
+''', encoding="utf-8")
+
+        active_dir = ms_dir / "active"
+        active_dir.mkdir()
+        (active_dir / "coordinator.md").write_text(
+            "cycle: 1\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: build-phase\nphases_completed: 0\nphases_total: 1\n"
+        )
+
+        # No messages at all -- hangs immediately.
+        _hung = asyncio.Event()
+
+        async def _receive_nothing():
+            await _hung.wait()
+            # Never yields anything -- empty async generator.
+            return
+            yield  # noqa: unreachable -- makes this an async generator
+
+        client = MagicMock()
+        client.query = AsyncMock()
+        client.stop_task = MagicMock()
+        client.receive_response = _receive_nothing
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(f"{_PC}.ClaudeSDKClient", return_value=client):
+            result = await _run_single_cycle(
+                project_dir, "ms", "EXECUTE", "do work",
+            )
+
+        # No messages -> classification should be "crashed".
+        assert result == "agent_team_crash"
+
+    @pytest.mark.asyncio
+    async def test_idle_watchdog_failed_notification_returns_crash(
+        self, project_dir: Path,
+    ) -> None:
+        """When the last message is a failed notification, timeout -> crash."""
+        ms_dir = project_dir / ".clou" / "milestones" / "ms"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "compose.py").write_text('''
+class R: ...
+
+def resource_bounds(tokens=None, timeout_seconds=None):
+    def decorator(func):
+        return func
+    return decorator
+
+@resource_bounds(timeout_seconds=1)
+async def failing_task() -> R:
+    """Task that fails then hangs."""
+
+async def execute():
+    r = await failing_task()
+''', encoding="utf-8")
+
+        active_dir = ms_dir / "active"
+        active_dir.mkdir()
+        (active_dir / "coordinator.md").write_text(
+            "cycle: 1\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: build-phase\nphases_completed: 0\nphases_total: 1\n"
+        )
+
+        _hung = asyncio.Event()
+
+        async def _receive_fail_then_hang():
+            yield _make_task_started("tid-fail", "failing_task")
+            yield _make_task_notification("tid-fail", "failed", "crash")
+            # Hang after failure notification.
+            await _hung.wait()
+
+        client = MagicMock()
+        client.query = AsyncMock()
+        client.stop_task = MagicMock()
+        client.receive_response = _receive_fail_then_hang
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(f"{_PC}.ClaudeSDKClient", return_value=client):
+            result = await _run_single_cycle(
+                project_dir, "ms", "EXECUTE", "do work",
+            )
+
+        # Last message was a failed notification -> should be "agent_team_crash".
+        assert result == "agent_team_crash"
+
+    @pytest.mark.asyncio
+    async def test_run_coordinator_interrupted_no_crash_increment(
+        self, project_dir: Path,
+    ) -> None:
+        """Outer run_coordinator loop: interrupted does not increment crash_retries.
+
+        Exercises lines 890-904 of coordinator.py.  When _run_single_cycle
+        returns "interrupted", the loop should:
+        - NOT increment crash_retries
+        - Emit a "timeout_interrupted" telemetry event
+        - Continue to the next cycle (not escalate or abort)
+        """
+        cycle_calls = 0
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            nonlocal cycle_calls
+            cycle_calls += 1
+            # First cycle: interrupted (timeout classified as interruption).
+            # Second cycle: normal completion.
+            return "interrupted" if cycle_calls == 1 else "ok"
+
+        telemetry_events: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_event(name: str, **attrs: Any) -> None:
+            telemetry_events.append((name, attrs))
+
+        with (
+            patch(
+                f"{_PC}.determine_next_cycle",
+                side_effect=[
+                    ("EXECUTE", ["status.md"]),
+                    ("EXECUTE", ["status.md"]),
+                    ("COMPLETE", []),
+                ],
+            ),
+            patch(f"{_PC}.read_cycle_count", return_value=1),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.telemetry.event", side_effect=_capture_event),
+        ):
+            result = await run_coordinator(project_dir, "ms")
+
+        # Loop continued past "interrupted" and completed normally.
+        assert result == "completed"
+        assert cycle_calls == 2, (
+            f"Expected 2 cycle calls (interrupted + ok), got {cycle_calls}"
+        )
+
+        # "timeout_interrupted" telemetry event was emitted.
+        interrupted_events = [
+            (name, attrs) for name, attrs in telemetry_events
+            if name == "timeout_interrupted"
+        ]
+        assert len(interrupted_events) == 1, (
+            f"Expected 1 timeout_interrupted event, got {len(interrupted_events)}"
+        )
+        evt_name, evt_attrs = interrupted_events[0]
+        assert evt_attrs["milestone"] == "ms"
+        assert evt_attrs["cycle_type"] == "EXECUTE"
+
+        # crash_retries was NOT incremented: no "crash" event was emitted
+        # (the "crash" event is only emitted when crash_retries increments
+        # in the "failed" handler).  Also, no escalation was triggered.
+        crash_events = [
+            name for name, _ in telemetry_events if name == "crash"
+        ]
+        assert len(crash_events) == 0, (
+            "crash_retries should not increment for interrupted status"
+        )
+
+
+class TestGateTelemetry:
+    """Quality gate decision telemetry emission (I3/F3)."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_prompt_io(self) -> Any:
+        with (
+            patch(f"{_PC}.load_prompt", return_value="<system/>"),
+            patch(f"{_PC}._build_agents", return_value={}),
+            patch(f"{_PC}.build_hooks", return_value={"PreToolUse": []}),
+        ):
+            yield
+
+    @pytest.fixture
+    def project_dir(self, tmp_path: Path) -> Path:
+        clou_dir = tmp_path / ".clou"
+        clou_dir.mkdir()
+        return tmp_path
+
+    def _write_checkpoint(
+        self, project_dir: Path, milestone: str, step: str, next_step: str,
+        cycle: int = 3, phase: str = "impl",
+    ) -> None:
+        """Write a coordinator checkpoint at the expected path.
+
+        Also writes the milestone marker so the checkpoint is not
+        deleted as stale at the start of run_coordinator().
+        """
+        active_dir = project_dir / ".clou" / "milestones" / milestone / "active"
+        active_dir.mkdir(parents=True, exist_ok=True)
+        (active_dir / "coordinator.md").write_text(
+            f"cycle: {cycle}\nstep: {step}\nnext_step: {next_step}\n"
+            f"current_phase: {phase}\nphases_completed: 0\nphases_total: 1\n"
+        )
+        # Write milestone marker so run_coordinator doesn't delete checkpoint
+        # as stale (line ~552-555 of coordinator.py).
+        marker = project_dir / ".clou" / ".coordinator-milestone"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(milestone)
+
+    @pytest.mark.asyncio
+    async def test_assess_accept_emits_gate_decision(
+        self, project_dir: Path,
+    ) -> None:
+        """ASSESS -> VERIFY transition emits assess/accept gate decision."""
+        self._write_checkpoint(project_dir, "ms", "ASSESS", "VERIFY")
+
+        telemetry_events: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_event(name: str, **attrs: Any) -> None:
+            telemetry_events.append((name, attrs))
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            return "ok"
+
+        with (
+            patch(
+                f"{_PC}.determine_next_cycle",
+                side_effect=[("VERIFY", ["intents.md"]), ("COMPLETE", [])],
+            ),
+            patch(f"{_PC}.read_cycle_count", return_value=3),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.telemetry.event", side_effect=_capture_event),
+        ):
+            result = await run_coordinator(project_dir, "ms")
+
+        assert result == "completed"
+
+        gate_events = [
+            (name, attrs) for name, attrs in telemetry_events
+            if name == "quality_gate.decision"
+        ]
+        assert len(gate_events) >= 1
+        name, attrs = gate_events[0]
+        assert attrs["gate_type"] == "assess"
+        assert attrs["decision"] == "accept"
+        assert attrs["milestone"] == "ms"
+        assert "cycle_num" in attrs
+
+    @pytest.mark.asyncio
+    async def test_assess_rework_emits_gate_decision(
+        self, project_dir: Path,
+    ) -> None:
+        """ASSESS -> EXECUTE (rework) emits assess/rework gate decision."""
+        self._write_checkpoint(
+            project_dir, "ms", "ASSESS", "EXECUTE (rework)",
+        )
+
+        telemetry_events: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_event(name: str, **attrs: Any) -> None:
+            telemetry_events.append((name, attrs))
+
+        cycle_calls = 0
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            nonlocal cycle_calls
+            cycle_calls += 1
+            return "ok"
+
+        with (
+            patch(
+                f"{_PC}.determine_next_cycle",
+                side_effect=[
+                    ("EXECUTE", ["status.md"]),
+                    ("COMPLETE", []),
+                ],
+            ),
+            patch(f"{_PC}.read_cycle_count", return_value=3),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.telemetry.event", side_effect=_capture_event),
+        ):
+            result = await run_coordinator(project_dir, "ms")
+
+        assert result == "completed"
+
+        gate_events = [
+            (name, attrs) for name, attrs in telemetry_events
+            if name == "quality_gate.decision"
+        ]
+        assert len(gate_events) >= 1
+        name, attrs = gate_events[0]
+        assert attrs["gate_type"] == "assess"
+        assert attrs["decision"] == "rework"
+        assert attrs["milestone"] == "ms"
+        assert "cycle_num" in attrs
+
+    @pytest.mark.asyncio
+    async def test_verify_accept_emits_gate_decision(
+        self, project_dir: Path,
+    ) -> None:
+        """VERIFY -> EXIT transition emits verify/accept gate decision."""
+        self._write_checkpoint(project_dir, "ms", "VERIFY", "EXIT")
+
+        telemetry_events: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_event(name: str, **attrs: Any) -> None:
+            telemetry_events.append((name, attrs))
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            return "ok"
+
+        with (
+            patch(
+                f"{_PC}.determine_next_cycle",
+                side_effect=[("EXIT", ["handoff.md"]), ("COMPLETE", [])],
+            ),
+            patch(f"{_PC}.read_cycle_count", return_value=5),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.telemetry.event", side_effect=_capture_event),
+        ):
+            result = await run_coordinator(project_dir, "ms")
+
+        assert result == "completed"
+
+        gate_events = [
+            (name, attrs) for name, attrs in telemetry_events
+            if name == "quality_gate.decision"
+        ]
+        assert len(gate_events) >= 1
+        # Find the verify gate event (there may also be an EXIT->COMPLETE event).
+        verify_events = [
+            (n, a) for n, a in gate_events if a["gate_type"] == "verify"
+        ]
+        assert len(verify_events) >= 1
+        name, attrs = verify_events[0]
+        assert attrs["decision"] == "accept"
+        assert attrs["milestone"] == "ms"
+        assert "cycle_num" in attrs
+
+    @pytest.mark.asyncio
+    async def test_verify_rework_emits_gate_decision(
+        self, project_dir: Path,
+    ) -> None:
+        """VERIFY -> EXECUTE (rework) emits verify/rework gate decision."""
+        self._write_checkpoint(
+            project_dir, "ms", "VERIFY", "EXECUTE (rework)",
+        )
+
+        telemetry_events: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_event(name: str, **attrs: Any) -> None:
+            telemetry_events.append((name, attrs))
+
+        cycle_calls = 0
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            nonlocal cycle_calls
+            cycle_calls += 1
+            return "ok"
+
+        with (
+            patch(
+                f"{_PC}.determine_next_cycle",
+                side_effect=[
+                    ("EXECUTE", ["status.md"]),
+                    ("COMPLETE", []),
+                ],
+            ),
+            patch(f"{_PC}.read_cycle_count", return_value=5),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.telemetry.event", side_effect=_capture_event),
+        ):
+            result = await run_coordinator(project_dir, "ms")
+
+        assert result == "completed"
+
+        gate_events = [
+            (name, attrs) for name, attrs in telemetry_events
+            if name == "quality_gate.decision"
+        ]
+        assert len(gate_events) >= 1
+        name, attrs = gate_events[0]
+        assert attrs["gate_type"] == "verify"
+        assert attrs["decision"] == "rework"
+        assert attrs["milestone"] == "ms"
+        assert "cycle_num" in attrs
+
+    @pytest.mark.asyncio
+    async def test_no_gate_event_for_execute_cycle(
+        self, project_dir: Path,
+    ) -> None:
+        """EXECUTE -> ASSESS has no gate decision (EXECUTE is not a gate)."""
+        self._write_checkpoint(project_dir, "ms", "EXECUTE", "ASSESS")
+
+        telemetry_events: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_event(name: str, **attrs: Any) -> None:
+            telemetry_events.append((name, attrs))
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            return "ok"
+
+        with (
+            patch(
+                f"{_PC}.determine_next_cycle",
+                side_effect=[("ASSESS", ["assessment.md"]), ("COMPLETE", [])],
+            ),
+            patch(f"{_PC}.read_cycle_count", return_value=2),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.telemetry.event", side_effect=_capture_event),
+        ):
+            result = await run_coordinator(project_dir, "ms")
+
+        assert result == "completed"
+
+        gate_events = [
+            (name, attrs) for name, attrs in telemetry_events
+            if name == "quality_gate.decision"
+        ]
+        # First iteration: step=EXECUTE, no gate event.
+        # Second iteration: checkpoint is gone after COMPLETE, so no event.
+        # There may be a gate event from the second iteration if the checkpoint
+        # was updated by _run_single_cycle, but the first iteration should not
+        # produce a gate_type="execute" event (no such gate type exists).
+        execute_gate_events = [
+            (n, a) for n, a in gate_events
+            if a.get("gate_type") == "execute"
+        ]
+        assert len(execute_gate_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_no_gate_event_without_checkpoint(
+        self, project_dir: Path,
+    ) -> None:
+        """No checkpoint -> no gate decision event emitted."""
+        # Don't write any checkpoint -- ensure ms dir exists but no checkpoint.
+        ms_dir = project_dir / ".clou" / "milestones" / "ms"
+        ms_dir.mkdir(parents=True, exist_ok=True)
+
+        telemetry_events: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_event(name: str, **attrs: Any) -> None:
+            telemetry_events.append((name, attrs))
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            return "ok"
+
+        with (
+            patch(
+                f"{_PC}.determine_next_cycle",
+                side_effect=[("PLAN", ["milestone.md"]), ("COMPLETE", [])],
+            ),
+            patch(f"{_PC}.read_cycle_count", return_value=0),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.telemetry.event", side_effect=_capture_event),
+        ):
+            result = await run_coordinator(project_dir, "ms")
+
+        assert result == "completed"
+
+        gate_events = [
+            (name, attrs) for name, attrs in telemetry_events
+            if name == "quality_gate.decision"
+        ]
+        assert len(gate_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_gate_telemetry_failure_does_not_crash(
+        self, project_dir: Path,
+    ) -> None:
+        """Telemetry emission failure is caught and logged, not propagated."""
+        self._write_checkpoint(project_dir, "ms", "ASSESS", "VERIFY")
+
+        call_count = 0
+
+        def _failing_event(name: str, **attrs: Any) -> None:
+            nonlocal call_count
+            call_count += 1
+            if name == "quality_gate.decision":
+                raise RuntimeError("telemetry backend unavailable")
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            return "ok"
+
+        with (
+            patch(
+                f"{_PC}.determine_next_cycle",
+                side_effect=[("VERIFY", ["intents.md"]), ("COMPLETE", [])],
+            ),
+            patch(f"{_PC}.read_cycle_count", return_value=3),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.telemetry.event", side_effect=_failing_event),
+        ):
+            # Should not raise -- error isolation catches the exception.
+            result = await run_coordinator(project_dir, "ms")
+
+        assert result == "completed"
+        # The event function was called (gate telemetry attempted).
+        assert call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_gate_events_include_required_fields(
+        self, project_dir: Path,
+    ) -> None:
+        """All gate decision events include milestone, cycle_num, gate_type, decision."""
+        self._write_checkpoint(project_dir, "ms", "ASSESS", "VERIFY")
+
+        telemetry_events: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_event(name: str, **attrs: Any) -> None:
+            telemetry_events.append((name, attrs))
+
+        async def _cycle(*args: Any, **kwargs: Any) -> str:
+            return "ok"
+
+        with (
+            patch(
+                f"{_PC}.determine_next_cycle",
+                side_effect=[("VERIFY", ["intents.md"]), ("COMPLETE", [])],
+            ),
+            patch(f"{_PC}.read_cycle_count", return_value=3),
+            patch(f"{_PC}.validate_readiness", return_value=[]),
+            patch(f"{_PC}._run_single_cycle", side_effect=_cycle),
+            patch(f"{_PC}.validate_golden_context", return_value=[]),
+            patch(f"{_PC}.validate_delivery", return_value=[]),
+            patch(f"{_PC}.telemetry.event", side_effect=_capture_event),
+        ):
+            await run_coordinator(project_dir, "ms")
+
+        gate_events = [
+            (name, attrs) for name, attrs in telemetry_events
+            if name == "quality_gate.decision"
+        ]
+        assert len(gate_events) >= 1
+
+        required_fields = {"milestone", "cycle_num", "gate_type", "decision"}
+        for _, attrs in gate_events:
+            missing = required_fields - set(attrs.keys())
+            assert not missing, f"Missing fields: {missing}"

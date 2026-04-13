@@ -6,12 +6,16 @@ import asyncio
 import fnmatch
 from pathlib import Path
 
+import pytest
+
 from clou.hooks import (
     AGENT_TIER_MAP,
+    CLEANUP_SCOPE,
     WRITE_PERMISSIONS,
     HookConfig,
     _scoped_permissions,
     build_hooks,
+    is_cleanup_allowed,
 )
 
 
@@ -53,7 +57,8 @@ def test_build_hooks_coordinator_has_both_phases() -> None:
     assert "PreToolUse" in hooks
     assert "PostToolUse" in hooks
     assert len(hooks["PreToolUse"]) == 1
-    assert len(hooks["PostToolUse"]) == 1
+    # Coordinator gets 2 PostToolUse hooks: artifact validation + transcript capture.
+    assert len(hooks["PostToolUse"]) == 2
 
 
 def test_build_hooks_all_tiers_get_post_hook() -> None:
@@ -1770,3 +1775,1284 @@ def test_post_hook_ignores_non_formed_artifacts(tmp_path: Path) -> None:
         "totally invalid content\n",
     )
     assert "additionalContext" not in result.get("hookSpecificOutput", {})
+
+
+# ---------------------------------------------------------------------------
+# Intent-coverage validation — PostToolUse
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(reason="M25 coverage/heuristic wiring incomplete")
+def test_coverage_warnings_when_intents_exist(tmp_path: Path) -> None:
+    """Coverage warnings appear when intents.md exists and coverage is incomplete."""
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    # Write intents.md with an intent that won't be covered.
+    # Uses "When..." format required by the intent parser.
+    intents = clou_dir / "intents.md"
+    intents.write_text(
+        "1. When collaboration is enabled, users can work together in real-time\n"
+        "2. When offline, the app supports local caching for uninterrupted work\n"
+    )
+
+    # Write a compose.py that only covers intent 1.
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def setup_collaboration() -> CollabConfig:
+    \"\"\"Enable real-time collaboration between users.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def build_sync_engine(config: CollabConfig) -> SyncResult:
+    \"\"\"Build synchronization engine for collaboration.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def build_ui(config: CollabConfig) -> UIResult:
+    \"\"\"Build collaboration UI.\"\"\"
+
+async def verify(sync: SyncResult, ui: UIResult) -> VerifyResult:
+    \"\"\"Verify collaboration works end to end.\"\"\"
+
+async def execute():
+    config = await setup_collaboration()
+    sync, ui = await gather(
+        build_sync_engine(config),
+        build_ui(config),
+    )
+    v = await verify(sync, ui)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+    assert "Intent-coverage errors:" in ctx
+    assert "Uncovered intent 2:" in ctx
+    assert "Verify compose.py covers all intents." in ctx
+
+
+def test_coverage_skipped_when_no_intents(tmp_path: Path) -> None:
+    """Coverage validation is skipped gracefully when intents.md doesn't exist."""
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    # Valid compose.py, no intents.md sibling.
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def setup() -> Config:
+    \"\"\"Set up config.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def phase_a(c: Config) -> A:
+    \"\"\"Do A.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def phase_b(c: Config) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def verify(a: A, b: B) -> C:
+    \"\"\"Verify.\"\"\"
+
+async def execute():
+    c = await setup()
+    a, b = await gather(phase_a(c), phase_b(c))
+    await verify(a, b)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    # No intents.md → no coverage check → passes cleanly.
+    assert _is_allowed(result)
+
+
+def test_structural_errors_take_priority_over_coverage(tmp_path: Path) -> None:
+    """When structural validation fails, coverage is not run."""
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    # Write intents.md (would trigger coverage warnings if reached).
+    intents = clou_dir / "intents.md"
+    intents.write_text("1. Some intent that nothing covers\n")
+
+    # Write a compose.py with a structural error (undefined function).
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b(a)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+    # Structural errors are returned, not coverage warnings.
+    assert "Composition errors:" in ctx
+    assert "Undefined: task_b" in ctx
+    # Coverage warnings must NOT appear.
+    assert "Intent-coverage errors:" not in ctx
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: hook-validate-coverage pipeline end-to-end
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(reason="M25 coverage/heuristic wiring incomplete")
+def test_integration_coverage_error_through_hooks(tmp_path: Path) -> None:
+    """Uncovered intent produces actionable feedback through the full hook pipeline.
+
+    End-to-end: compose.py write -> PostToolUse hook -> validate() -> validate_coverage()
+    -> additionalContext with specific error identifying the uncovered intent and fix.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    # Realistic intents.md in "### I<N>:" format.
+    intents = clou_dir / "intents.md"
+    intents.write_text("""\
+# Intents: User Management
+
+## Observable outcomes
+
+### I1: User registration
+When a new user registers, their account is created with validated email and password.
+
+### I2: Profile editing
+When a user edits their profile, changes are persisted and visible immediately.
+
+### I3: Account deletion
+When a user deletes their account, all personal data is removed within 30 days.
+""")
+
+    # compose.py covers I1 and I2 but NOT I3 (account deletion).
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=80000, timeout_seconds=300)
+async def implement_registration() -> RegistrationService:
+    \"\"\"User registration with validated email and password.\"\"\"
+
+@resource_bounds(tokens=60000, timeout_seconds=240)
+async def implement_profile(reg: RegistrationService) -> ProfileService:
+    \"\"\"Profile editing with changes persisted and visible immediately.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=180)
+async def build_admin_dashboard(reg: RegistrationService) -> Dashboard:
+    \"\"\"Admin dashboard for user management.\"\"\"
+
+async def execute():
+    reg = await implement_registration()
+    profile, dash = await gather(
+        implement_profile(reg),
+        build_admin_dashboard(reg),
+    )
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+
+    # N3: Error is specific and actionable -- identifies which intent is uncovered.
+    assert "Intent-coverage errors:" in ctx
+    assert "Uncovered intent 3:" in ctx
+    assert "account" in ctx.lower() or "deletes" in ctx.lower()
+    assert "no task criteria reference this outcome" in ctx
+    assert "Verify compose.py covers all intents." in ctx
+
+
+def test_integration_valid_compose_with_intents_passes(tmp_path: Path) -> None:
+    """Valid compose.py + intents.md where all intents are covered passes cleanly.
+
+    End-to-end: no additionalContext when everything is in order.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    intents = clou_dir / "intents.md"
+    intents.write_text("""\
+# Intents
+
+## Observable outcomes
+
+### I1: Database migrations
+When database setup runs, migrations apply cleanly without data loss.
+
+### I2: Authentication
+When a user authenticates, JWT tokens with refresh are issued securely.
+
+### I3: API endpoints
+When API endpoints are called, they return correct responses per the spec.
+
+### I4: Frontend rendering
+When the frontend loads, the application renders correctly.
+""")
+
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=80000, timeout_seconds=300)
+async def setup_database() -> Schema:
+    \"\"\"Database setup with migrations that apply cleanly without data loss.\"\"\"
+
+@resource_bounds(tokens=100000, timeout_seconds=360)
+async def implement_auth(schema: Schema) -> AuthService:
+    \"\"\"JWT authentication with refresh tokens issued securely.\"\"\"
+
+@resource_bounds(tokens=90000, timeout_seconds=300)
+async def implement_api(auth: AuthService) -> APILayer:
+    \"\"\"API endpoints return correct responses per the spec.\"\"\"
+
+@resource_bounds(tokens=70000, timeout_seconds=240)
+async def scaffold_frontend(schema: Schema) -> FrontendShell:
+    \"\"\"Frontend application renders correctly.\"\"\"
+
+async def execute():
+    schema = await setup_database()
+    auth, shell = await gather(
+        implement_auth(schema),
+        scaffold_frontend(schema),
+    )
+    api = await implement_api(auth)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    # Clean pass -- no additionalContext at all.
+    assert _is_allowed(result)
+    output = result.get("hookSpecificOutput", {})
+    assert "additionalContext" not in output
+
+
+def test_integration_coverage_advisory_only_passes(tmp_path: Path) -> None:
+    """Advisory-only coverage feedback does not trigger 'Intent-coverage errors.'
+
+    When all intents ARE covered but an extra helper function exists (producing
+    only advisory 'does not trace to any intent' feedback), the hook should
+    pass cleanly -- advisory messages are not blocking errors.  Per I4.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    intents = clou_dir / "intents.md"
+    intents.write_text("""\
+# Intents
+
+## Observable outcomes
+
+### I1: File parsing
+When files are parsed, structured data is extracted correctly.
+
+### I2: Report generation
+When a report is generated, it includes all parsed data.
+""")
+
+    # All intents are covered. The extra helper 'format_output' has a docstring
+    # but does not trace to any intent -- validate_coverage() will produce an
+    # advisory "Task 'format_output' does not trace to any intent" message.
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def parse_files() -> ParsedData:
+    \"\"\"Parse files and extract structured data correctly.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def generate_report(data: ParsedData) -> Report:
+    \"\"\"Generate report that includes all parsed data.\"\"\"
+
+@resource_bounds(tokens=30000, timeout_seconds=120)
+async def format_output(report: Report) -> FormattedReport:
+    \"\"\"Apply formatting and styling to the final output.\"\"\"
+
+async def execute():
+    data = await parse_files()
+    report = await generate_report(data)
+    formatted = await format_output(report)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    # Advisory-only feedback should NOT trigger blocking errors.
+    assert _is_allowed(result)
+    output = result.get("hookSpecificOutput", {})
+    ctx = output.get("additionalContext", "")
+    assert "Intent-coverage errors:" not in ctx
+
+
+@pytest.mark.xfail(reason="M25 coverage/heuristic wiring incomplete")
+def test_integration_requires_undefined_error_through_hooks(tmp_path: Path) -> None:
+    """@requires("nonexistent") produces specific error through the hook pipeline.
+
+    Verifies the decorator edge validation added in validate_decorator_edges
+    surfaces through the PostToolUse hook with actionable error text.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def setup() -> Schema:
+    \"\"\"Create database schema.\"\"\"
+
+@requires("nonexistent_phase")
+@resource_bounds(tokens=60000, timeout_seconds=240)
+async def migrate(s: Schema) -> Migrated:
+    \"\"\"Run database migrations.\"\"\"
+
+@resource_bounds(tokens=40000, timeout_seconds=180)
+async def seed(m: Migrated) -> Seeded:
+    \"\"\"Seed initial data.\"\"\"
+
+async def execute():
+    s = await setup()
+    m = await migrate(s)
+    d = await seed(m)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+
+    # N3: Error is specific -- mentions the undefined function name and the
+    # decorator that references it.
+    assert "Composition errors:" in ctx
+    assert "undefined function" in ctx
+    assert "nonexistent_phase" in ctx
+    assert "migrate" in ctx
+    assert "Fix the call graph." in ctx
+
+
+@pytest.mark.xfail(reason="M25 coverage/heuristic wiring incomplete")
+def test_integration_width_warning_through_hooks(tmp_path: Path) -> None:
+    """Width warning for 4-task graph with no gather() surfaces through hooks.
+
+    Exercises the width enforcement check in validate() -> _check_width()
+    through the full PostToolUse pipeline.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_alpha() -> Alpha:
+    \"\"\"First independent task.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_beta() -> Beta:
+    \"\"\"Second independent task.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_gamma() -> Gamma:
+    \"\"\"Third independent task.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_delta() -> Delta:
+    \"\"\"Fourth independent task.\"\"\"
+
+async def execute():
+    a = await task_alpha()
+    b = await task_beta()
+    c = await task_gamma()
+    d = await task_delta()
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+
+    # N3: Width warning is specific -- identifies the task count and the issue.
+    assert "Composition errors:" in ctx
+    assert "No concurrent phases" in ctx
+    assert "4-task graph" in ctx
+
+
+@pytest.mark.xfail(reason="M25 coverage/heuristic wiring incomplete")
+def test_integration_needs_empty_path_error_through_hooks(tmp_path: Path) -> None:
+    """@needs('') with empty path produces specific error through hooks."""
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def setup() -> Schema:
+    \"\"\"Create schema.\"\"\"
+
+@needs("")
+@resource_bounds(tokens=60000, timeout_seconds=240)
+async def migrate(s: Schema) -> Migrated:
+    \"\"\"Run migrations.\"\"\"
+
+@resource_bounds(tokens=40000, timeout_seconds=180)
+async def seed(m: Migrated) -> Seeded:
+    \"\"\"Seed data.\"\"\"
+
+async def execute():
+    s = await setup()
+    m = await migrate(s)
+    d = await seed(m)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+
+    # N3: Error identifies the empty path and the function it's on.
+    assert "Composition errors:" in ctx
+    assert "empty path" in ctx
+    assert "migrate" in ctx
+
+
+def test_integration_edit_tool_triggers_validation(tmp_path: Path) -> None:
+    """Edit tool (not just Write) also triggers compose.py validation."""
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    # Write invalid compose.py to disk so the hook can read it.
+    compose.write_text("""\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await undefined_func(a)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Edit",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+    assert "Composition errors:" in ctx
+    assert "Undefined: undefined_func" in ctx
+
+
+def test_integration_advisory_warnings_not_composition_errors(tmp_path: Path) -> None:
+    """Advisory warnings (Missing @resource_bounds) are not presented as
+    'Composition errors' in the hook.
+
+    A compose.py that is structurally valid but lacks @resource_bounds
+    should pass cleanly -- the missing decorator is advisory, not an error.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    # Valid structure: 4 tasks with gather, but no @resource_bounds decorators.
+    # This should produce advisory warnings from validate() but NOT trigger
+    # "Composition errors: ... Fix the call graph."
+    compose.write_text("""\
+async def setup() -> Config:
+    \"\"\"Set up configuration.\"\"\"
+
+async def phase_a(c: Config) -> A:
+    \"\"\"Do A.\"\"\"
+
+async def phase_b(c: Config) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def verify(a: A, b: B) -> Result:
+    \"\"\"Verify results.\"\"\"
+
+async def execute():
+    c = await setup()
+    a, b = await gather(phase_a(c), phase_b(c))
+    r = await verify(a, b)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    # Advisory warnings should NOT trigger "Composition errors"
+    output = result.get("hookSpecificOutput", {})
+    ctx = output.get("additionalContext", "")
+    assert "Composition errors:" not in ctx
+    assert "Fix the call graph" not in ctx
+
+
+def test_integration_real_errors_still_surface_with_advisories(tmp_path: Path) -> None:
+    """When both real errors and advisory warnings exist, only real errors surface."""
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    # Has a real error (undefined function) AND would produce advisory warnings
+    # (missing @resource_bounds). Only the real error should appear.
+    compose.write_text("""\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await undefined_func(a)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+    # Real error surfaces
+    assert "Composition errors:" in ctx
+    assert "Undefined: undefined_func" in ctx
+    # Advisory warning is filtered out
+    assert "Missing @resource_bounds" not in ctx
+
+
+def test_integration_coverage_no_docstring_advisory_passes(tmp_path: Path) -> None:
+    """Advisory 'has no docstring' does not trigger Intent-coverage errors.
+
+    When all intents are covered but a task lacks a docstring, the hook should
+    pass cleanly -- the 'has no docstring' advisory is not a blocking error.
+    Exercises the second _COV_ADVISORY filter path added by R6.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    intents = clou_dir / "intents.md"
+    intents.write_text("""\
+# Intents
+
+## Observable outcomes
+
+### I1: Data ingestion
+When data is ingested, records are validated and stored.
+""")
+
+    # 'ingest_data' covers I1 via its docstring.
+    # 'transform' has no docstring -- validate_coverage() will produce
+    # "Task 'transform' has no docstring, cannot verify intent coverage"
+    # advisory, which should be filtered by the R6 fix.
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def ingest_data() -> Records:
+    \"\"\"Ingest data with records validated and stored.\"\"\"
+
+@resource_bounds(tokens=30000, timeout_seconds=120)
+async def transform(r: Records) -> Output:
+    pass
+
+async def execute():
+    r = await ingest_data()
+    out = await transform(r)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    # 'has no docstring' advisory should NOT trigger blocking errors.
+    assert _is_allowed(result)
+    output = result.get("hookSpecificOutput", {})
+    ctx = output.get("additionalContext", "")
+    assert "Intent-coverage errors:" not in ctx
+
+
+# ---------------------------------------------------------------------------
+# False dependency errors flow through rejection pipeline (M25 integrate_hooks)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(reason="M25 false dependency heuristics not fully wired")
+def test_single_use_chain_error_triggers_rejection(tmp_path: Path) -> None:
+    """Single-use chain false dependency (I1) triggers blocking rejection.
+
+    A compose.py with a pure serial chain of single-use wrapper types
+    must produce 'Composition errors:' feedback, NOT be silently
+    filtered as advisory.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_c(b: B) -> C:
+    \"\"\"Do C.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_d(c: C) -> D:
+    \"\"\"Do D.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b(a)
+    c = await task_c(b)
+    d = await task_d(c)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+    assert isinstance(ctx, str)
+    assert "Composition errors:" in ctx
+    assert "False dependency: serial chain" in ctx
+    assert "Fix the call graph." in ctx
+
+
+@pytest.mark.xfail(reason="M25 false dependency heuristics not fully wired")
+def test_war_false_dep_triggers_rejection(tmp_path: Path) -> None:
+    """WAR-equivalent false dependency (I2) triggers blocking rejection.
+
+    When task_b @requires('task_a') and both @needs the same resource
+    path but no type flow exists, the error must flow through as a
+    blocking rejection, not be filtered as advisory.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@needs("services/database")
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+@needs("services/database")
+@requires("task_a")
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_b() -> B:
+    \"\"\"Do B.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_c(a: A, b: B) -> C:
+    \"\"\"Combine.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b()
+    c = await task_c(a, b)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+    assert isinstance(ctx, str)
+    assert "Composition errors:" in ctx
+    assert "WAR-equivalent false dependency" in ctx
+    assert "Fix the call graph." in ctx
+
+
+@pytest.mark.xfail(reason="M25 false dependency heuristics not fully wired")
+def test_file_independence_triggers_rejection(tmp_path: Path) -> None:
+    """File/module independence (I3) triggers blocking rejection.
+
+    Two serial tasks with no shared types, resources, or ordering
+    constraints must produce 'Composition errors:' feedback.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def build_frontend() -> FrontendApp:
+    \"\"\"Build the frontend.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def build_backend() -> BackendAPI:
+    \"\"\"Build the backend.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def integrate(fe: FrontendApp, be: BackendAPI) -> App:
+    \"\"\"Wire frontend to backend.\"\"\"
+
+async def execute():
+    fe = await build_frontend()
+    be = await build_backend()
+    app = await integrate(fe, be)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+    assert isinstance(ctx, str)
+    assert "Composition errors:" in ctx
+    assert "appear independent" in ctx
+    assert "Fix the call graph." in ctx
+
+
+@pytest.mark.xfail(reason="M25 false dependency heuristics not fully wired")
+def test_false_dep_errors_not_matched_by_advisory_filter(tmp_path: Path) -> None:
+    """None of the three false dependency error types match _ADVISORY patterns.
+
+    The only advisory is 'Missing @resource_bounds'. Verify that single-use
+    chain, WAR-equivalent, and file independence errors do NOT contain the
+    advisory substring and therefore are never filtered out.
+    """
+    from clou.graph import validate
+
+    # Single-use chain
+    chain_code = """\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def a() -> X:
+    \"\"\"Do A.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def b(x: X) -> Y:
+    \"\"\"Do B.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def c(y: Y) -> Z:
+    \"\"\"Do C.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def d(z: Z) -> W:
+    \"\"\"Do D.\"\"\"
+
+async def execute():
+    x = await a()
+    y = await b(x)
+    z = await c(y)
+    w = await d(z)
+"""
+    chain_errors = validate(chain_code)
+    false_dep = [e for e in chain_errors if "False dependency: serial chain" in e.message]
+    assert len(false_dep) >= 1
+    for e in false_dep:
+        assert "Missing @resource_bounds" not in e.message
+
+    # WAR-equivalent
+    war_code = """\
+@needs("config.yaml")
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def read_a() -> A:
+    \"\"\"Read A.\"\"\"
+
+@needs("config.yaml")
+@requires("read_a")
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def read_b() -> B:
+    \"\"\"Read B.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def merge(a: A, b: B) -> C:
+    \"\"\"Merge.\"\"\"
+
+async def execute():
+    a = await read_a()
+    b = await read_b()
+    c = await merge(a, b)
+"""
+    war_errors = validate(war_code)
+    war = [e for e in war_errors if "WAR-equivalent" in e.message]
+    assert len(war) >= 1
+    for e in war:
+        assert "Missing @resource_bounds" not in e.message
+
+    # File independence
+    indep_code = """\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def lint() -> LintResult:
+    \"\"\"Lint code.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def typecheck() -> TypeResult:
+    \"\"\"Type check.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def report(l: LintResult, t: TypeResult) -> Report:
+    \"\"\"Generate report.\"\"\"
+
+async def execute():
+    l = await lint()
+    t = await typecheck()
+    r = await report(l, t)
+"""
+    indep_errors = validate(indep_code)
+    indep = [e for e in indep_errors if "appear independent" in e.message]
+    assert len(indep) >= 1
+    for e in indep:
+        assert "Missing @resource_bounds" not in e.message
+
+
+@pytest.mark.xfail(reason="M25 false dependency heuristics not fully wired")
+def test_resource_bounds_advisory_still_filtered_with_false_dep(
+    tmp_path: Path,
+) -> None:
+    """Missing @resource_bounds remains advisory even alongside real errors.
+
+    When a compose.py has both false dependency errors AND missing
+    @resource_bounds advisories, only the false dependency errors appear
+    in the rejection -- the advisory is filtered out.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    # No @resource_bounds decorators (produces advisory) AND
+    # independent tasks (produces false dep error)
+    compose.write_text("""\
+async def build_ui() -> UI:
+    \"\"\"Build UI.\"\"\"
+
+async def build_api() -> API:
+    \"\"\"Build API.\"\"\"
+
+async def deploy(u: UI, a: API) -> Deployed:
+    \"\"\"Deploy.\"\"\"
+
+async def execute():
+    u = await build_ui()
+    a = await build_api()
+    d = await deploy(u, a)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+    assert isinstance(ctx, str)
+    # False dep error surfaces as blocking
+    assert "Composition errors:" in ctx
+    assert "Fix the call graph." in ctx
+    # Advisory is filtered out
+    assert "Missing @resource_bounds" not in ctx
+
+
+@pytest.mark.xfail(reason="M25 false dependency heuristics not fully wired")
+def test_rejection_message_format_unchanged(tmp_path: Path) -> None:
+    """False dependency errors use the same rejection format as M24 structural errors.
+
+    The format is: 'Composition errors:\\n{errors}\\nFix the call graph.'
+    This ensures the planner receives consistent actionable feedback.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def frontend() -> FE:
+    \"\"\"Build frontend.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def backend() -> BE:
+    \"\"\"Build backend.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def deploy(f: FE, b: BE) -> App:
+    \"\"\"Deploy app.\"\"\"
+
+async def execute():
+    f = await frontend()
+    b = await backend()
+    app = await deploy(f, b)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+    assert isinstance(ctx, str)
+    # Verify exact format: starts with "Composition errors:" and ends with "Fix the call graph."
+    assert ctx.startswith("Composition errors:\n")
+    assert ctx.endswith("\nFix the call graph.")
+
+
+@pytest.mark.xfail(reason="M25 false dependency heuristics not fully wired")
+def test_false_dep_blocks_through_post_hook(tmp_path: Path) -> None:
+    """False dependency errors flow through the PostToolUse hook as blocking.
+
+    Exercises the actual _make_post_hook path end-to-end: write a compose.py
+    with a WAR-equivalent false dependency, trigger the hook, and verify the
+    error appears in the rejection output (not silently filtered as advisory).
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    compose.write_text("""\
+@needs("services/database")
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+@needs("services/database")
+@requires("task_a")
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_b() -> B:
+    \"\"\"Do B.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def task_c(a: A, b: B) -> C:
+    \"\"\"Combine.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b()
+    c = await task_c(a, b)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+    assert isinstance(ctx, str)
+    # The WAR-equivalent error must surface as a blocking rejection
+    assert "Composition errors:" in ctx, (
+        f"Expected blocking 'Composition errors:' but got: {ctx!r}"
+    )
+    assert "WAR-equivalent" in ctx, (
+        f"Expected WAR-equivalent error in hook output but got: {ctx!r}"
+    )
+    assert "Fix the call graph." in ctx
+
+
+@pytest.mark.xfail(reason="M25 false dependency heuristics not fully wired")
+def test_multi_error_types_aggregated_in_rejection(tmp_path: Path) -> None:
+    """Multiple distinct error types are joined in a single rejection (F3).
+
+    The PostToolUse hook joins all non-advisory errors into one rejection
+    string via "\\n".join(errors). This test triggers two distinct error
+    families -- a structural error (Undefined) and a false dependency
+    (file independence) -- and asserts both appear in the output.
+    """
+    clou_dir = tmp_path / ".clou" / "milestones" / "m1"
+    clou_dir.mkdir(parents=True)
+
+    compose = clou_dir / "compose.py"
+    # This compose.py triggers two distinct error types:
+    # 1. File independence: build_frontend and build_backend are serial
+    #    with no shared types/resources/constraints.
+    # 2. Undefined function: undefined_func is called but never defined.
+    compose.write_text("""\
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def build_frontend() -> FrontendApp:
+    \"\"\"Build the frontend.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def build_backend() -> BackendAPI:
+    \"\"\"Build the backend.\"\"\"
+
+@resource_bounds(tokens=50000, timeout_seconds=300)
+async def integrate(fe: FrontendApp, be: BackendAPI) -> App:
+    \"\"\"Wire frontend to backend.\"\"\"
+
+async def execute():
+    fe = await build_frontend()
+    be = await build_backend()
+    app = await integrate(fe, be)
+    final = await undefined_func(app)
+""")
+
+    hook = _get_post_hook(tmp_path)
+    result = _run(
+        hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(compose)},
+                "tool_response": "ok",
+            },
+            "tool-1",
+            {},
+        )
+    )
+    output = result.get("hookSpecificOutput")
+    assert isinstance(output, dict)
+    ctx = output.get("additionalContext", "")
+    assert isinstance(ctx, str)
+    # Both error families must appear in the single rejection string
+    assert "Composition errors:" in ctx, (
+        f"Expected 'Composition errors:' but got: {ctx!r}"
+    )
+    assert "Undefined: undefined_func" in ctx, (
+        f"Expected 'Undefined: undefined_func' but got: {ctx!r}"
+    )
+    assert "appear independent" in ctx, (
+        f"Expected 'appear independent' but got: {ctx!r}"
+    )
+    assert "Fix the call graph." in ctx
+
+
+# ---------------------------------------------------------------------------
+# Cleanup permission scope — CLEANUP_SCOPE + is_cleanup_allowed
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_scope_is_tuple_of_strings() -> None:
+    """CLEANUP_SCOPE is a non-empty immutable tuple of glob pattern strings."""
+    assert isinstance(CLEANUP_SCOPE, tuple)
+    assert len(CLEANUP_SCOPE) > 0
+    for pat in CLEANUP_SCOPE:
+        assert isinstance(pat, str)
+
+
+def test_cleanup_allowed_example_file() -> None:
+    """Root-level .example files are allowed cleanup targets."""
+    assert is_cleanup_allowed("roadmap.py.example") is True
+
+
+def test_cleanup_allowed_bak_file() -> None:
+    """Root-level .bak files are allowed cleanup targets."""
+    assert is_cleanup_allowed("some-file.bak") is True
+
+
+def test_cleanup_allowed_old_file() -> None:
+    """Root-level .old files are allowed cleanup targets."""
+    assert is_cleanup_allowed("config.old") is True
+
+
+def test_cleanup_rejected_nested_milestones_path() -> None:
+    """Nested milestone paths are rejected even if extension matches."""
+    assert is_cleanup_allowed("milestones/foo/handoff.md") is False
+
+
+def test_cleanup_rejected_nested_prompts_path() -> None:
+    """Nested prompts paths are rejected."""
+    assert is_cleanup_allowed("prompts/coordinator.md") is False
+
+
+def test_cleanup_rejected_project_md() -> None:
+    """Golden context files (project.md) don't match any cleanup pattern."""
+    assert is_cleanup_allowed("project.md") is False
+
+
+def test_cleanup_rejected_roadmap_md() -> None:
+    """Golden context files (roadmap.md) don't match any cleanup pattern."""
+    assert is_cleanup_allowed("roadmap.md") is False
+
+
+def test_cleanup_rejected_empty_string() -> None:
+    """Empty string is rejected."""
+    assert is_cleanup_allowed("") is False
+
+
+def test_cleanup_rejected_path_outside_clou() -> None:
+    """Paths with directory separators are rejected (prevents traversal)."""
+    assert is_cleanup_allowed("active/supervisor.md") is False
+
+
+def test_cleanup_rejected_backslash_path() -> None:
+    """Backslash directory separators are also rejected."""
+    assert is_cleanup_allowed("milestones\\foo.example") is False
+
+
+def test_write_permissions_unchanged() -> None:
+    """WRITE_PERMISSIONS is not affected by CLEANUP_SCOPE addition."""
+    expected_tiers = {
+        "supervisor", "coordinator", "worker",
+        "verifier", "brutalist", "assess-evaluator",
+    }
+    assert set(WRITE_PERMISSIONS.keys()) == expected_tiers

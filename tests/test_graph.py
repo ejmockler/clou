@@ -5,7 +5,21 @@ Tests go through the public validate() API only — no implementation
 details are tested directly.
 """
 
-from clou.graph import ResourceBounds, compute_topology, extract_dag_data, validate
+from clou.graph import (
+    MilestoneEntry,
+    ResourceBounds,
+    RoadmapGraph,
+    ValidationResult,
+    compute_independent_sets,
+    compute_topology,
+    extract_dag_data,
+    extract_roadmap_data,
+    get_colayer_tasks,
+    parse_roadmap_annotations,
+    validate,
+    validate_roadmap,
+    validate_roadmap_annotations,
+)
 
 # ---------------------------------------------------------------------------
 # The canonical example from DB-02 — the golden test
@@ -60,7 +74,7 @@ def test_valid_composition() -> None:
 def test_syntax_error() -> None:
     errors = validate("def foo(")
     assert len(errors) == 1
-    assert errors[0].startswith("Syntax error:")
+    assert errors[0].message.startswith("Syntax error:")
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +88,9 @@ async def task_a() -> A:
     \"\"\"Do A.\"\"\"
 """
     errors = validate(code)
-    assert errors == ["Missing execute() entry point"]
+    assert len(errors) == 1
+    assert errors[0].message == "Missing execute() entry point"
+    assert errors[0].severity == "error"
 
 
 def test_execute_milestone_entry_point() -> None:
@@ -112,7 +128,7 @@ async def execute():
     b = await task_b(a)
 """
     errors = validate(code)
-    assert any("Undefined: task_b" in e for e in errors)
+    assert any("Undefined: task_b" in e.message for e in errors)
 
 
 def test_imported_name_not_flagged() -> None:
@@ -125,7 +141,7 @@ async def task_a() -> A:
 async def execute():
     a = await task_a()
 """
-    assert not any("Undefined" in e for e in validate(code))
+    assert not any("Undefined" in e.message for e in validate(code))
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +161,7 @@ async def execute():
     a = await task_a()
 """
     errors = validate(code)
-    assert any("Unused: task_b" in e for e in errors)
+    assert any("Unused: task_b" in e.message for e in errors)
 
 
 def test_helper_function_not_flagged_as_unused() -> None:
@@ -189,7 +205,7 @@ async def execute():
     b = await task_b(a)
 """
     errors = validate(code)
-    assert any("Cycle:" in e for e in errors)
+    assert any("Cycle:" in e.message for e in errors)
 
 
 def test_same_return_type_no_false_cycle() -> None:
@@ -231,7 +247,7 @@ async def execute():
 """
     errors = validate(code)
     assert any(
-        "Type mismatch" in e and "expects TypeB" in e and "got TypeA" in e
+        "Type mismatch" in e.message and "expects TypeB" in e.message and "got TypeA" in e.message
         for e in errors
     )
 
@@ -347,7 +363,7 @@ def execute(tasks):
     a = task_a()
 """
     errors = validate(code)
-    assert any("Entry point must be async" in e for e in errors)
+    assert any("Entry point must be async" in e.message for e in errors)
 
 
 def test_multiple_errors_reported() -> None:
@@ -364,8 +380,8 @@ async def execute():
     c = await task_c(a)
 """
     errors = validate(code)
-    assert any("Undefined: task_c" in e for e in errors)
-    assert any("Unused: task_b" in e for e in errors)
+    assert any("Undefined: task_c" in e.message for e in errors)
+    assert any("Unused: task_b" in e.message for e in errors)
     assert len(errors) >= 2
 
 
@@ -387,7 +403,7 @@ async def execute():
     a = await task_a()
 """
     errors = validate(code)
-    assert any("Duplicate entry point 'execute'" in e for e in errors)
+    assert any("Duplicate entry point 'execute'" in e.message for e in errors)
 
 
 # ---------------------------------------------------------------------------
@@ -406,8 +422,8 @@ def execute(tasks):
 """
     errors = validate(code)
     assert len(errors) >= 1
-    assert "Entry point must be async: 'execute'" in errors[0]
-    assert "line" in errors[0]
+    assert "Entry point must be async: 'execute'" in errors[0].message
+    assert "line" in errors[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +446,7 @@ async def execute():
         b = await task_b(a)
 """
     errors = validate(code)
-    assert any("Control flow in execute body not supported: If" in e for e in errors)
+    assert any("Control flow in execute body not supported: If" in e.message for e in errors)
 
 
 def test_for_loop_in_execute_body() -> None:
@@ -445,7 +461,7 @@ async def execute():
         pass
 """
     errors = validate(code)
-    assert any("Control flow in execute body not supported: For" in e for e in errors)
+    assert any("Control flow in execute body not supported: For" in e.message for e in errors)
 
 
 # ---------------------------------------------------------------------------
@@ -464,9 +480,9 @@ async def execute():
     b = await task_b(a)
 """
     errors = validate(code)
-    undefined = [e for e in errors if "Undefined: task_b" in e]
+    undefined = [e for e in errors if "Undefined: task_b" in e.message]
     assert len(undefined) == 1
-    assert "line" in undefined[0]
+    assert "line" in undefined[0].message
 
 
 def test_unused_error_includes_line_number() -> None:
@@ -482,9 +498,9 @@ async def execute():
     a = await task_a()
 """
     errors = validate(code)
-    unused = [e for e in errors if "Unused: task_b" in e]
+    unused = [e for e in errors if "Unused: task_b" in e.message]
     assert len(unused) == 1
-    assert "line" in unused[0]
+    assert "line" in unused[0].message
 
 
 def test_cycle_error_includes_line_number() -> None:
@@ -501,9 +517,9 @@ async def execute():
     b = await task_b(a)
 """
     errors = validate(code)
-    cycle = [e for e in errors if "Cycle:" in e]
+    cycle = [e for e in errors if "Cycle:" in e.message]
     assert len(cycle) == 1
-    assert "line" in cycle[0]
+    assert "line" in cycle[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +687,7 @@ async def execute():
     d = await task_d()
 """
     errors = validate(code)
-    assert any("No concurrent phases" in e and "4-task graph" in e for e in errors)
+    assert any("No concurrent phases" in e.message and "4-task graph" in e.message for e in errors)
 
 
 def test_width_no_warning_with_gather() -> None:
@@ -695,7 +711,7 @@ async def execute():
     d = await finalize(c)
 """
     errors = validate(code)
-    assert not any("No concurrent phases" in e for e in errors)
+    assert not any("No concurrent phases" in e.message for e in errors)
 
 
 def test_width_serial_data_flow_no_warning() -> None:
@@ -720,7 +736,7 @@ async def execute():
     d = await task_d(c)
 """
     errors = validate(code)
-    assert not any("No concurrent phases" in e for e in errors)
+    assert not any("No concurrent phases" in e.message for e in errors)
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +762,7 @@ async def execute():
     h = await verify(b)
 """
     errors = validate(code)
-    assert any("Under-decomposed milestone" in e for e in errors)
+    assert any("Under-decomposed milestone" in e.message for e in errors)
 
 
 def test_min_decomposition_passes_with_enough_tasks() -> None:
@@ -771,7 +787,7 @@ async def execute():
     h = await verify(c)
 """
     errors = validate(code)
-    assert not any("Under-decomposed" in e for e in errors)
+    assert not any("Under-decomposed" in e.message for e in errors)
 
 
 # ---------------------------------------------------------------------------
@@ -869,7 +885,7 @@ async def execute():
     c = await task_c(b)
 """
     errors = validate(code)
-    assert any("tokens must be positive" in e for e in errors)
+    assert any("tokens must be positive" in e.message for e in errors)
 
     code2 = """\
 @resource_bounds(tokens=100, timeout_seconds=-10)
@@ -888,7 +904,7 @@ async def execute():
     c = await task_c(b)
 """
     errors2 = validate(code2)
-    assert any("timeout_seconds must be positive" in e for e in errors2)
+    assert any("timeout_seconds must be positive" in e.message for e in errors2)
 
 
 def test_resource_bounds_in_dag_data() -> None:
@@ -938,7 +954,7 @@ async def execute():
     c = await task_c(b)
 """
     errors = validate(code)
-    assert not any("resource_bounds" in e for e in errors)
+    assert not any("resource_bounds" in e.message for e in errors)
 
 
 # ---------------------------------------------------------------------------
@@ -1204,3 +1220,684 @@ def test_topology_canonical_composition() -> None:
     assert topo["width"] == 2  # scaffold_frontend + setup_database
     assert topo["depth"] >= 4
     assert topo["gather_groups"] == [2]  # one gather with 2 args
+
+
+# ---------------------------------------------------------------------------
+# get_colayer_tasks
+# ---------------------------------------------------------------------------
+
+
+def test_get_colayer_tasks_gather_group() -> None:
+    """get_colayer_tasks returns all tasks in the same DAG layer."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"A.\"\"\"
+
+async def task_b() -> B:
+    \"\"\"B.\"\"\"
+
+async def combine(a: A, b: B) -> C:
+    \"\"\"Combine.\"\"\"
+
+async def execute():
+    a, b = await gather(task_a(), task_b())
+    c = await combine(a, b)
+"""
+    peers = get_colayer_tasks(code, "task_a")
+    assert set(peers) == {"task_a", "task_b"}
+    peers_b = get_colayer_tasks(code, "task_b")
+    assert set(peers_b) == {"task_a", "task_b"}
+
+
+def test_get_colayer_tasks_single_task_layer() -> None:
+    """A task alone in its layer returns just itself."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"A.\"\"\"
+
+async def task_b() -> B:
+    \"\"\"B.\"\"\"
+
+async def combine(a: A, b: B) -> C:
+    \"\"\"Combine.\"\"\"
+
+async def execute():
+    a, b = await gather(task_a(), task_b())
+    c = await combine(a, b)
+"""
+    peers = get_colayer_tasks(code, "combine")
+    assert peers == ["combine"]
+
+
+def test_get_colayer_tasks_unknown_task() -> None:
+    """Unknown task_name returns [task_name] as fallback."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"A.\"\"\"
+
+async def execute():
+    a = await task_a()
+"""
+    peers = get_colayer_tasks(code, "nonexistent")
+    assert peers == ["nonexistent"]
+
+
+def test_get_colayer_tasks_parse_error() -> None:
+    """Syntax errors return [task_name] as fallback."""
+    peers = get_colayer_tasks("this is not valid python {{{}}", "some_task")
+    assert peers == ["some_task"]
+
+
+def test_get_colayer_tasks_serial_graph() -> None:
+    """In a fully serial graph, each task is alone in its layer."""
+    code = """\
+async def setup() -> Schema:
+    \"\"\"Setup.\"\"\"
+
+async def build(s: Schema) -> App:
+    \"\"\"Build.\"\"\"
+
+async def deploy(a: App) -> Result:
+    \"\"\"Deploy.\"\"\"
+
+async def execute():
+    s = await setup()
+    a = await build(s)
+    r = await deploy(a)
+"""
+    assert get_colayer_tasks(code, "setup") == ["setup"]
+    assert get_colayer_tasks(code, "build") == ["build"]
+    assert get_colayer_tasks(code, "deploy") == ["deploy"]
+
+
+# ---------------------------------------------------------------------------
+# Gather consumption advisory
+# ---------------------------------------------------------------------------
+
+
+def test_gather_unconsumed_warning() -> None:
+    """gather() results assigned but never used downstream emit a warning."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b() -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c() -> C:
+    \"\"\"Do C.\"\"\"
+
+async def execute():
+    a, b = await gather(task_a(), task_b())
+    c = await task_c()
+"""
+    errors = validate(code)
+    assert any("gather() results not consumed" in e.message for e in errors)
+
+
+def test_gather_consumed_no_warning() -> None:
+    """gather() results used by a downstream task do not emit a warning."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b() -> B:
+    \"\"\"Do B.\"\"\"
+
+async def combine(a: A, b: B) -> C:
+    \"\"\"Combine.\"\"\"
+
+async def execute():
+    a, b = await gather(task_a(), task_b())
+    c = await combine(a, b)
+"""
+    errors = validate(code)
+    assert not any("gather() results not consumed" in e.message for e in errors)
+
+
+def test_no_gather_no_consumption_warning() -> None:
+    """Compose with no gather() does not emit a gather consumption warning."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b(a: A) -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c(b: B) -> C:
+    \"\"\"Do C.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b(a)
+    c = await task_c(b)
+"""
+    errors = validate(code)
+    assert not any("gather() results not consumed" in e.message for e in errors)
+
+
+def test_gather_consumed_in_later_gather() -> None:
+    """gather() results used in a subsequent gather() count as consumed."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b() -> B:
+    \"\"\"Do B.\"\"\"
+
+async def enhance_a(a: A) -> EA:
+    \"\"\"Enhance A.\"\"\"
+
+async def enhance_b(b: B) -> EB:
+    \"\"\"Enhance B.\"\"\"
+
+async def finalize(ea: EA, eb: EB) -> Done:
+    \"\"\"Finalize.\"\"\"
+
+async def execute():
+    a, b = await gather(task_a(), task_b())
+    ea, eb = await gather(enhance_a(a), enhance_b(b))
+    d = await finalize(ea, eb)
+"""
+    errors = validate(code)
+    assert not any("gather() results not consumed" in e.message for e in errors)
+
+
+def test_gather_bare_await_no_warning() -> None:
+    """await gather(...) with no assignment does not trigger the check."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b() -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c() -> C:
+    \"\"\"Do C.\"\"\"
+
+async def execute():
+    await gather(task_a(), task_b())
+    c = await task_c()
+"""
+    errors = validate(code)
+    assert not any("gather() results not consumed" in e.message for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Typed ValidationResult contract
+# ---------------------------------------------------------------------------
+
+
+def test_validate_returns_typed_results() -> None:
+    """Every validate() result is a ValidationResult with valid severity."""
+    results = validate(VALID_COMPOSITION)
+    for r in results:
+        assert isinstance(r, ValidationResult)
+        assert r.severity in ("error", "advisory")
+
+
+def test_validation_result_str_returns_message() -> None:
+    """ValidationResult.__str__ returns the message for backward compat."""
+    r = ValidationResult("error", "some error message")
+    assert str(r) == "some error message"
+
+
+def test_errors_have_error_severity() -> None:
+    """Hard errors carry severity='error'."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b(a)
+"""
+    results = validate(code)
+    undefined = [r for r in results if "Undefined" in r.message]
+    assert len(undefined) >= 1
+    assert all(r.severity == "error" for r in undefined)
+
+
+def test_advisories_have_advisory_severity() -> None:
+    """Width warnings carry severity='advisory'."""
+    code = """\
+async def task_a() -> A:
+    \"\"\"Do A.\"\"\"
+
+async def task_b() -> B:
+    \"\"\"Do B.\"\"\"
+
+async def task_c() -> C:
+    \"\"\"Do C.\"\"\"
+
+async def task_d() -> D:
+    \"\"\"Do D.\"\"\"
+
+async def execute():
+    a = await task_a()
+    b = await task_b()
+    c = await task_c()
+    d = await task_d()
+"""
+    results = validate(code)
+    width_warnings = [r for r in results if "No concurrent phases" in r.message]
+    assert len(width_warnings) >= 1
+    assert all(r.severity == "advisory" for r in width_warnings)
+
+
+# ---------------------------------------------------------------------------
+# Roadmap annotation parsing (DB-08 markdown format)
+# ---------------------------------------------------------------------------
+
+VALID_ROADMAP_MD = """\
+# Roadmap
+
+## Milestones
+
+### 1. project-setup
+**Status:** completed
+**Summary:** Initialize project structure, CI/CD, and development environment
+**Completed:** 2026-03-18
+
+### 2. user-authentication
+**Status:** in_progress
+**Summary:** User registration, login, session management
+**Started:** 2026-03-19
+
+### 3. dashboard
+**Status:** pending
+**Summary:** Main dashboard with analytics widgets
+**Depends on:** user-authentication
+
+### 4. payment-integration
+**Status:** pending
+**Summary:** Stripe integration for subscription billing
+**Depends on:** user-authentication
+**Independent of:** dashboard (candidate for parallel coordinator)
+
+## Ordering
+Default: sequential.
+"""
+
+ROADMAP_NO_ANNOTATIONS = """\
+# Roadmap
+
+## Milestones
+
+### 1. alpha
+**Status:** pending
+**Summary:** First milestone
+
+### 2. beta
+**Status:** pending
+**Summary:** Second milestone
+
+### 3. gamma
+**Status:** pending
+**Summary:** Third milestone
+"""
+
+
+class TestParseRoadmapAnnotations:
+    """Tests for parse_roadmap_annotations()."""
+
+    def test_valid_roadmap_parses_all_milestones(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        assert set(graph.milestones) == {
+            "project-setup",
+            "user-authentication",
+            "dashboard",
+            "payment-integration",
+        }
+        assert graph.order == (
+            "project-setup",
+            "user-authentication",
+            "dashboard",
+            "payment-integration",
+        )
+
+    def test_status_values_extracted(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        assert graph.milestones["project-setup"].status == "completed"
+        assert graph.milestones["user-authentication"].status == "in_progress"
+        assert graph.milestones["dashboard"].status == "pending"
+
+    def test_depends_on_extracted(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        assert graph.milestones["dashboard"].depends_on == ("user-authentication",)
+        assert graph.milestones["payment-integration"].depends_on == (
+            "user-authentication",
+        )
+        assert graph.milestones["project-setup"].depends_on == ()
+
+    def test_independent_of_extracted(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        assert graph.milestones["payment-integration"].independent_of == ("dashboard",)
+        assert graph.milestones["dashboard"].independent_of == ()
+
+    def test_independent_of_strips_parenthetical(self) -> None:
+        md = """\
+### 1. a
+**Status:** pending
+**Independent of:** b (some note), c (another note)
+### 2. b
+**Status:** pending
+### 3. c
+**Status:** pending
+"""
+        graph = parse_roadmap_annotations(md)
+        assert graph.milestones["a"].independent_of == ("b", "c")
+
+    def test_no_annotations_all_empty(self) -> None:
+        graph = parse_roadmap_annotations(ROADMAP_NO_ANNOTATIONS)
+        assert len(graph.milestones) == 3
+        for entry in graph.milestones.values():
+            assert entry.depends_on == ()
+            assert entry.independent_of == ()
+
+    def test_empty_input(self) -> None:
+        graph = parse_roadmap_annotations("")
+        assert graph.milestones == {}
+        assert graph.order == ()
+
+    def test_no_milestone_headers(self) -> None:
+        graph = parse_roadmap_annotations("# Roadmap\nJust some text.\n")
+        assert graph.milestones == {}
+
+    def test_summary_extracted(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        assert "analytics" in graph.milestones["dashboard"].summary.lower()
+
+    def test_multiple_depends_on(self) -> None:
+        md = """\
+### 1. alpha
+**Status:** completed
+### 2. beta
+**Status:** completed
+### 3. gamma
+**Status:** pending
+**Depends on:** alpha, beta
+"""
+        graph = parse_roadmap_annotations(md)
+        assert graph.milestones["gamma"].depends_on == ("alpha", "beta")
+
+    def test_milestone_entry_is_frozen(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        entry = graph.milestones["dashboard"]
+        assert isinstance(entry, MilestoneEntry)
+        try:
+            entry.name = "changed"  # type: ignore[misc]
+            assert False, "Should be frozen"
+        except AttributeError:
+            pass
+
+    def test_roadmap_graph_is_frozen(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        try:
+            graph.order = ()  # type: ignore[misc]
+            assert False, "Should be frozen"
+        except AttributeError:
+            pass
+
+
+class TestValidateRoadmapAnnotations:
+    """Tests for validate_roadmap_annotations()."""
+
+    def test_valid_graph_no_errors(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        errors = validate_roadmap_annotations(graph)
+        assert errors == []
+
+    def test_dangling_depends_on(self) -> None:
+        md = """\
+### 1. alpha
+**Status:** pending
+**Depends on:** nonexistent
+"""
+        graph = parse_roadmap_annotations(md)
+        errors = validate_roadmap_annotations(graph)
+        assert len(errors) == 1
+        assert errors[0].severity == "error"
+        assert "nonexistent" in errors[0].message
+        assert "Dangling dependency" in errors[0].message
+
+    def test_dangling_independent_of(self) -> None:
+        md = """\
+### 1. alpha
+**Status:** pending
+**Independent of:** ghost
+"""
+        graph = parse_roadmap_annotations(md)
+        errors = validate_roadmap_annotations(graph)
+        assert len(errors) == 1
+        assert errors[0].severity == "error"
+        assert "ghost" in errors[0].message
+        assert "Dangling reference" in errors[0].message
+
+    def test_direct_cycle(self) -> None:
+        md = """\
+### 1. alpha
+**Status:** pending
+**Depends on:** beta
+### 2. beta
+**Status:** pending
+**Depends on:** alpha
+"""
+        graph = parse_roadmap_annotations(md)
+        errors = validate_roadmap_annotations(graph)
+        cycle_errors = [e for e in errors if "cycle" in e.message.lower()]
+        assert len(cycle_errors) == 1
+        assert cycle_errors[0].severity == "error"
+
+    def test_transitive_cycle(self) -> None:
+        md = """\
+### 1. alpha
+**Status:** pending
+**Depends on:** gamma
+### 2. beta
+**Status:** pending
+**Depends on:** alpha
+### 3. gamma
+**Status:** pending
+**Depends on:** beta
+"""
+        graph = parse_roadmap_annotations(md)
+        errors = validate_roadmap_annotations(graph)
+        cycle_errors = [e for e in errors if "cycle" in e.message.lower()]
+        assert len(cycle_errors) == 1
+
+    def test_consistency_contradiction(self) -> None:
+        md = """\
+### 1. alpha
+**Status:** pending
+**Depends on:** beta
+**Independent of:** beta
+### 2. beta
+**Status:** pending
+"""
+        graph = parse_roadmap_annotations(md)
+        errors = validate_roadmap_annotations(graph)
+        contradiction_errors = [
+            e for e in errors if "Contradiction" in e.message
+        ]
+        assert len(contradiction_errors) == 1
+        assert contradiction_errors[0].severity == "error"
+        assert "alpha" in contradiction_errors[0].message
+        assert "beta" in contradiction_errors[0].message
+
+    def test_name_resolution_with_dirs(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        dirs = ["project-setup", "user-authentication"]
+        errors = validate_roadmap_annotations(graph, milestone_dirs=dirs)
+        # dashboard and payment-integration have no dirs.
+        advisory = [e for e in errors if e.severity == "advisory"]
+        assert len(advisory) == 2
+        names_in_messages = [e.message for e in advisory]
+        assert any("dashboard" in m for m in names_in_messages)
+        assert any("payment-integration" in m for m in names_in_messages)
+
+    def test_name_resolution_all_present(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        dirs = [
+            "project-setup",
+            "user-authentication",
+            "dashboard",
+            "payment-integration",
+        ]
+        errors = validate_roadmap_annotations(graph, milestone_dirs=dirs)
+        assert errors == []
+
+    def test_name_resolution_none_skips_check(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        errors = validate_roadmap_annotations(graph, milestone_dirs=None)
+        assert errors == []
+
+    def test_no_annotations_is_valid(self) -> None:
+        graph = parse_roadmap_annotations(ROADMAP_NO_ANNOTATIONS)
+        errors = validate_roadmap_annotations(graph)
+        assert errors == []
+
+
+class TestComputeIndependentSets:
+    """Tests for compute_independent_sets()."""
+
+    def test_valid_graph_with_independence(self) -> None:
+        graph = parse_roadmap_annotations(VALID_ROADMAP_MD)
+        layers = compute_independent_sets(graph)
+        # project-setup and user-authentication have no deps -> layer 0.
+        assert sorted(layers[0]) == ["project-setup", "user-authentication"]
+        # dashboard and payment-integration both depend on
+        # user-authentication. With independence annotation, they
+        # should share a layer.
+        found_parallel = False
+        for layer in layers:
+            if "dashboard" in layer and "payment-integration" in layer:
+                found_parallel = True
+                break
+        assert found_parallel, f"Expected parallel layer, got {layers}"
+
+    def test_no_annotations_fully_serial(self) -> None:
+        graph = parse_roadmap_annotations(ROADMAP_NO_ANNOTATIONS)
+        layers = compute_independent_sets(graph)
+        # Without independence annotations -> one per layer.
+        assert all(len(layer) == 1 for layer in layers)
+        assert len(layers) == 3
+        names = [layer[0] for layer in layers]
+        assert set(names) == {"alpha", "beta", "gamma"}
+
+    def test_single_milestone(self) -> None:
+        md = """\
+### 1. solo
+**Status:** pending
+**Summary:** Only one milestone
+"""
+        graph = parse_roadmap_annotations(md)
+        layers = compute_independent_sets(graph)
+        assert layers == [["solo"]]
+
+    def test_all_independent(self) -> None:
+        md = """\
+### 1. alpha
+**Status:** pending
+**Independent of:** beta, gamma
+### 2. beta
+**Status:** pending
+**Independent of:** alpha, gamma
+### 3. gamma
+**Status:** pending
+**Independent of:** alpha, beta
+"""
+        graph = parse_roadmap_annotations(md)
+        layers = compute_independent_sets(graph)
+        # All should be in one layer since none depends on any other.
+        assert len(layers) == 1
+        assert sorted(layers[0]) == ["alpha", "beta", "gamma"]
+
+    def test_empty_graph(self) -> None:
+        graph = parse_roadmap_annotations("")
+        layers = compute_independent_sets(graph)
+        assert layers == []
+
+    def test_chain_dependency(self) -> None:
+        md = """\
+### 1. alpha
+**Status:** completed
+**Independent of:** gamma
+### 2. beta
+**Status:** pending
+**Depends on:** alpha
+**Independent of:** gamma
+### 3. gamma
+**Status:** pending
+**Depends on:** beta
+"""
+        graph = parse_roadmap_annotations(md)
+        layers = compute_independent_sets(graph)
+        # alpha -> beta -> gamma: strict chain.
+        assert layers[0] == ["alpha"]
+        assert layers[1] == ["beta"]
+        assert layers[2] == ["gamma"]
+
+    def test_diamond_dependency(self) -> None:
+        md = """\
+### 1. root
+**Status:** completed
+### 2. left
+**Status:** pending
+**Depends on:** root
+**Independent of:** right
+### 3. right
+**Status:** pending
+**Depends on:** root
+**Independent of:** left
+### 4. join
+**Status:** pending
+**Depends on:** left, right
+"""
+        graph = parse_roadmap_annotations(md)
+        layers = compute_independent_sets(graph)
+        assert layers[0] == ["root"]
+        assert sorted(layers[1]) == ["left", "right"]
+        assert layers[2] == ["join"]
+
+
+class TestValidateRoadmapPublicAPI:
+    """Tests for the updated validate_roadmap() public API."""
+
+    def test_valid_markdown_roadmap(self) -> None:
+        errors = validate_roadmap(VALID_ROADMAP_MD)
+        assert errors == []
+
+    def test_markdown_with_cycle(self) -> None:
+        md = """\
+### 1. a
+**Status:** pending
+**Depends on:** b
+### 2. b
+**Status:** pending
+**Depends on:** a
+"""
+        errors = validate_roadmap(md)
+        assert any("cycle" in e.message.lower() for e in errors)
+
+    def test_empty_roadmap(self) -> None:
+        errors = validate_roadmap("")
+        # Legacy fallback or error.
+        assert len(errors) >= 1
+
+
+class TestExtractRoadmapDataUpdated:
+    """Tests for the updated extract_roadmap_data()."""
+
+    def test_markdown_extraction(self) -> None:
+        tasks, deps = extract_roadmap_data(VALID_ROADMAP_MD)
+        names = {t["name"] for t in tasks}
+        assert "dashboard" in names
+        assert "payment-integration" in names
+        assert deps["dashboard"] == ["user-authentication"]
+
+    def test_status_in_tasks(self) -> None:
+        tasks, _ = extract_roadmap_data(VALID_ROADMAP_MD)
+        status_map = {t["name"]: t["status"] for t in tasks}
+        assert status_map["project-setup"] == "completed"
+        assert status_map["user-authentication"] == "in_progress"

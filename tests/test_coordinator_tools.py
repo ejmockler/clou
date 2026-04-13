@@ -537,7 +537,7 @@ class TestWriteExecutionToolHandler:
 
 
 class TestCheckpointToolHandler:
-    """clou_write_checkpoint was unchanged — verify it still works."""
+    """clou_write_checkpoint now also side-effects status.md."""
 
     @pytest.mark.asyncio
     async def test_writes_checkpoint(self, coord_tools) -> None:
@@ -557,3 +557,98 @@ class TestCheckpointToolHandler:
         ).read_text()
         assert "cycle: 2" in checkpoint_md
         assert "step: EXECUTE" in checkpoint_md
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_side_effects_status(self, coord_tools) -> None:
+        """Writing checkpoint also writes status.md as a derived view."""
+        tmp_path, tools = coord_tools
+        handler = _find_tool(tools, "clou_write_checkpoint").handler
+        result = await handler({
+            "cycle": 3,
+            "step": "ASSESS",
+            "next_step": "EXECUTE (rework)",
+            "current_phase": "api",
+            "phases_completed": 1,
+            "phases_total": 2,
+        })
+        assert "status_written" in result
+        status_md = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "status.md"
+        ).read_text()
+        assert "# Status: test-ms" in status_md
+        assert "phase: api" in status_md
+        assert "cycle: 3" in status_md
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_status_validates(self, coord_tools) -> None:
+        """Side-effected status.md passes validation."""
+        tmp_path, tools = coord_tools
+        handler = _find_tool(tools, "clou_write_checkpoint").handler
+        await handler({
+            "cycle": 1,
+            "step": "PLAN",
+            "next_step": "EXECUTE",
+            "current_phase": "setup",
+            "phases_completed": 0,
+            "phases_total": 2,
+        })
+        status_md = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "status.md"
+        ).read_text()
+        findings = validate_status_checkpoint(status_md)
+        errors = [f for f in findings if f.severity == Severity.ERROR]
+        assert errors == []
+
+
+class TestUpdateStatusFromCheckpoint:
+    """clou_update_status now reads checkpoint and re-renders."""
+
+    @pytest.mark.asyncio
+    async def test_reads_checkpoint_when_available(self, coord_tools) -> None:
+        """When a checkpoint exists, status.md is derived from it."""
+        tmp_path, tools = coord_tools
+        # First write a checkpoint.
+        cp_handler = _find_tool(tools, "clou_write_checkpoint").handler
+        await cp_handler({
+            "cycle": 5,
+            "step": "ASSESS",
+            "next_step": "VERIFY",
+            "current_phase": "api",
+            "phases_completed": 2,
+            "phases_total": 3,
+        })
+        # Now call update_status -- it should derive from checkpoint.
+        status_handler = _find_tool(tools, "clou_update_status").handler
+        result = await status_handler({
+            "phase": "ignored",
+            "cycle": 999,
+            "next_step": "ignored",
+            "phase_progress": {"ignored": "pending"},
+            "notes": "",
+        })
+        status_md = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "status.md"
+        ).read_text()
+        # Should reflect checkpoint values, not the args.
+        assert "cycle: 5" in status_md
+        assert "phase: api" in status_md
+        assert "cycle: 999" not in status_md
+
+    @pytest.mark.asyncio
+    async def test_falls_back_without_checkpoint(self, coord_tools) -> None:
+        """Without a checkpoint, falls back to direct render from args."""
+        tmp_path, tools = coord_tools
+        handler = _find_tool(tools, "clou_update_status").handler
+        await handler({
+            "phase": "init",
+            "cycle": 1,
+            "next_step": "EXECUTE",
+            "phase_progress": {"init": "in_progress"},
+            "notes": "first plan",
+        })
+        status_md = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "status.md"
+        ).read_text()
+        assert "phase: init" in status_md
+        assert "cycle: 1" in status_md
+        assert "| init | in_progress |" in status_md
