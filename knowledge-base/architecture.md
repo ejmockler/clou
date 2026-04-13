@@ -89,14 +89,19 @@ The coordinator compresses team activity into structured artifacts (decisions, e
 
 **Exception:** Escalation. The coordinator can write structured escalations that the supervisor checks. But escalations are engineered artifacts with analysis and recommendations, not raw passthrough.
 
-### 2. Coordinators run synchronously by default
+### 2. Coordinators run sequentially by default, parallel when annotated
 
-Each milestone depends on the previous. The roadmap is a linked list. The architecture supports future parallel coordinators on milestones the supervisor deems independent, but this requires:
-- A dependency graph at the roadmap level (not yet specified)
-- Independence analysis by the supervisor
-- No direct coordinator-to-coordinator communication (by design)
+Each milestone depends on the previous unless the supervisor explicitly
+reasons otherwise. The roadmap supports dependency annotations per DB-08:
+`Depends on:` and `Independent of:` fields on milestone entries. When
+the orchestrator finds validated `Independent of:` annotations, it
+dispatches those coordinators concurrently via asyncio.gather. Each
+coordinator gets its own session; no direct coordinator-to-coordinator
+communication (by design). If one coordinator fails, siblings continue.
 
-**Starting constraint:** Serial execution. Earn parallel.
+**Principle:** Serial execution is the default. Parallel is opt-in via
+dependency annotations -- earned by the supervisor's explicit reasoning
+that no artifact flows between the milestones.
 
 ### 3. Quality gates are essential infrastructure
 

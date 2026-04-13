@@ -1042,6 +1042,256 @@ The attention-as-retrieval framing (§2, extended here) makes the architectural 
 
 ---
 
+## 17. Long-Horizon Agent Reliability
+
+The dominant failure mode in agentic systems is not capability — it is coherence over time. As tasks grow longer, agents don't gradually degrade; they hit inflection points where accumulated drift becomes self-reinforcing. Recent empirical work (2025-2026) quantifies these decay curves, identifies the structural mechanisms, and validates architectural decomposition as the highest-leverage intervention.
+
+### Reliability Decay Curves
+
+Khanal et al. (March 2026, arXiv:2603.29231) conducted the largest empirical study of long-horizon agent reliability: **23,392 episodes across 10 models** spanning short to very-long tasks. Three findings rewrite conventional assumptions:
+
+1. **pass@1 drops from 76.3% (short) to 52.1% (very-long).** This is not a gentle slope — the decay accelerates at longer horizons.
+2. **Errors are positively correlated across steps.** The independence assumption (each step fails with probability p, total failure = 1-(1-p)^n) dramatically underestimates actual failure rates. Real agent errors exhibit **super-linear decay** — an error at step k increases the probability of error at step k+1. Compounding is the mechanism, not accumulation.
+3. **Frontier models have the highest meltdown rates (13-19%) at very-long horizon.** Counter-intuitively, the most capable models fail most catastrophically on long tasks — because they pursue ambitious multi-step strategies that create deeper dependency chains. Less capable models attempt simpler approaches that degrade more gracefully.
+
+A critical negative result: **episodic memory augmentation never improves long-horizon performance across any model tested.** Giving agents access to their own execution history does not help — and sometimes hurts — because the memory itself becomes another source of distraction in an already-overloaded context. The authors identify **task decomposition as the highest-leverage intervention** for long-horizon reliability.
+
+**Domain-stratified analysis** reveals the collapse is not uniform. Software engineering tasks degrade catastrophically (GDS 0.90 to 0.44) while document processing stays stable. The difference: SE requires precise multi-step execution where each step's output constrains the next — exactly the dependency structure that triggers super-linear error compounding.
+
+### Agent Drift
+
+Rath (January 2026, arXiv:2601.04170) formalizes the mechanisms by which agents deviate from intended behavior over extended interactions. Three drift categories:
+
+- **Semantic drift** — the agent's understanding of its objective gradually diverges from the original intent. Instructions that were clear at step 1 become reinterpreted through the lens of accumulated context.
+- **Coordination drift** — in multi-agent systems, consensus between agents degrades. Shared assumptions diverge as each agent accumulates different interaction histories.
+- **Behavioral drift** — emergence of unintended strategies. The agent develops behaviors that were never specified and may contradict design intent.
+
+All four Agent Stability Index (ASI) components decline roughly linearly through 300 interactions, then exhibit **accelerated degradation** — a critical threshold where accumulated drift becomes self-reinforcing. The 300-interaction inflection point represents the boundary beyond which recovery becomes increasingly costly.
+
+### Production Degradation
+
+Zylos Research (January 2026) studied agent performance degradation in production deployments and identified a consistent pattern: **every AI agent experiences performance degradation after 35 minutes of human-equivalent task time.** The degradation is not gradual — doubling task duration **quadruples** failure rates. This non-linear relationship means that a task taking 70 minutes doesn't fail twice as often as a 35-minute task; it fails four times as often.
+
+Their key architectural finding: the **Planner-Worker pattern** — where capable models plan and cheap models execute — achieves **90% cost reduction** while maintaining or improving reliability. The separation prevents the planning model's context from being polluted with execution details, and prevents the execution model from needing to maintain strategic coherence.
+
+### Maximal Decomposition
+
+Meyerson et al. (Cognition + UT Austin, November 2025, arXiv:2511.09030) pushed decomposition to its theoretical limit with MAKER (Maximally Agentic Knowledge-based Execution and Reasoning). The headline result: **solved a 1,048,575-step task with zero errors** using GPT-4.1-mini at approximately $3,500.
+
+The method — **Maximal Agentic Decomposition (MAD)** — breaks every task into atomic single-step units. Each unit is so simple that a cheap model can execute it reliably. Correctness is ensured through **First-to-Ahead-by-K voting** across multiple samples: instead of majority vote, the first answer to lead by K votes wins. This adaptive sampling spends more compute on harder steps and less on trivial ones.
+
+The mathematical foundation: required confidence grows **logarithmically** with total steps — O(ln s). Total cost scales **O(s ln s)**, making million-step tasks economically feasible. A critical quality signal: **red-flagging** discards responses exceeding ~700 tokens or exhibiting format violations. The authors note that "bad behaviors correlate in LLMs" — a response that is verbose is also more likely to be wrong, and a response that violates formatting is more likely to contain reasoning errors.
+
+The implication is architectural, not about model improvement: **model reliability doesn't need to improve globally. Reliability scales through architectural decomposition, not model capability.** A model that is 95% reliable per step becomes 99.999%+ reliable per task when the architecture decomposes tasks into atomic units and votes across samples.
+
+### Long-Horizon Benchmarks
+
+Two benchmarks specifically designed to measure multi-step coherence validate the severity of the long-horizon problem:
+
+**SWE-EVO** (FPT, December 2025, arXiv:2512.18470) constructs 48 software engineering tasks spanning an average of 21 files each, validated against approximately 874 tests. GPT-5.4 achieves **25% on SWE-EVO versus 72.8% on SWE-Bench Verified** — a **3x collapse** when tasks require coordinated changes across multiple files. The benchmark isolates multi-step coherence from raw capability: the same model that solves 73% of localized problems solves only 25% of distributed ones.
+
+**SWE-Bench Pro** (Scale AI, September 2025, arXiv:2509.16941) scales to 1,865 problems drawn from real-world repositories. Best models achieve approximately **23%** — a massive drop from 50%+ on SWE-Bench Verified. Failure mode trajectory clustering reveals that breakdowns follow structural patterns: agents don't fail randomly, they fail in characteristic ways that reflect the architecture's inability to maintain coherence across dependent steps.
+
+### Clou Implication
+
+These five research threads converge on a single architectural thesis: **long-horizon reliability is a structural problem that requires structural solutions.** Clou's design already embodies several of these solutions; the research provides empirical validation and identifies the mechanisms.
+
+**Session-per-cycle is validated by drift research.** Rath's 300-interaction inflection point and Zylos's 35-minute cliff both identify a boundary beyond which accumulated drift becomes self-reinforcing. Session-per-cycle (DB-03) sidesteps this entirely — each cycle starts fresh, preventing drift from accumulating past the threshold. The accelerated degradation phase never begins because the session ends before it can.
+
+**Decomposition is the highest-leverage intervention.** Beyond pass@1 identifies task decomposition — not memory, not prompting, not model capability — as the single most impactful intervention for long-horizon reliability. MAKER proves this at scale: a 1,048,575-step task with zero errors through maximal decomposition. Clou's phase-level decomposition operates at the same principle, breaking milestones into phases small enough to complete within a single session's reliability window.
+
+**Episodic memory doesn't help, but structured external state does.** Beyond pass@1's negative result on episodic memory is not a contradiction of golden context — it's a confirmation that the mechanism matters. Episodic memory augmentation injects execution history *into the model's context*, adding distraction load (cf. §1). Golden context files are structured external state that the orchestrator curates *for* each cycle — different mechanism, same function as memory, but without the context pollution.
+
+**The Planner-Worker pattern maps to Clou's architecture.** Zylos's 90% cost reduction from separating planning (capable models) and execution (cheap models) is structurally equivalent to Clou's coordinator (planner) and agent teams (workers). The coordinator maintains strategic coherence without execution detail pollution; workers execute without needing to maintain the full plan in context.
+
+**Multi-step coherence, not capability, is the bottleneck.** SWE-EVO's 3x collapse (72.8% to 25%) on the same model demonstrates that the failure mode is not insufficient capability but insufficient coherence across steps. Session-per-cycle combined with quality gates at phase boundaries is the structural response: each phase is short enough for the model to maintain coherence, and gates at boundaries catch drift before it propagates.
+
+**Sources:**
+- Khanal et al., "Beyond pass@1: Multi-Step Agentic Evaluation," March 2026: [arXiv:2603.29231](https://arxiv.org/abs/2603.29231)
+- Rath, "Agent Drift in Agentic AI Systems," January 2026: [arXiv:2601.04170](https://arxiv.org/abs/2601.04170)
+- Zylos Research, "AI Agent Performance Degradation in Production," January 2026
+- Meyerson et al., "MAKER: Maximal Agentic Knowledge-based Execution and Reasoning," November 2025: [arXiv:2511.09030](https://arxiv.org/abs/2511.09030)
+- "SWE-EVO: Multi-File Software Engineering Benchmark," FPT, December 2025: [arXiv:2512.18470](https://arxiv.org/abs/2512.18470)
+- "SWE-Bench Pro: Real-World Software Engineering Problems at Scale," Scale AI, September 2025: [arXiv:2509.16941](https://arxiv.org/abs/2509.16941)
+
+---
+
+## 18. Autonomous Sequential Delivery
+
+How multi-agent systems organize around sequential milestone delivery — planning, executing, verifying, and converging without continuous human supervision. This section synthesizes research on autonomous orchestration lifecycles, workflow topology optimization, typed compilation pipelines, hierarchical error correction, and production-scale agent performance data.
+
+### Self-Organizing Multi-Agent Systems
+
+Lyu et al. (William & Mary, March 2026) introduced TheBotCompany, a Strategy-Execution-Verification lifecycle that repeats per milestone. Three manager agents divide the orchestration loop: **Athena** (planning — assesses progress, defines milestones with cycle budgets), **Ares** (execution — schedules workers, claims completion), and **Apollo** (verification — independent evaluation; rejection triggers fix rounds with **halved budgets**). Hierarchical milestone decomposition uses dotted numbering (1, 1.1, 1.1.2). When milestones prove unachievable, the system breaks them into smaller tasks automatically. Workers maintain persistent skill files that managers modify. Human users steer asynchronously by filing issues consumed at phase boundaries.
+
+The budget-halving mechanism is structurally significant: each rejection cycle receives half the computational budget of the previous attempt. This creates a convergence pressure that is geometric rather than threshold-based — the system must either solve the problem with progressively fewer resources or escalate, preventing infinite retry loops.
+
+### Structural Frameworks for Agentic Software Engineering
+
+Hassan et al. (September 2025) proposed SASE, framing Agentic Software Engineering as "SE 3.0" with three structural artifact types:
+
+- **BriefingScripts** — version-controlled work orders replacing informal prompts. Each includes goal, success criteria, and architectural context. The shift from prompt to artifact makes intent explicit and auditable.
+- **LoopScripts** — declarative workflow definitions enabling task decomposition and parallelization. These encode the orchestration topology as a first-class artifact rather than implicit control flow.
+- **Merge-Readiness Packs (MRPs)** — evidence bundles proving functional completeness, sound verification, SE hygiene, clear rationale, and full auditability. MRPs treat verification as a structured deliverable, not a binary gate.
+
+SASE treats humans as callable endpoints ("humans-as-MCP-tools") via **Consultation Request Packs** — structured escalation artifacts that include context, options, and the specific decision needed, rather than open-ended requests for help.
+
+### Verified Multi-Agent Orchestration
+
+Zhang et al. (AWS + HSBC, March 2026) developed VMAO, which performs DAG decomposition with dependency-aware parallel execution. The system operates a five-phase loop: **Plan-Execute-Verify-Replan-Synthesize**. An LLM-based verifier produces completeness scores, gap identification, and recommendations after each execution phase. Convergence is governed by configurable stop conditions:
+
+- **Completeness threshold**: 80% (task considered sufficiently complete)
+- **Diminishing returns**: <5% improvement between iterations
+- **Token budget**: 1M tokens maximum
+- **Max iterations**: 3
+
+These four signals compose into a multi-dimensional stopping criterion — the system halts when *any* condition is met, not just one.
+
+### Workflow Optimization
+
+Chen et al. (IBM/RPI, March 2026) surveyed workflow architectures and classified them along two dimensions: **Graph Determination Time** (offline / pre-execution / in-execution) and **Graph Plasticity Mode** (none / select / generate / edit). Their central finding: **in-execution editing is optimal for long runs** — workflows revised during execution based on intermediate feedback outperform both static topologies and topologies determined before execution begins.
+
+Wang et al. (February 2026) demonstrated AgentConductor, an RL-optimized orchestrator that dynamically generates density-aware layered DAGs. AgentConductor regenerates topology based on validity, code-execution, and cost feedback. Results: **14.6% pass@1 improvement** with **68% token cost reduction** and **13% communication density reduction**. The density awareness is notable — it actively reduces inter-agent communication overhead, not just computational cost.
+
+### Typed Compilation Pipelines
+
+Chivukula et al. (NeurIPS 2025) introduced Agint, which frames agent workflows as compilation pipelines with "type floors": **text → data → spec → code**. Each stage is a compilation step that narrows the type, and typed bindings between stages improve reliability by making interface contracts explicit. Typed stages enable concurrent composition — once the output type is known, downstream consumers can be scheduled before the upstream producer completes, analogous to speculative execution in hardware pipelines.
+
+The composable unix-style toolchain model (pipes, filters, typed streams) provides an alternative to monolithic agent architectures: small specialized tools composed via typed interfaces rather than large generalist agents coordinating via natural language.
+
+### Hierarchical Error Correction
+
+Cao et al. (April 2026) developed HECG (Hierarchical Error Correction Graph), which defines three correction levels:
+
+- **Level 1** — local parameter tuning (adjust within current strategy)
+- **Level 2** — strategy switching (select alternative approach)
+- **Level 3** — full replanning incorporating failure history
+
+An **Error Matrix Classification** categorizes errors by type, source, and severity, routing each to the appropriate correction level. Graph nodes encode expected outcomes with error thresholds — when actual outcomes exceed thresholds, the error type determines which correction level activates. This prevents over-correction (replanning when parameter tuning suffices) and under-correction (tuning parameters when the strategy is wrong).
+
+### Production Data
+
+Cognition's 2025 Devin Performance Review provides production-scale data on autonomous agent performance. PR merge rates doubled from **34% to 67%**. Fleet parallelization over sequential execution yielded **10-14x speedups**. The critical limitation identified: Devin "handles clear upfront scoping well, but not mid-task requirement changes."
+
+This confirms the pattern emerging across the research: autonomous agents succeed as **"junior execution at infinite scale"** — high throughput on well-specified work — but fail at senior-level ambiguity resolution. The bottleneck is not capability but specification: agents execute what they're told with increasing reliability, but determining *what to tell them* remains a human-level problem.
+
+### Clou Implication
+
+**1. Budget-halving as convergence mechanism.** TheBotCompany's halved budgets on rejection create geometric convergence pressure — each rework cycle gets less budget, forcing convergence or escalation rather than infinite retry loops. Clou's staleness detection serves a similar function but is threshold-based (consecutive zero-valid cycles), not budget-based. A budget-aware model could compose with staleness: track both "are we making progress?" (staleness) and "can we afford to keep trying?" (remaining budget).
+
+**2. Artifact structure validation.** SASE's artifact types map cleanly to Clou's existing structure: BriefingScripts ≈ milestone.md + phase.md, LoopScripts ≈ compose.py, MRPs ≈ handoff.md (but more structured), Consultation Request Packs ≈ escalations. The mapping validates Clou's artifact-centric design and suggests handoff.md could be enriched with explicit evidence sections (verification results, hygiene checks, rationale).
+
+**3. Success-driven topology adaptation.** The survey's finding that in-execution graph editing is optimal for long runs suggests compose.py should evolve during execution, not just on failure. Currently REPLAN is failure-triggered — it activates when a phase fails or staleness is detected. Success-driven topology adaptation — revising the graph because execution revealed better structure — is the missing mode. A milestone that completes its first phase and discovers the remaining work decomposes differently than planned should be able to restructure without triggering a failure pathway.
+
+**4. Multi-dimensional stopping criteria.** VMAO's configurable stop conditions (completeness threshold, diminishing returns, token budget, max iterations) provide a richer convergence model than Clou's consecutive-zero-valid counter. Multiple stopping signals could be composed: staleness (no valid progress), diminishing returns (progress but decelerating), budget exhaustion (tokens consumed), and completeness (verification score above threshold). Any one signal triggers convergence behavior.
+
+**5. Typed dependencies across milestones.** Agint's type floors align with compose.py's typed return types as compilation targets. Extending this principle to the project level — cross-milestone typed dependencies where one milestone's output type is another milestone's input type — would make inter-milestone contracts explicit rather than implicit in natural language descriptions.
+
+**6. Error correction hierarchy.** HECG's three-level error correction maps directly to Clou's existing hierarchy: Level 1 (local parameter tuning) = rework within a phase, Level 2 (strategy switching) = REPLAN (re-decompose the milestone), Level 3 (full replanning incorporating failure history) = escalation to supervisor. The Error Matrix Classification suggests Clou's escalation routing could be more principled — classifying errors by type, source, and severity rather than using a single staleness counter to trigger all escalation decisions.
+
+**Sources:**
+- Lyu et al., "TheBotCompany: Serving Agentic Software Engineering," William & Mary, March 2026: [arXiv:2603.25928](https://arxiv.org/abs/2603.25928)
+- Hassan et al., "SASE: Structural Artifact-Centric SE 3.0 Roadmap," September 2025: [arXiv:2509.06216](https://arxiv.org/abs/2509.06216)
+- Zhang et al., "VMAO: Verified Multi-Agent Orchestration," AWS/HSBC, March 2026: [arXiv:2603.11445](https://arxiv.org/abs/2603.11445)
+- Chen et al., "From Static Templates to Dynamic Runtime Graphs: A Survey," IBM/RPI, March 2026: [arXiv:2603.22386](https://arxiv.org/abs/2603.22386)
+- Wang et al., "AgentConductor: RL-Optimized Multi-Agent Orchestration," February 2026: [arXiv:2602.17100](https://arxiv.org/abs/2602.17100)
+- Chivukula et al., "Agint: Typed Composition for Agent Workflows," NeurIPS 2025: [arXiv:2511.19635](https://arxiv.org/abs/2511.19635)
+- Cao et al., "HECG: Hierarchical Error Correction Graph," April 2026: [arXiv:2603.08388](https://arxiv.org/abs/2603.08388)
+- Cognition, "Devin 2025 Performance Review," 2025
+
+---
+
+## 19. Transformer Dynamics for Agent Architecture — Unexplored Frontiers
+
+The preceding sections survey what research has established. This section identifies what it has NOT addressed — gaps derived from first principles of transformer mechanics (§2 Hopfield equivalence, §9 compositionality limits, §19 serial fabrication) applied to agent architecture. These are not literature reviews but analytical extrapolations: what the existing findings imply when composed, and what engineering responses follow.
+
+### The Attractor Landscape Is Session-Shaped
+
+Attention is Hopfield retrieval (§2). Each forward pass retrieves the nearest stored pattern from weights + context. The weights are frozen between sessions. The context — golden context files — defines the energy landscape of each session.
+
+Hopfield networks have well-studied dynamics: basins of attraction, energy minima, spurious states. The read set defines the energy landscape:
+
+- A **sharp read set** (precisely relevant files) creates deep basins around correct patterns — reliable retrieval.
+- A **diluted read set** (too many files) flattens the landscape — the model drifts to spurious attractors.
+- Adding irrelevant context can cause **phase transitions** (sudden jumps between attractor basins) rather than gradual degradation.
+
+Agent Drift's linear-then-accelerated pattern (§17) may be an artifact of uncurated context. With curated context (session-per-cycle), degradation should be discontinuous — stable while the read set activates the right basin, then abrupt when it doesn't. The engineering response: treat read set curation as energy landscape engineering, not just "include relevant files."
+
+### Compositionality Limits Apply to Orchestration
+
+§9 shows compositionality breaks at 2 hops. The research (MAKER, Beyond pass@1) applies this to execution steps. But orchestration DECISIONS are also compositions.
+
+The ASSESS cycle reads: execution.md + compose.py + assessment.md + requirements.md + decisions.md = **5-hop composition**. By the research's own findings, this exceeds the 2-hop reliability boundary. The coordinator is composing at 2.5x the demonstrated failure threshold.
+
+MAKER's fix (maximal decomposition) applies to execution but not to orchestration. You can't decompose a routing decision into atomic single-hop steps — it inherently requires integrating multiple information sources.
+
+The engineering response: reduce ASSESS compositional complexity by pre-composing inputs. The two-dispatch protocol (brutalist + evaluator) already distributes composition across sessions. The coordinator's final routing decision should read at most 2 files: classified findings + prior reasoning. Exclude compose.py, execution.md, and requirements.md from the coordinator's ASSESS read set — those are consumed by the brutalist and evaluator dispatches.
+
+### Information Channel Capacity Is Unmeasured
+
+Every serialization-deserialization step in the pipeline is a lossy channel:
+
+```
+user intent → milestone.md → compose.py → phase.md → execution.md → decisions.md
+```
+
+Each arrow is: LLM generates text (lossy) → file write (lossless) → file read by different session with different Hopfield landscape (lossy). The compaction research (§4) measures loss within a single channel: 54% of constraints eroded after 3 rounds. Nobody has measured the end-to-end channel capacity of a multi-step agent pipeline.
+
+For a 30-milestone project with 5 cycles per milestone: ~150 ser-deser steps. Even at 95% per-step retention: **0.95^150 ≈ 5% end-to-end.** The binding limit on horizon length is not compute or tokens — it's information channel capacity.
+
+The engineering response: measure intent survival rate — trace specific intents from intents.md through every artifact in the pipeline. Each step: present or absent. The product is end-to-end retention. Identify which steps are the bottleneck and engineer those specifically.
+
+### Autoregressive Bias Is Recursive
+
+§19 documents serial fabrication: autoregressive generation favors serialization. The fix: validate topology, reject, regenerate. But the rejection feedback is ALSO processed autoregressively.
+
+When the validator says "restructure into gather()", the planner processes this correction through the same biased mechanism. The correction may trigger surface-level reformatting (rewriting serial code as gather()) without changing the planner's internal representation of task independence.
+
+**Testable prediction:** compare downstream decision quality between plans "born parallel" and plans "corrected to parallel." If correction is superficial, corrected plans should exhibit worse downstream coherence.
+
+The engineering response: two-phase planning. Task identification first (flat unordered set — no topology), topology determination second (analyze the pre-existing list for independence). The autoregressive bias can't create serial dependencies during task identification because no ordering is requested. Self-consistency check: compare the independence claims from step 1 against the topology from step 2.
+
+### Prior Activation Density Decays with Project Novelty
+
+RPD (§11) says experts match situations to prototypes. The training distribution IS the prototype library. Every benchmark (SWE-Bench, SWE-EVO) tests on well-known projects with extensive training coverage.
+
+As a project becomes idiosyncratic (diverging from training distribution), the prototype density drops. The serial fabrication problem should get WORSE for novel projects because the model has fewer parallel-decomposition prototypes for that domain.
+
+**Prediction:** decomposition quality degrades over a project's lifetime — not from model degradation, but from increasing distance between the project's current state and the training distribution.
+
+Crude proxy: compose.py validation retry count. Many retries = the model struggles to produce valid topology = far from familiar territory. Correlate with downstream rework rates.
+
+The engineering response: when validation retries exceed a threshold, adaptively enrich context (more detailed phase.md), reduce gather() group sizes, add intermediate verification checkpoints.
+
+### Verification Asymmetry Is Unexploited
+
+MAKER (§17) proves reliability scales through decomposition + verification. The cost: verification scales O(ln s), execution scales O(s). But current architectures apply verification at execution granularity — one ASSESS per EXECUTE.
+
+In software, tests run in seconds. Writing code takes minutes. The ratio is 100:1 or more. But ASSESS takes a full coordinator session (5+ minutes) for every EXECUTE cycle.
+
+The unexploited asymmetry: **sub-cycle verification.** Workers write structured test-status artifacts incrementally. The orchestrator monitors at sub-minute frequency. Failures caught at 30-second granularity, not 15-minute granularity. The 35-minute degradation cliff (Zylos, §17) becomes irrelevant when verification frequency exceeds the degradation rate.
+
+COCO (§18) implements continuous oversight but monitors for anomalies, not correctness. For software, test pass/fail is a concrete binary signal available immediately. No agent system uses this at sub-cycle granularity.
+
+### Clou Implication
+
+These gaps share a common root: research treats the transformer as a statistical function that succeeds or fails at each invocation. But it's a dynamical system with basins of attraction, compositional limits, generative biases, and training-distribution-shaped competence.
+
+The architecture built around it should be designed with these dynamics in mind:
+
+- **Context curation as energy landscape engineering** (not just "include relevant files")
+- **Compositional complexity as a measurable constraint** on orchestration depth (not just execution)
+- **Information channel capacity as the binding limit** on horizon length (not tokens or compute)
+- **Two-phase planning** to structurally defeat autoregressive bias (not just prompt guidance)
+- **Training distribution distance as a steering signal** for decomposition conservatism
+- **Sub-cycle verification** to exploit the testing cost asymmetry
+
+The meta-principle: success probability says "decompose to make each step more likely to succeed." Dynamical systems thinking says "shape the attractor landscape so the system stays in the right basin across the full arc."
+
+No sources — this section derives from first principles applied to existing findings in §2, §9, §11, §17, §19. Cross-reference those sections.
+
+---
+
 ## Summary: Research-Grounded Design Principles
 
 | Research Finding | Clou Design Response |
@@ -1090,3 +1340,23 @@ The attention-as-retrieval framing (§2, extended here) makes the architectural 
 | Spreading activation surfaces related subgraphs (SYNAPSE) | Context assembly should activate clusters of related memories, not isolated facts |
 | No single memory structure fits all interactions (FluxMem) | Orchestrator adapts context-building strategy per cycle type |
 | Goal-conditioned gating filters memory admission (CraniMem) | Not all observations deserve to be memories; admission control prevents pollution |
+| pass@1 drops 76.3%→52.1% with super-linear error compounding (Beyond pass@1) | Session-per-cycle prevents drift accumulation past inflection point |
+| Episodic memory augmentation never helps long-horizon (Beyond pass@1) | Golden context is structured external state, not in-context memory replay |
+| Task decomposition is the highest-leverage intervention (Beyond pass@1) | Phase-level decomposition keeps each unit within single-session reliability window |
+| Agent drift accelerates past 300 interactions (Rath 2026) | Session-per-cycle ends before accelerated degradation phase begins |
+| Performance degrades after 35 min; doubling duration quadruples failures (Zylos) | Session-per-cycle bounds execution time below degradation cliff |
+| Planner-Worker achieves 90% cost reduction (Zylos) | Coordinator (planner) / agent teams (workers) structural separation |
+| Maximal decomposition: 1M steps, zero errors (MAKER) | Reliability scales through architectural decomposition, not model capability |
+| SWE-EVO: 3x collapse on multi-file tasks (72.8%→25%) | Multi-step coherence is the bottleneck; quality gates at phase boundaries catch drift |
+| Budget-halving on rejection forces convergence (TheBotCompany) | Structural convergence mechanism — each rework cycle gets less budget, not infinite retry |
+| BriefingScripts / LoopScripts / MRPs (SASE) | Validates Clou's artifact structure: milestone.md ≈ BriefingScript, compose.py ≈ LoopScript, handoff.md ≈ MRP |
+| In-execution graph editing optimal for long runs (survey) | compose.py should evolve during execution, not just on failure; success-driven topology adaptation |
+| Configurable stop conditions: threshold + diminishing returns + budget (VMAO) | Multiple convergence signals composed, not just consecutive-zero-valid counter |
+| Type floors as compilation stages (Agint) | Cross-milestone typed dependencies extend compose.py's typed returns to the project level |
+| Three-level error correction: local → strategy → replan (HECG) | Maps to Clou hierarchy: rework → REPLAN → escalation to supervisor |
+| Read set defines attractor landscape, not just "relevant files" (§19) | Context curation as energy landscape engineering; phase transitions, not gradual degradation |
+| Compositionality limits apply to orchestration, not just execution (§19) | ASSESS read set bounded to 2-hop maximum; orchestration depth is a measurable constraint |
+| Information channel capacity binds horizon length (§19) | End-to-end intent survival rate across pipeline; lossy ser-deser steps compound |
+| Autoregressive bias is recursive — corrections may be superficial (§19) | Two-phase planning: task identification before topology; self-consistency check |
+| Prior activation density decays with project novelty (§19) | Validation retry count as proxy; adaptive decomposition when far from training distribution |
+| Verification asymmetry: tests in seconds, ASSESS in minutes (§19) | Sub-cycle verification via structured test-status artifacts; monitor at sub-minute frequency |

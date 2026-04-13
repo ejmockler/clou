@@ -161,8 +161,8 @@ Each coordinator cycle (PLAN, EXECUTE, ASSESS, VERIFY, EXIT) runs as a **fresh s
 
 **What the coordinator reads per cycle** (only what's needed for that cycle type — the orchestrator reads the checkpoint separately and injects cycle context into the prompt):
 - PLAN: milestone.md, intents.md, requirements.md, project.md
-- EXECUTE: status.md, compose.py, current phase's phase.md
-- ASSESS: status.md, compose.py, current phase's execution.md, requirements.md, decisions.md
+- EXECUTE: status.md, compose.py, phase.md for all tasks in the current topological layer (gather()-aware: co-layer tasks included)
+- ASSESS: status.md, compose.py, execution.md + shards for all tasks in the current topological layer, requirements.md, decisions.md
 - VERIFY: status.md, intents.md, compose.py
 - EXIT: status.md, handoff.md, decisions.md
 

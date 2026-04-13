@@ -283,6 +283,38 @@ clou/
 └── utils.py              # Shared utilities
 ```
 
+## Gather()-Aware Phase Tracking
+
+When compose.py uses `gather()` to dispatch multiple tasks in parallel, all tasks in that layer execute in a single EXECUTE cycle. The checkpoint, read-set, and prompt machinery must track this:
+
+**Read set expansion.** `determine_next_cycle()` reads compose.py, computes topological layers via `get_colayer_tasks()`, and includes phase.md for ALL tasks in the current layer — not just `current_phase`. The ASSESS read set similarly includes execution.md and execution shards for all co-layer tasks.
+
+**Worker briefing.** Each worker's phase directory matches its function name in compose.py. Worker for `pipeline_completion` reads `phases/pipeline_completion/phase.md`, not a shared `{phase}` path. The EXECUTE prompt template uses `{function_name}` for phase paths.
+
+**Phase advancement.** When ASSESS evaluates a gather() layer and all tasks pass, `phases_completed` increments by the layer size, and `current_phase` advances to the first task in the next layer. If no next layer exists, routing proceeds to VERIFY. Partial failures create rework tasks for failed tasks only; `current_phase` stays unchanged.
+
+**Fallback.** When compose.py is absent or unparseable, the system falls back to single-phase behavior (only current_phase in the read set).
+
+## Convergence Enforcement
+
+The AST validator checks for unconsumed gather() results: when a `gather()` call assigns to variables that are never referenced in subsequent statements, an advisory warning is emitted: "gather() results not consumed by downstream tasks — consider whether an integration phase is needed."
+
+This is an advisory, not a hard error. The flat gather() pattern is valid when parallel workstreams have no integration point. But the warning forces the planner to explicitly consider convergence — the default instinct is to partition work without reasoning about composition.
+
+The coordinator-plan.md prompt includes three examples: narrow (serial), wide (gather without convergence), and full graph (gather with typed convergence point). The convergence example shows `wire_frontend(api, shell)` consuming both gather() results as typed arguments, creating a join point where parallel streams merge.
+
+## Two-Phase Planning
+
+§19 demonstrates a 27-point gap between task identification (node-F1 81.54%) and topology determination (edge-F1 54.70%). The coordinator-plan.md prompt separates these competencies:
+
+**Step 1 — Task identification.** List every distinct unit of work as a flat, UNORDERED set. No reasoning about dependencies. Just: what work exists?
+
+**Step 2 — Topology determination.** For each pair of tasks, ask: does B need to READ the output of A? If you cannot name the specific artifact, they are independent.
+
+The autoregressive generation bias (§19) cannot create serial dependencies during task identification because no ordering is requested. The topology step operates on a pre-existing list, not on a sequence being generated for the first time.
+
+**Self-consistency check.** The validator can compare the task set (from step 1) against the topology (from step 2). If all tasks were declared independent in step 1 but appear serial in step 2, the validator flags the inconsistency.
+
 ## Why Not the Other Options
 
 - **Option A (prompt-only scheduling)**: No structural enforcement. The coordinator could skip dependencies.
@@ -310,6 +342,15 @@ clou/
 3. **Semantic density + structural redundancy**: Every token carries meaning; patterns are predictable
 4. **Locality preservation**: Dependencies are adjacent in token sequence (function arguments)
 5. **Operational affordance**: Dependency tracing, concurrency detection, readiness checking are all syntactic inspections
+
+### Long-horizon agent reliability (§17)
+- Decomposition is the highest-leverage intervention; MAKER proves reliability scales through architecture
+
+### Autonomous sequential delivery (§18)
+- In-execution graph editing; independent verification; cross-milestone typed dependencies
+
+### Transformer dynamics (§19)
+- Attractor landscape engineering; compositionality limits on orchestration; information channel capacity
 
 ### The meta-principle
 A representation is effective when the transformer perceives structure through recognition rather than reconstruction. `compose.py` is constitutive — it IS the computation, not a description of it.
