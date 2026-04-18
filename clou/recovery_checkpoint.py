@@ -261,6 +261,9 @@ def _filter_memory_for_cycle(
     memory_path: Path,
     cycle_type: str,
     milestones_dir: Path,
+    *,
+    milestone: str = "",
+    cycle_num: int = 0,
 ) -> str | None:
     """Return filtered memory.md content for *cycle_type*, or None.
 
@@ -268,6 +271,9 @@ def _filter_memory_for_cycle(
     ``_MEMORY_TYPE_FILTERS[cycle_type]``.  Patterns with status
     ``fading`` or ``archived`` are excluded.  Returns ``None`` when
     *cycle_type* has no filter entry or when no patterns match.
+
+    When *milestone* is provided, emits a ``memory.patterns_retrieved``
+    telemetry event listing the patterns that passed filtering (M35 I1).
     """
     allowed_types = _MEMORY_TYPE_FILTERS.get(cycle_type)
     if allowed_types is None:
@@ -314,6 +320,27 @@ def _filter_memory_for_cycle(
 
     if not matched:
         return None
+
+    # M35 I1: emit telemetry event listing retrieved patterns.
+    # Only emit when milestone is non-empty to avoid orphaned events (F2).
+    if milestone:
+        from clou import telemetry
+
+        telemetry.event(
+            "memory.patterns_retrieved",
+            milestone=milestone,
+            cycle_num=cycle_num,
+            cycle_type=cycle_type,
+            pattern_count=len(matched),
+            patterns=[
+                {
+                    "name": p.name,
+                    "type": p.type,
+                    "description": p.description,
+                }
+                for p in matched
+            ],
+        )
 
     return _render_memory(matched)
 
@@ -362,13 +389,36 @@ def determine_next_cycle(
     # DB-18 I6: filtered memory retrieval replaces raw memory.md inclusion.
     # Write filtered content to active/_filtered_memory.md for the prompt
     # builder to read as a milestone-relative path.
+    # Boundary directory for symlink / resolved-path checks (F7).
+    _milestone_dir = checkpoint_path.parent.parent
+
     def _maybe_add_filtered_memory(
         read_set: list[str], cycle_type: str,
+        *, _cycle_num: int = 1,
     ) -> None:
         filtered = _filter_memory_for_cycle(
             _memory_path, cycle_type, _milestones_dir,
+            milestone=milestone,
+            cycle_num=_cycle_num,
         )
         if filtered is not None:
+            # F7: Symlink and boundary validation before write (matches
+            # coordinator.py assess_summary.md guard).
+            if _filtered_path.is_symlink():
+                _log.warning(
+                    "Refusing to write symlink: %s",
+                    _filtered_path,
+                )
+                return
+            if _filtered_path.exists() and not str(
+                _filtered_path.resolve()
+            ).startswith(str(_milestone_dir.resolve()) + "/"):
+                _log.warning(
+                    "_filtered_memory.md resolved outside milestone "
+                    "boundary: %s",
+                    _filtered_path.resolve(),
+                )
+                return
             _filtered_path.parent.mkdir(parents=True, exist_ok=True)
             _filtered_path.write_text(filtered, encoding="utf-8")
             read_set.append("active/_filtered_memory.md")
@@ -376,23 +426,38 @@ def determine_next_cycle(
             # Remove stale file from a previous cycle type to prevent
             # leaking PLAN-cycle memory into an EXECUTE cycle (F1).
             try:
-                _filtered_path.unlink(missing_ok=True)
+                # F7: Symlink and boundary validation before unlink.
+                if _filtered_path.is_symlink():
+                    _log.warning(
+                        "Refusing to unlink symlink: %s",
+                        _filtered_path,
+                    )
+                elif _filtered_path.exists() and not str(
+                    _filtered_path.resolve()
+                ).startswith(str(_milestone_dir.resolve()) + "/"):
+                    _log.warning(
+                        "_filtered_memory.md resolved outside milestone "
+                        "boundary: %s",
+                        _filtered_path.resolve(),
+                    )
+                else:
+                    _filtered_path.unlink(missing_ok=True)
             except OSError:
                 pass
 
     if not checkpoint_path.exists():
-        _maybe_add_filtered_memory(_plan_set, "PLAN")
+        _maybe_add_filtered_memory(_plan_set, "PLAN", _cycle_num=1)
         return "PLAN", _plan_set
 
     checkpoint = parse_checkpoint(checkpoint_path.read_text())
 
     match checkpoint.next_step:
         case "PLAN":
-            _maybe_add_filtered_memory(_plan_set, "PLAN")
+            _maybe_add_filtered_memory(_plan_set, "PLAN", _cycle_num=checkpoint.cycle + 1)
             return "PLAN", _plan_set
         case "EXECUTE" | "EXECUTE (rework)" | "EXECUTE (additional verification)":
             # No memory for EXECUTE -- clean up stale filtered file.
-            _maybe_add_filtered_memory([], "EXECUTE")
+            _maybe_add_filtered_memory([], "EXECUTE", _cycle_num=checkpoint.cycle + 1)
             # Defense-in-depth: reject path traversal in current_phase.
             if not _PHASE_RE.match(checkpoint.current_phase):
                 _log.warning(
@@ -446,7 +511,7 @@ def determine_next_cycle(
             return "EXECUTE", execute_set
         case "REPLAN":
             # No memory for REPLAN -- clean up stale filtered file.
-            _maybe_add_filtered_memory([], "REPLAN")
+            _maybe_add_filtered_memory([], "REPLAN", _cycle_num=checkpoint.cycle + 1)
             # Re-decomposition: ASSESS detected repeated rework failure
             # on the same task and requested re-planning (ADaPT, §9).
             # Read set mirrors PLAN but adds execution artifacts for
@@ -524,28 +589,28 @@ def determine_next_cycle(
                         assess_read.append(rel)
             assess_read += ["requirements.md", "decisions.md", "assessment.md"]
             # DB-18 I6: include filtered memory for ASSESS cycles.
-            _maybe_add_filtered_memory(assess_read, "ASSESS")
+            _maybe_add_filtered_memory(assess_read, "ASSESS", _cycle_num=checkpoint.cycle + 1)
             return "ASSESS", assess_read
         case "VERIFY":
-            _maybe_add_filtered_memory([], "VERIFY")
+            _maybe_add_filtered_memory([], "VERIFY", _cycle_num=checkpoint.cycle + 1)
             return "VERIFY", [
                 "status.md",
                 "intents.md",
                 "compose.py",
             ]
         case "EXIT":
-            _maybe_add_filtered_memory([], "EXIT")
+            _maybe_add_filtered_memory([], "EXIT", _cycle_num=checkpoint.cycle + 1)
             return "EXIT", [
                 "status.md",
                 "handoff.md",
                 "decisions.md",
             ]
         case "COMPLETE":
-            _maybe_add_filtered_memory([], "COMPLETE")
+            _maybe_add_filtered_memory([], "COMPLETE", _cycle_num=checkpoint.cycle + 1)
             return "COMPLETE", []
 
     # Unknown next_step fallback -- clean up stale filtered memory.
-    _maybe_add_filtered_memory([], "UNKNOWN")
+    _maybe_add_filtered_memory([], "UNKNOWN", _cycle_num=checkpoint.cycle + 1)
     return "PLAN", ["milestone.md", "intents.md", "requirements.md", "project.md"]
 
 

@@ -453,7 +453,11 @@ def parse_roadmap_annotations(markdown: str) -> RoadmapGraph:
     # Find all milestone headers with their positions.
     headers: list[tuple[int, str, str]] = []  # (pos, number, name)
     for m in _MILESTONE_RE.finditer(markdown):
-        headers.append((m.start(), m.group(1), m.group(2).strip()))
+        raw_name = m.group(2).strip()
+        # Strip status suffixes like "— current", "— completed", "— sketch",
+        # "— pending" so milestone names are stable across status changes.
+        name = re.sub(r"\s*—\s*(?:current|completed|sketch|pending)\s*$", "", raw_name)
+        headers.append((m.start(), m.group(1), name))
 
     if not headers:
         return RoadmapGraph(milestones={}, order=())

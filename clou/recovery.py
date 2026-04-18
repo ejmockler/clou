@@ -30,6 +30,7 @@ from clou.recovery_compaction import (  # noqa: F401
     _apply_decay,
     _consolidated_milestones,
     _detect_contradiction,
+    _extract_key_phrases,
     _invalidate_contradictions,
     _milestone_sort_key,
     _parse_memory,
@@ -37,6 +38,7 @@ from clou.recovery_compaction import (  # noqa: F401
     _render_memory,
     compact_decisions,
     compact_understanding,
+    scan_pattern_references,
 )
 from clou.recovery_consolidation import (  # noqa: F401
     _analyze_compose,

@@ -57,6 +57,7 @@ from clou.recovery import (
     DEFAULT_RETRY_COOLDOWN,
     ErrorKind,
     archive_milestone_episodic,
+    assess_convergence,
     attempt_self_heal,
     classify_error,
     consolidate_milestone,
@@ -111,6 +112,10 @@ _MAX_CRASH_RETRIES = 3
 _STALENESS_THRESHOLD = 3
 _MAX_BUDGET_USD: float | None = None  # No per-cycle cost cap by default
 _MAX_TURNS: int = 200  # Per-cycle turn limit — prevents infinite agent loops
+
+#: Phase names: lowercase alphanumeric with hyphens or underscores.
+#: Defense-in-depth duplicate of recovery_checkpoint._PHASE_RE (F22).
+_PHASE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*\Z")
 
 
 class StalenessState:
@@ -912,6 +917,162 @@ async def run_coordinator(
                         exc_info=True,
                     )
 
+            # DB-20: Pre-compose ASSESS context into a summary file.
+            # Replaces the raw 5+ file read set with <=2 pre-composed files.
+            if cycle_type == "ASSESS" and _current_phase:
+                # F7: Normalize to lowercase before _PHASE_RE check so
+                # mixed-case phase names from golden_context.py still match.
+                _current_phase = _current_phase.lower()
+                # F22: Validate _current_phase against _PHASE_RE before
+                # passing to precompose_assess_context (defense in depth).
+                if not _PHASE_RE.match(_current_phase):
+                    log.warning(
+                        "ASSESS pre-composition skipped: invalid phase %r",
+                        _current_phase,
+                    )
+                else:
+                    try:
+                        from clou.precompose import precompose_assess_context
+                        from clou.graph import get_colayer_tasks
+
+                        _co_layer: list[str] = [_current_phase]
+                        if compose_path.exists():
+                            try:
+                                _compose_src = compose_path.read_text(
+                                    encoding="utf-8",
+                                )
+                                _co_layer = get_colayer_tasks(
+                                    _compose_src, _current_phase,
+                                )
+                            except Exception as _colayer_exc:
+                                # F7: Log the exception and emit telemetry so
+                                # scope narrowing is observable.
+                                log.warning(
+                                    "get_colayer_tasks failed for phase %r; "
+                                    "falling back to single-task layer",
+                                    _current_phase,
+                                    exc_info=True,
+                                )
+                                telemetry.event(
+                                    "precompose.colayer_fallback",
+                                    milestone=milestone,
+                                    cycle_num=read_cycle_count(
+                                        checkpoint_path,
+                                    ) + 1,
+                                    phase=_current_phase,
+                                    error=str(_colayer_exc),
+                                )
+                            else:
+                                # F1: Detect trivial fallback — get_colayer_tasks
+                                # returns [task_name] on internal parse failure
+                                # without raising.  Make this observable.
+                                if _co_layer == [_current_phase]:
+                                    log.warning(
+                                        "get_colayer_tasks returned trivial "
+                                        "fallback for phase %r",
+                                        _current_phase,
+                                    )
+                                    telemetry.event(
+                                        "precompose.colayer_fallback",
+                                        milestone=milestone,
+                                        cycle_num=read_cycle_count(
+                                            checkpoint_path,
+                                        ) + 1,
+                                        phase=_current_phase,
+                                        error="trivial fallback: parse "
+                                              "returned [task_name]",
+                                    )
+
+                        # F2: precompose_assess_context is now synchronous.
+                        _summary_path = precompose_assess_context(
+                            milestone_dir, _current_phase, _co_layer,
+                        )
+
+                        # F4: Post-precompose validation — verify the summary
+                        # was created and is non-empty before replacing read set.
+                        if (
+                            not _summary_path.exists()
+                            or _summary_path.stat().st_size == 0
+                        ):
+                            raise RuntimeError(
+                                f"assess_summary.md missing or empty: "
+                                f"{_summary_path}"
+                            )
+
+                        # Replace read set: summary + requirements.md for evaluator.
+                        _summary_rel = str(
+                            _summary_path.relative_to(milestone_dir),
+                        )
+                        _precomposed_set = [_summary_rel, "requirements.md"]
+                        # Preserve filtered memory if it was in the original set.
+                        if "active/_filtered_memory.md" in read_set:
+                            _precomposed_set.append(
+                                "active/_filtered_memory.md",
+                            )
+                        log.info(
+                            "ASSESS pre-composition: %d -> %d files",
+                            len(read_set),
+                            len(_precomposed_set),
+                        )
+                        telemetry.event(
+                            "precompose.assess",
+                            milestone=milestone,
+                            cycle_num=read_cycle_count(checkpoint_path) + 1,
+                            original_files=len(read_set),
+                            precomposed_files=len(_precomposed_set),
+                        )
+                        # F3: Emit post-precompose composition event so the
+                        # Cognitive Load table uses post-precompose data.  The
+                        # original read_set.composition emitted earlier
+                        # (line ~706) remains for before/after comparison.
+                        telemetry.event(
+                            "read_set.composition",
+                            milestone=milestone,
+                            cycle_num=read_cycle_count(checkpoint_path) + 1,
+                            cycle_type=cycle_type,
+                            file_count=len(_precomposed_set),
+                            files=_precomposed_set,
+                            pre_composed=True,
+                        )
+                        read_set = _precomposed_set
+                    except Exception:
+                        log.warning(
+                            "ASSESS pre-composition failed; using raw read set",
+                            exc_info=True,
+                        )
+                        # F6: Delete stale assess_summary.md on precomposition
+                        # failure to prevent the coordinator from reading stale
+                        # data from a prior cycle.
+                        # F2: Symlink and boundary validation before unlink.
+                        _stale_summary = milestone_dir / "active" / "assess_summary.md"
+                        if _stale_summary.exists():
+                            try:
+                                # Reject symlinks — never follow a link.
+                                if _stale_summary.is_symlink():
+                                    log.warning(
+                                        "Refusing to unlink symlink: %s",
+                                        _stale_summary,
+                                    )
+                                # Boundary check: resolved path must be under
+                                # the milestone directory.
+                                elif not str(
+                                    _stale_summary.resolve()
+                                ).startswith(
+                                    str(milestone_dir.resolve()) + "/"
+                                ):
+                                    log.warning(
+                                        "assess_summary.md resolved outside "
+                                        "milestone boundary: %s",
+                                        _stale_summary.resolve(),
+                                    )
+                                else:
+                                    _stale_summary.unlink()
+                            except OSError:
+                                log.debug(
+                                    "Could not delete stale assess_summary.md",
+                                    exc_info=True,
+                                )
+
             prompt = build_cycle_prompt(
                 project_dir,
                 milestone,
@@ -1006,6 +1167,23 @@ async def run_coordinator(
                 )
             except Exception:
                 pass  # telemetry must never break the orchestrator
+
+            # Compositional span telemetry (DB-20 Step 2).
+            if cycle_type == "ASSESS":
+                try:
+                    from clou.telemetry import compute_compositional_span
+                    span_data = compute_compositional_span(read_set)
+                    telemetry.event(
+                        "cognitive.compositional_span",
+                        milestone=milestone,
+                        cycle_num=cycle_count + 1,
+                        cycle_type="ASSESS",
+                        span=span_data["span"],
+                        chain=span_data["chain"],
+                        pre_composed=span_data["pre_composed"],
+                    )
+                except Exception:
+                    pass  # telemetry must never break the orchestrator
 
             # Decision accuracy feedback (G6): after an ASSESS cycle that
             # follows a rework EXECUTE, check whether the rework was productive.
@@ -1255,6 +1433,28 @@ async def run_coordinator(
                 readiness_retries = 0
                 crash_retries = 0
 
+            # Scan decisions.md for memory pattern references (M35 I2).
+            # Must run BEFORE compact_decisions() so the scanner sees the
+            # original (pre-compaction) decisions content (F7).
+            if cycle_type in ("PLAN", "ASSESS"):
+                _filtered_path = checkpoint_path.parent / "_filtered_memory.md"
+                if _filtered_path.exists() and decisions_path.exists():
+                    try:
+                        from clou.recovery import scan_pattern_references
+
+                        scan_pattern_references(
+                            _filtered_path,
+                            decisions_path,
+                            milestone=milestone,
+                            cycle_num=cycle_count + 1,
+                            cycle_type=cycle_type,
+                        )
+                    except Exception:
+                        log.warning(
+                            "Pattern reference scan failed for %r",
+                            milestone, exc_info=True,
+                        )
+
             # Compact decisions.md if it's grown too large (DB-15 D3).
             if decisions_path.exists():
                 from clou.recovery import compact_decisions
@@ -1493,14 +1693,24 @@ async def _run_single_cycle(
                     cp_path_pre.read_text(encoding="utf-8")
                 ).current_phase
                 if _phase_for_clean:
-                    ms_dir_pre = clou_dir / "milestones" / milestone
-                    removed = clean_stale_shards(ms_dir_pre, _phase_for_clean)
-                    if removed:
-                        log.info(
-                            "Cleaned %d stale shard(s) before dispatch: %s",
-                            len(removed),
-                            [str(p) for p in removed],
+                    # F5: Lowercase-normalize and validate against
+                    # _PHASE_RE before passing to clean_stale_shards
+                    # (defense in depth, same pattern as line 924-927).
+                    _phase_for_clean = _phase_for_clean.lower()
+                    if not _PHASE_RE.match(_phase_for_clean):
+                        log.warning(
+                            "Stale shard cleanup skipped: invalid phase %r",
+                            _phase_for_clean,
                         )
+                    else:
+                        ms_dir_pre = clou_dir / "milestones" / milestone
+                        removed = clean_stale_shards(ms_dir_pre, _phase_for_clean)
+                        if removed:
+                            log.info(
+                                "Cleaned %d stale shard(s) before dispatch: %s",
+                                len(removed),
+                                [str(p) for p in removed],
+                            )
         except Exception:
             log.debug("Could not clean stale shards", exc_info=True)
 
@@ -1674,27 +1884,40 @@ async def _run_single_cycle(
                                         except Exception:
                                             pass
                                     if _shard_phase:
-                                        active_names = {
-                                            _task_id_to_name[tid]
-                                            for tid in _active_task_ids
-                                            if tid in _task_id_to_name
-                                            and tid != msg.task_id
-                                        }
-                                        impact = sorted(
-                                            _compute_abort_set(
-                                                task_name, _dag_deps,
-                                                active_names,
+                                        # F1: Lowercase-normalize and validate
+                                        # against _PHASE_RE before passing to
+                                        # _write_failure_shard (defense in
+                                        # depth, same pattern as line 924-931).
+                                        _shard_phase = _shard_phase.lower()
+                                        if not _PHASE_RE.match(_shard_phase):
+                                            log.warning(
+                                                "Failure shard skipped: "
+                                                "invalid phase %r",
+                                                _shard_phase,
                                             )
-                                        )
-                                        ms_dir = (
-                                            clou_dir / "milestones" / milestone
-                                        )
-                                        _write_failure_shard(
-                                            ms_dir, _shard_phase,
-                                            task_name, _violation_type,
-                                            _violation_detail,
-                                            impact,
-                                        )
+                                        else:
+                                            active_names = {
+                                                _task_id_to_name[tid]
+                                                for tid in _active_task_ids
+                                                if tid in _task_id_to_name
+                                                and tid != msg.task_id
+                                            }
+                                            impact = sorted(
+                                                _compute_abort_set(
+                                                    task_name, _dag_deps,
+                                                    active_names,
+                                                )
+                                            )
+                                            ms_dir = (
+                                                clou_dir / "milestones"
+                                                / milestone
+                                            )
+                                            _write_failure_shard(
+                                                ms_dir, _shard_phase,
+                                                task_name, _violation_type,
+                                                _violation_detail,
+                                                impact,
+                                            )
 
                         elif is_task_complete(msg):
                             _au = getattr(msg, "usage", {}) or {}
@@ -1917,6 +2140,19 @@ async def _run_single_cycle(
                 except Exception:
                     pass
 
+                # F1: Lowercase-normalize and validate _fallback_phase
+                # against _PHASE_RE before it can reach _write_failure_shard
+                # (defense in depth, same pattern as line 924-931).
+                if _fallback_phase:
+                    _fallback_phase = _fallback_phase.lower()
+                    if not _PHASE_RE.match(_fallback_phase):
+                        log.warning(
+                            "Failure shard fallback skipped: "
+                            "invalid phase %r",
+                            _fallback_phase,
+                        )
+                        _fallback_phase = None
+
                 ms_dir = clou_dir / "milestones" / milestone
                 for tid in list(_active_task_ids):
                     task_name = _task_id_to_name.get(tid)
@@ -1953,12 +2189,31 @@ async def _run_single_cycle(
                     )
                 return "agent_team_crash"
 
+        # Convergence-aware gate status (DB-18).
+        # If _qg_seen is empty during an ASSESS cycle, distinguish
+        # "coordinator suppressed the gate (convergence)" from
+        # "MCP tools genuinely unavailable."
+        _converged = False
+        if cycle_type == "ASSESS" and _qg_expected and not _qg_seen:
+            _ckpt_path = clou_dir / "milestones" / milestone / "checkpoint.md"
+            if _ckpt_path.exists():
+                try:
+                    _ckpt = parse_checkpoint(
+                        _ckpt_path.read_text(encoding="utf-8")
+                    )
+                    _conv = assess_convergence(_ckpt)
+                    _converged = _conv.converged
+                except Exception:
+                    pass  # Fall through to degraded.
+
         # Emit quality gate telemetry after ASSESS cycle completes (DB-18).
         if _qg_expected:
             if _qg_seen == _qg_expected:
                 _qg_status = "full"
             elif _qg_seen:
                 _qg_status = "partial"
+            elif _converged:
+                _qg_status = "converged"
             else:
                 _qg_status = "degraded"
             telemetry.event(
@@ -1967,7 +2222,14 @@ async def _run_single_cycle(
                 cycle_num=cycle_num,
                 status=_qg_status,
                 tools_invoked=sorted(_qg_seen),
-                tools_unavailable=sorted(_qg_expected - _qg_seen),
+                tools_unavailable=(
+                    sorted(_qg_expected - _qg_seen)
+                    if _qg_status != "converged" else []
+                ),
+                tools_suppressed=(
+                    sorted(_qg_expected - _qg_seen)
+                    if _qg_status == "converged" else []
+                ),
                 tools_invoked_count=len(_qg_seen),
             )
             if _qg_status == "degraded":

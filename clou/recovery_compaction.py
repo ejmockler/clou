@@ -12,6 +12,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from clou.recovery_checkpoint import _safe_int
 
@@ -613,3 +614,147 @@ def compact_understanding(
     rendered = _render_understanding(preamble, sections, section_prose)
     understanding_path.write_text(rendered, encoding="utf-8")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Pattern reference scanning (M35 I2)
+# ---------------------------------------------------------------------------
+
+
+def _extract_key_phrases(description: str, *, min_words: int = 3) -> list[str]:
+    """Extract all contiguous N-word phrases from *description*.
+
+    Returns lowercase phrases of *min_words* or more consecutive words,
+    generated via a sliding window over the whitespace-split tokens.
+    """
+    words = description.lower().split()
+    if len(words) < min_words:
+        return []
+    return [
+        " ".join(words[i : i + min_words])
+        for i in range(len(words) - min_words + 1)
+    ]
+
+
+def _extract_cycle_section(decisions_content: str, cycle_num: int) -> str | None:
+    """Return content under ``## Cycle {cycle_num}`` from *decisions_content*.
+
+    Splits the decisions text by ``## Cycle `` headings and returns the
+    body of the section whose number matches *cycle_num*.  Returns
+    ``None`` when no matching section exists.
+    """
+    # Split on ``## Cycle `` boundaries, keeping the heading text.
+    parts = re.split(r"(?=^## Cycle )", decisions_content, flags=re.MULTILINE)
+    for part in parts:
+        m = re.match(r"^## Cycle\s+(\d+)", part)
+        if m and int(m.group(1)) == cycle_num:
+            return part
+    return None
+
+
+def scan_pattern_references(
+    filtered_memory_path: Path,
+    decisions_path: Path,
+    *,
+    milestone: str,
+    cycle_num: int,
+    cycle_type: str,
+) -> dict[str, Any] | None:
+    """Scan decisions.md for references to retrieved memory patterns.
+
+    Returns influence data dict or None if no patterns were retrieved.
+    Emits ``memory.pattern_influence`` telemetry event as side effect.
+
+    Detection logic:
+    - **Exact name match:** pattern name (and hyphen-to-space variant)
+      appears as a case-insensitive substring in decisions content.
+    - **Key phrase overlap:** any 3+-word contiguous phrase from the
+      pattern description appears in the decisions content.
+
+    Does not modify decisions.md content (R7).
+    """
+    if not filtered_memory_path.exists():
+        return None
+
+    try:
+        memory_content = filtered_memory_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    patterns = _parse_memory(memory_content)
+    if not patterns:
+        return None
+
+    if not decisions_path.exists():
+        return None
+
+    decisions_content = decisions_path.read_text(encoding="utf-8")
+
+    # F4: Scope to current cycle section only.  Split by ``## Cycle ``
+    # headings and extract the section matching *cycle_num* so patterns
+    # mentioned in earlier cycles are not credited to the current one.
+    cycle_section = _extract_cycle_section(decisions_content, cycle_num)
+    if cycle_section is None:
+        return None
+    decisions_lower = cycle_section.lower()
+
+    retrieved: list[str] = [p.name for p in patterns]
+    referenced: list[str] = []
+    match_details: list[dict[str, str]] = []
+
+    for pattern in patterns:
+        name_lower = pattern.name.lower()
+        name_spaced = name_lower.replace("-", " ")
+
+        # Exact name match (hyphenated or space-separated).
+        if name_lower in decisions_lower or name_spaced in decisions_lower:
+            if pattern.name not in referenced:
+                referenced.append(pattern.name)
+            match_details.append({
+                "pattern": pattern.name,
+                "match_type": "exact_name",
+                "matched_phrase": pattern.name,
+            })
+            continue
+
+        # Key phrase overlap from description.
+        if pattern.description:
+            phrases = _extract_key_phrases(pattern.description)
+            matched = False
+            for phrase in phrases:
+                if phrase in decisions_lower:
+                    if pattern.name not in referenced:
+                        referenced.append(pattern.name)
+                    match_details.append({
+                        "pattern": pattern.name,
+                        "match_type": "key_phrase",
+                        "matched_phrase": phrase,
+                    })
+                    matched = True
+                    break  # One phrase match is sufficient per pattern.
+            if matched:
+                continue
+
+    influence_ratio = len(referenced) / len(retrieved) if retrieved else 0.0
+
+    result: dict[str, Any] = {
+        "milestone": milestone,
+        "cycle_num": cycle_num,
+        "cycle_type": cycle_type,
+        "retrieved": retrieved,
+        "referenced": referenced,
+        "influence_ratio": influence_ratio,
+        "match_details": match_details,
+    }
+
+    # Emit telemetry event (uses module-level API; no-op if not initialised).
+    try:
+        from clou import telemetry
+
+        telemetry.event("memory.pattern_influence", **result)
+    except Exception:
+        _log.warning(
+            "Pattern influence telemetry emission failed", exc_info=True,
+        )
+
+    return result

@@ -397,6 +397,52 @@ class TestWriteMilestoneSummary:
         finally:
             telemetry._log = old
 
+    def test_quality_gate_section_converged(self, tmp_path: Path) -> None:
+        """DB-18: converged status shows tools_suppressed, not tools_unavailable."""
+        old = telemetry._log
+        try:
+            init("test-qg-conv", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 1000
+                c["output_tokens"] = 1000
+            event(
+                "quality_gate.result", milestone="m1", cycle_num=3,
+                status="converged",
+                tools_invoked=[],
+                tools_unavailable=[],
+                tools_suppressed=["mcp__brutalist__roast"],
+                tools_invoked_count=0,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Quality Gate" in content
+            assert "converged" in content
+            # Suppressed tools shown with (suppressed) label
+            assert "mcp__brutalist__roast (suppressed)" in content
+            # Gate Availability counts converged status
+            assert "converged: 1" in content
+            # Suppressed tools should NOT appear in per-tool unavailability
+            # (tools_unavailable is empty, so no per-tool row for it)
+            lines = content.split("\n")
+            avail_section = False
+            for line in lines:
+                if "### Gate Availability" in line:
+                    avail_section = True
+                if avail_section and line.startswith("| mcp__brutalist__roast"):
+                    # Should not appear in per-tool table since it was
+                    # suppressed (not in tools_unavailable)
+                    assert False, (
+                        "Suppressed tool should not appear in per-tool "
+                        "availability table"
+                    )
+                if avail_section and line.startswith("##") and "Gate" not in line:
+                    break
+        finally:
+            telemetry._log = old
+
     def test_rework_section(self, tmp_path: Path) -> None:
         """DB-18: cycle.rework events produce a Rework table."""
         old = telemetry._log
@@ -1042,5 +1088,825 @@ class TestSectionOrdering:
             assert "## Topology" in content
             assert "## Per-Task Data" in content
             assert "## Incidents" in content
+        finally:
+            telemetry._log = old
+
+
+# ---------------------------------------------------------------------------
+# Cognitive Load section in metrics.md (DB-20 Step 2)
+# ---------------------------------------------------------------------------
+
+
+class TestCognitiveLoadSection:
+    """## Cognitive Load section renders from cognitive telemetry events."""
+
+    def test_cognitive_load_section_renders_all_three_events(
+        self, tmp_path: Path,
+    ) -> None:
+        """All three event types produce a complete Cognitive Load table row."""
+        old = telemetry._log
+        try:
+            init("test-cog-full", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=3, cycle_type="ASSESS") as c:
+                c["outcome"] = "VERIFY"
+                c["input_tokens"] = 20000
+                c["output_tokens"] = 2000
+            event(
+                "read_set.composition", milestone="m1", cycle_num=3,
+                cycle_type="ASSESS", file_count=2,
+                files=["assess_summary.md", "decisions.md"],
+            )
+            event(
+                "read_set.reference_density", milestone="m1", cycle_num=3,
+                density=0.85, referenced_count=2, total_count=2,
+            )
+            event(
+                "cognitive.compositional_span", milestone="m1", cycle_num=3,
+                cycle_type="ASSESS", span=2,
+                chain=["compose.py", "execution.md"], pre_composed=True,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Cognitive Load" in content
+            assert "| Cycle | Type | Read Set Size | Ref Density | Comp Span | Pre-composed |" in content
+            # Row for cycle 3
+            assert "| 3 " in content
+            assert "ASSESS" in content
+            assert "| 2 " in content
+            assert "| 0.85 " in content
+            assert "| yes |" in content
+        finally:
+            telemetry._log = old
+
+    def test_cognitive_load_missing_compositional_span(
+        self, tmp_path: Path,
+    ) -> None:
+        """When compositional_span is missing, renders '-' for span columns."""
+        old = telemetry._log
+        try:
+            init("test-cog-partial", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=5, cycle_type="ASSESS") as c:
+                c["outcome"] = "VERIFY"
+                c["input_tokens"] = 15000
+                c["output_tokens"] = 1500
+            event(
+                "read_set.composition", milestone="m1", cycle_num=5,
+                cycle_type="ASSESS", file_count=4,
+                files=["a.md", "b.md", "c.md", "d.md"],
+            )
+            event(
+                "read_set.reference_density", milestone="m1", cycle_num=5,
+                density=0.75, referenced_count=3, total_count=4,
+            )
+            # No cognitive.compositional_span event
+            write_milestone_summary(tmp_path, "m1", "completed")
+
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Cognitive Load" in content
+            assert "| 5 " in content
+            assert "| 4 " in content
+            assert "| 0.75 " in content
+            # Span and pre_composed should show dashes
+            assert "| - |" in content
+        finally:
+            telemetry._log = old
+
+    def test_cognitive_load_only_assess_cycles(
+        self, tmp_path: Path,
+    ) -> None:
+        """Only ASSESS-cycle events appear; PLAN/EXECUTE events are excluded."""
+        old = telemetry._log
+        try:
+            init("test-cog-assess-only", tmp_path)
+            # PLAN cycle with composition event (should be excluded)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 10000
+                c["output_tokens"] = 1000
+            event(
+                "read_set.composition", milestone="m1", cycle_num=1,
+                cycle_type="PLAN", file_count=6,
+                files=["a", "b", "c", "d", "e", "f"],
+            )
+            # ASSESS cycle (should be included)
+            with span("cycle", milestone="m1", cycle_num=3, cycle_type="ASSESS") as c:
+                c["outcome"] = "VERIFY"
+                c["input_tokens"] = 20000
+                c["output_tokens"] = 2000
+            event(
+                "read_set.composition", milestone="m1", cycle_num=3,
+                cycle_type="ASSESS", file_count=2,
+                files=["assess_summary.md", "decisions.md"],
+            )
+            event(
+                "cognitive.compositional_span", milestone="m1", cycle_num=3,
+                cycle_type="ASSESS", span=2,
+                chain=["compose.py", "execution.md"], pre_composed=True,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Cognitive Load" in content
+            # Only cycle 3 should appear, not cycle 1
+            cog_start = content.index("## Cognitive Load")
+            # Find the next section or end
+            cog_section = content[cog_start:]
+            next_section = cog_section.find("\n## ", 1)
+            if next_section > 0:
+                cog_section = cog_section[:next_section]
+            assert "| 3 " in cog_section
+            assert "| 1 " not in cog_section
+        finally:
+            telemetry._log = old
+
+    def test_cognitive_load_no_events_no_section(
+        self, tmp_path: Path,
+    ) -> None:
+        """No cognitive events at all means no Cognitive Load section."""
+        old = telemetry._log
+        try:
+            init("test-cog-none", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+            write_milestone_summary(tmp_path, "m1", "completed")
+
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Cognitive Load" not in content
+        finally:
+            telemetry._log = old
+
+    def test_existing_sections_unaffected(
+        self, tmp_path: Path,
+    ) -> None:
+        """Adding cognitive load section does not break existing sections."""
+        old = telemetry._log
+        try:
+            init("test-cog-noregress", tmp_path)
+            # Full realistic scenario with agents and cognitive events
+            event("agent.start", milestone="m1", cycle_num=2,
+                  task_id="a1", description="implement login")
+            event("agent.end", milestone="m1", cycle_num=2,
+                  task_id="a1", status="completed", total_tokens=15000, tool_uses=12)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 12000
+                c["output_tokens"] = 3000
+            with span("cycle", milestone="m1", cycle_num=2, cycle_type="EXECUTE") as c:
+                c["outcome"] = "ASSESS"
+                c["input_tokens"] = 35000
+                c["output_tokens"] = 6000
+            with span("cycle", milestone="m1", cycle_num=3, cycle_type="ASSESS") as c:
+                c["outcome"] = "VERIFY"
+                c["input_tokens"] = 20000
+                c["output_tokens"] = 2000
+            event(
+                "read_set.composition", milestone="m1", cycle_num=3,
+                cycle_type="ASSESS", file_count=2,
+                files=["assess_summary.md", "decisions.md"],
+            )
+            event(
+                "quality_gate.result", milestone="m1", cycle_num=3,
+                tools_invoked=["roast"], tools_unavailable=[],
+                finding_count=2,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            # Existing sections still present
+            assert "# Metrics: m1" in content
+            assert "## Cycles" in content
+            assert "## Agents" in content
+            assert "## Quality Gate" in content
+            # New section also present
+            assert "## Cognitive Load" in content
+        finally:
+            telemetry._log = old
+
+    def test_cognitive_load_multiple_assess_cycles(
+        self, tmp_path: Path,
+    ) -> None:
+        """Multiple ASSESS cycles produce multiple rows sorted by cycle."""
+        old = telemetry._log
+        try:
+            init("test-cog-multi", tmp_path)
+            # Two ASSESS cycles
+            with span("cycle", milestone="m1", cycle_num=3, cycle_type="ASSESS") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 20000
+                c["output_tokens"] = 2000
+            with span("cycle", milestone="m1", cycle_num=5, cycle_type="ASSESS") as c:
+                c["outcome"] = "VERIFY"
+                c["input_tokens"] = 18000
+                c["output_tokens"] = 1800
+            event(
+                "read_set.composition", milestone="m1", cycle_num=3,
+                cycle_type="ASSESS", file_count=4,
+                files=["a.md", "b.md", "c.md", "d.md"],
+            )
+            event(
+                "read_set.composition", milestone="m1", cycle_num=5,
+                cycle_type="ASSESS", file_count=2,
+                files=["assess_summary.md", "decisions.md"],
+            )
+            event(
+                "cognitive.compositional_span", milestone="m1", cycle_num=3,
+                cycle_type="ASSESS", span=4,
+                chain=["a", "b", "c", "d"], pre_composed=False,
+            )
+            event(
+                "cognitive.compositional_span", milestone="m1", cycle_num=5,
+                cycle_type="ASSESS", span=2,
+                chain=["assess_summary.md", "decisions.md"], pre_composed=True,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Cognitive Load" in content
+            # Both cycles present
+            cog_start = content.index("## Cognitive Load")
+            cog_section = content[cog_start:]
+            next_section = cog_section.find("\n## ", 1)
+            if next_section > 0:
+                cog_section = cog_section[:next_section]
+            assert "| 3 " in cog_section
+            assert "| 5 " in cog_section
+            # Cycle 3 row before cycle 5 row
+            pos_3 = cog_section.index("| 3 ")
+            pos_5 = cog_section.index("| 5 ")
+            assert pos_3 < pos_5
+            # Cycle 3 shows no pre-composed
+            assert "| no |" in cog_section
+            # Cycle 5 shows pre-composed
+            assert "| yes |" in cog_section
+        finally:
+            telemetry._log = old
+
+
+class TestPatternInfluenceSection:
+    """M35: Pattern Influence section in metrics.md."""
+
+    def test_section_renders_from_both_event_types(
+        self, tmp_path: Path,
+    ) -> None:
+        """Full scenario: retrieval + influence events produce the section."""
+        old = telemetry._log
+        try:
+            init("test-pi-full", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+            event(
+                "memory.patterns_retrieved", milestone="m1",
+                cycle_num=1, cycle_type="PLAN", pattern_count=3,
+                patterns=[
+                    {"name": "decomposition-topology", "type": "decomposition", "description": "topology matters"},
+                    {"name": "cycle-count-distribution", "type": "cost-calibration", "description": "cycle cost data"},
+                    {"name": "validation-noise", "type": "debt", "description": "noisy validation"},
+                ],
+            )
+            event(
+                "memory.pattern_influence", milestone="m1",
+                cycle_num=1, cycle_type="PLAN",
+                retrieved=["decomposition-topology", "cycle-count-distribution", "validation-noise"],
+                referenced=["decomposition-topology", "cycle-count-distribution"],
+                influence_ratio=0.67,
+                match_details=[
+                    {"pattern": "decomposition-topology", "match_type": "exact_name", "matched_phrase": "decomposition-topology"},
+                    {"pattern": "cycle-count-distribution", "match_type": "key_phrase", "matched_phrase": "cycle cost data"},
+                ],
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+
+            # Section heading present
+            assert "## Pattern Influence" in content
+
+            # Per-cycle table
+            assert "| Cycle | Type | Retrieved | Referenced | Influence |" in content
+            assert "| 1 | PLAN | 3 | 2 | 0.67 |" in content
+
+            # Patterns Retrieved sub-table
+            assert "### Patterns Retrieved" in content
+            assert "| decomposition-topology | decomposition | 1 |" in content
+            assert "| cycle-count-distribution | cost-calibration | 1 |" in content
+            assert "| validation-noise | debt | 1 |" in content
+
+            # Patterns Referenced sub-table
+            assert "### Patterns Referenced" in content
+            assert "| decomposition-topology | 1 | exact_name |" in content
+            assert "| cycle-count-distribution | 1 | key_phrase |" in content
+        finally:
+            telemetry._log = old
+
+    def test_section_omitted_when_no_events(
+        self, tmp_path: Path,
+    ) -> None:
+        """No retrieval/influence events -> no section at all."""
+        old = telemetry._log
+        try:
+            init("test-pi-none", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Pattern Influence" not in content
+            assert "### Patterns Retrieved" not in content
+            assert "### Patterns Referenced" not in content
+        finally:
+            telemetry._log = old
+
+    def test_multiple_cycles_ordered_by_cycle_num(
+        self, tmp_path: Path,
+    ) -> None:
+        """Per-cycle rows are ordered by cycle number."""
+        old = telemetry._log
+        try:
+            init("test-pi-multi", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+            with span("cycle", milestone="m1", cycle_num=4, cycle_type="ASSESS") as c:
+                c["outcome"] = "VERIFY"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+            # Emit in reverse order to test sorting
+            event(
+                "memory.pattern_influence", milestone="m1",
+                cycle_num=4, cycle_type="ASSESS",
+                retrieved=["pat-a", "pat-b"],
+                referenced=["pat-a"],
+                influence_ratio=0.50,
+                match_details=[
+                    {"pattern": "pat-a", "match_type": "exact_name", "matched_phrase": "pat-a"},
+                ],
+            )
+            event(
+                "memory.pattern_influence", milestone="m1",
+                cycle_num=1, cycle_type="PLAN",
+                retrieved=["pat-a", "pat-b", "pat-c"],
+                referenced=["pat-a", "pat-b"],
+                influence_ratio=0.67,
+                match_details=[
+                    {"pattern": "pat-a", "match_type": "exact_name", "matched_phrase": "pat-a"},
+                    {"pattern": "pat-b", "match_type": "key_phrase", "matched_phrase": "some phrase"},
+                ],
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+
+            # Find the Pattern Influence section
+            pi_start = content.index("## Pattern Influence")
+            pi_section = content[pi_start:]
+            # Cycle 1 row appears before cycle 4 row
+            pos_1 = pi_section.index("| 1 | PLAN")
+            pos_4 = pi_section.index("| 4 | ASSESS")
+            assert pos_1 < pos_4
+        finally:
+            telemetry._log = old
+
+    def test_aggregate_patterns_across_cycles(
+        self, tmp_path: Path,
+    ) -> None:
+        """Aggregate tables accumulate patterns across multiple cycles."""
+        old = telemetry._log
+        try:
+            init("test-pi-agg", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+            with span("cycle", milestone="m1", cycle_num=4, cycle_type="ASSESS") as c:
+                c["outcome"] = "VERIFY"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+            # Retrieval events for two cycles
+            event(
+                "memory.patterns_retrieved", milestone="m1",
+                cycle_num=1, cycle_type="PLAN", pattern_count=2,
+                patterns=[
+                    {"name": "pat-a", "type": "decomp", "description": "desc a"},
+                    {"name": "pat-b", "type": "cost", "description": "desc b"},
+                ],
+            )
+            event(
+                "memory.patterns_retrieved", milestone="m1",
+                cycle_num=4, cycle_type="ASSESS", pattern_count=2,
+                patterns=[
+                    {"name": "pat-a", "type": "decomp", "description": "desc a"},
+                    {"name": "pat-c", "type": "debt", "description": "desc c"},
+                ],
+            )
+            # Influence events
+            event(
+                "memory.pattern_influence", milestone="m1",
+                cycle_num=1, cycle_type="PLAN",
+                retrieved=["pat-a", "pat-b"],
+                referenced=["pat-a"],
+                influence_ratio=0.50,
+                match_details=[
+                    {"pattern": "pat-a", "match_type": "exact_name", "matched_phrase": "pat-a"},
+                ],
+            )
+            event(
+                "memory.pattern_influence", milestone="m1",
+                cycle_num=4, cycle_type="ASSESS",
+                retrieved=["pat-a", "pat-c"],
+                referenced=["pat-a"],
+                influence_ratio=0.50,
+                match_details=[
+                    {"pattern": "pat-a", "match_type": "key_phrase", "matched_phrase": "desc a"},
+                ],
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+
+            # Patterns Retrieved: pat-a appears in cycles 1, 4
+            assert "| pat-a | decomp | 1, 4 |" in content
+            # pat-b only in cycle 1
+            assert "| pat-b | cost | 1 |" in content
+            # pat-c only in cycle 4
+            assert "| pat-c | debt | 4 |" in content
+
+            # Patterns Referenced: pat-a referenced in both cycles with both match types
+            assert "### Patterns Referenced" in content
+            # pat-a in cycles 1, 4 with both match types
+            assert "| pat-a | 1, 4 | exact_name, key_phrase |" in content
+        finally:
+            telemetry._log = old
+
+    def test_no_json_dumps_in_output(
+        self, tmp_path: Path,
+    ) -> None:
+        """Output is human-readable markdown, not raw JSON."""
+        old = telemetry._log
+        try:
+            init("test-pi-readable", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+            event(
+                "memory.patterns_retrieved", milestone="m1",
+                cycle_num=1, cycle_type="PLAN", pattern_count=1,
+                patterns=[
+                    {"name": "test-pat", "type": "test", "description": "a test pattern"},
+                ],
+            )
+            event(
+                "memory.pattern_influence", milestone="m1",
+                cycle_num=1, cycle_type="PLAN",
+                retrieved=["test-pat"],
+                referenced=["test-pat"],
+                influence_ratio=1.0,
+                match_details=[
+                    {"pattern": "test-pat", "match_type": "exact_name", "matched_phrase": "test-pat"},
+                ],
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+
+            # Extract just the Pattern Influence section
+            pi_start = content.index("## Pattern Influence")
+            next_h2 = content.find("\n## ", pi_start + 1)
+            if next_h2 > 0:
+                pi_section = content[pi_start:next_h2]
+            else:
+                pi_section = content[pi_start:]
+
+            # No JSON artifacts in the section
+            assert "{" not in pi_section
+            assert "}" not in pi_section
+            assert "[" not in pi_section
+            assert "]" not in pi_section
+        finally:
+            telemetry._log = old
+
+    def test_retrieval_only_without_influence(
+        self, tmp_path: Path,
+    ) -> None:
+        """Only retrieval events (no influence) still produces the section."""
+        old = telemetry._log
+        try:
+            init("test-pi-ret-only", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+            event(
+                "memory.patterns_retrieved", milestone="m1",
+                cycle_num=1, cycle_type="PLAN", pattern_count=1,
+                patterns=[
+                    {"name": "solo-pat", "type": "solo", "description": "solo"},
+                ],
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+
+            assert "## Pattern Influence" in content
+            assert "### Patterns Retrieved" in content
+            assert "| solo-pat | solo | 1 |" in content
+            # No per-cycle influence table or referenced table
+            assert "### Patterns Referenced" not in content
+        finally:
+            telemetry._log = old
+
+    def test_pattern_names_with_pipes_and_newlines_are_sanitized(
+        self, tmp_path: Path,
+    ) -> None:
+        """F11: pipe and newline chars in pattern fields do not corrupt tables."""
+        old = telemetry._log
+        try:
+            init("test-pi-sanitize", tmp_path)
+            with span("cycle", milestone="m1", cycle_num=1, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+            event(
+                "memory.patterns_retrieved", milestone="m1",
+                cycle_num=1, cycle_type="PLAN", pattern_count=1,
+                patterns=[
+                    {
+                        "name": "bad|name\nhere",
+                        "type": "cost|type\nbroken",
+                        "description": "desc with | and \n inside",
+                    },
+                ],
+            )
+            event(
+                "memory.pattern_influence", milestone="m1",
+                cycle_num=1, cycle_type="PLAN",
+                retrieved=["bad|name\nhere"],
+                referenced=["bad|name\nhere"],
+                influence_ratio=1.0,
+                match_details=[
+                    {
+                        "pattern": "bad|name\nhere",
+                        "match_type": "exact|name\ntype",
+                        "matched_phrase": "bad|name\nhere",
+                    },
+                ],
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+
+            # The section should render without corruption
+            assert "## Pattern Influence" in content
+
+            # Pipes and newlines must be escaped/stripped in table cells
+            assert r"bad\|name here" in content
+            assert r"cost\|type broken" in content
+
+            # Verify table structure is not broken: each data row in the
+            # Pattern Influence section should have exactly the expected
+            # number of pipe-delimiters for its table format.
+            pi_start = content.index("## Pattern Influence")
+            pi_section = content[pi_start:]
+            for line in pi_section.splitlines():
+                if line.startswith("|") and not line.startswith("|--"):
+                    # Count unescaped pipes (not preceded by backslash)
+                    import re as _re
+                    unescaped = _re.findall(r"(?<!\\)\|", line)
+                    # Header/data rows have the same pipe count per table
+                    # (minimum 4 for 3-column tables, minimum 6 for 5-column)
+                    assert len(unescaped) >= 4, (
+                        f"Table row has too few columns: {line!r}"
+                    )
+        finally:
+            telemetry._log = old
+
+
+class TestPatternInfluenceIntegration:
+    """F14: Integration test using production _filter_memory_for_cycle path."""
+
+    def test_production_retrieval_flows_through_to_metrics(
+        self, tmp_path: Path,
+    ) -> None:
+        """Call _filter_memory_for_cycle with real memory, then verify metrics."""
+        from clou.recovery_checkpoint import _filter_memory_for_cycle
+
+        # Set up real memory.md with active patterns
+        clou_dir = tmp_path / ".clou"
+        ms_dir = clou_dir / "milestones"
+        ms_dir.mkdir(parents=True)
+        memory_path = clou_dir / "memory.md"
+        memory_path.write_text(
+            "# Operational Memory\n"
+            "\n"
+            "## Patterns\n"
+            "\n"
+            "### decomposition-topology\n"
+            "type: decomposition\n"
+            "observed: m01-setup\n"
+            "reinforced: 2\n"
+            "last_active: m02-auth\n"
+            "status: active\n"
+            "Topology-aware decomposition reduces cycle count.\n"
+            "\n"
+            "### cycle-cost-calibration\n"
+            "type: cost-calibration\n"
+            "observed: m01-setup\n"
+            "reinforced: 1\n"
+            "last_active: m01-setup\n"
+            "status: active\n"
+            "Track cycle costs for budget estimation.\n",
+            encoding="utf-8",
+        )
+
+        old = telemetry._log
+        try:
+            init("test-pi-integration", tmp_path)
+
+            # Emit a cycle span so write_milestone_summary has cycle data
+            with span("cycle", milestone="test-ms", cycle_num=3, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+
+            # Call production code path -- this emits the real
+            # memory.patterns_retrieved event via telemetry.event()
+            result = _filter_memory_for_cycle(
+                memory_path, "PLAN", ms_dir,
+                milestone="test-ms", cycle_num=3,
+            )
+            assert result is not None, "Expected patterns to pass filtering"
+
+            # Now render metrics and verify the renderer consumed the event
+            write_milestone_summary(tmp_path, "test-ms", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "test-ms" / "metrics.md"
+            ).read_text()
+
+            # Section should be present
+            assert "## Pattern Influence" in content
+            assert "### Patterns Retrieved" in content
+
+            # Both patterns should appear with cycle_num 3
+            assert "| decomposition-topology | decomposition | 3 |" in content
+            assert "| cycle-cost-calibration | cost-calibration | 3 |" in content
+
+            # Verify cycle_num appears in the Cycles Retrieved column
+            pi_start = content.index("### Patterns Retrieved")
+            pi_section = content[pi_start:]
+            # Every data row should contain "3" as the cycle number
+            for line in pi_section.splitlines():
+                if line.startswith("| ") and not line.startswith("| Pattern") and not line.startswith("|--"):
+                    assert "3" in line, (
+                        f"cycle_num 3 missing from row: {line!r}"
+                    )
+        finally:
+            telemetry._log = old
+
+    def test_influence_pipeline_flows_through_to_metrics(
+        self, tmp_path: Path,
+    ) -> None:
+        """RF5: retrieval -> scan_pattern_references -> metrics rendering."""
+        from clou.recovery_checkpoint import _filter_memory_for_cycle
+        from clou.recovery_compaction import scan_pattern_references
+
+        # Set up real memory.md with active patterns
+        clou_dir = tmp_path / ".clou"
+        ms_dir = clou_dir / "milestones"
+        ms_dir.mkdir(parents=True)
+        memory_path = clou_dir / "memory.md"
+        memory_path.write_text(
+            "# Operational Memory\n"
+            "\n"
+            "## Patterns\n"
+            "\n"
+            "### decomposition-topology\n"
+            "type: decomposition\n"
+            "observed: m01-setup\n"
+            "reinforced: 2\n"
+            "last_active: m02-auth\n"
+            "status: active\n"
+            "Topology-aware decomposition reduces cycle count.\n"
+            "\n"
+            "### cycle-cost-calibration\n"
+            "type: cost-calibration\n"
+            "observed: m01-setup\n"
+            "reinforced: 1\n"
+            "last_active: m01-setup\n"
+            "status: active\n"
+            "Track cycle costs for budget estimation.\n",
+            encoding="utf-8",
+        )
+
+        old = telemetry._log
+        try:
+            init("test-pi-influence", tmp_path)
+
+            # Emit a cycle span so write_milestone_summary has cycle data
+            with span("cycle", milestone="test-ms", cycle_num=3, cycle_type="PLAN") as c:
+                c["outcome"] = "EXECUTE"
+                c["input_tokens"] = 5000
+                c["output_tokens"] = 1000
+
+            # Step 1: Call production retrieval path (emits
+            # memory.patterns_retrieved event).
+            filtered = _filter_memory_for_cycle(
+                memory_path, "PLAN", ms_dir,
+                milestone="test-ms", cycle_num=3,
+            )
+            assert filtered is not None, "Expected patterns to pass filtering"
+
+            # Write filtered memory to a temp file for the scanner
+            filtered_path = tmp_path / "filtered_memory.md"
+            filtered_path.write_text(filtered, encoding="utf-8")
+
+            # Step 2: Write decisions.md that references the patterns.
+            # Use exact name match for one pattern and a key phrase
+            # from the description for the other.
+            decisions_dir = ms_dir / "test-ms"
+            decisions_dir.mkdir(parents=True, exist_ok=True)
+            decisions_path = decisions_dir / "decisions.md"
+            decisions_path.write_text(
+                "# Decisions\n"
+                "\n"
+                "## Cycle 3\n"
+                "\n"
+                "Applied decomposition-topology to split the milestone "
+                "into smaller phases. Also considered cycle costs for "
+                "budget estimation when planning.\n",
+                encoding="utf-8",
+            )
+
+            # Step 3: Call scan_pattern_references with production args.
+            # This emits memory.pattern_influence telemetry event.
+            influence = scan_pattern_references(
+                filtered_path,
+                decisions_path,
+                milestone="test-ms",
+                cycle_num=3,
+                cycle_type="PLAN",
+            )
+            assert influence is not None, "Expected influence data"
+            assert len(influence["referenced"]) > 0, "Expected at least one reference"
+
+            # Step 4: Re-render metrics and verify Patterns Referenced table.
+            write_milestone_summary(tmp_path, "test-ms", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "test-ms" / "metrics.md"
+            ).read_text()
+
+            # Both tables should be present
+            assert "### Patterns Retrieved" in content
+            assert "### Patterns Referenced" in content
+
+            # Verify Patterns Referenced table contains matched patterns
+            ref_start = content.index("### Patterns Referenced")
+            ref_section = content[ref_start:]
+
+            # decomposition-topology matched by exact name
+            assert "decomposition-topology" in ref_section
+            # cycle-cost-calibration matched by key phrase
+            assert "cycle-cost-calibration" in ref_section
+
+            # Verify table structure has expected columns
+            assert "| Pattern | Cycles | Match Type |" in ref_section
+
+            # Verify match types appear in the table rows
+            ref_lines = [
+                ln for ln in ref_section.splitlines()
+                if ln.startswith("| ") and not ln.startswith("| Pattern") and not ln.startswith("|--")
+            ]
+            assert len(ref_lines) >= 2, (
+                f"Expected at least 2 referenced pattern rows, got {len(ref_lines)}"
+            )
+            # Every data row should reference cycle 3
+            for line in ref_lines:
+                assert "3" in line, f"cycle 3 missing from referenced row: {line!r}"
         finally:
             telemetry._log = old

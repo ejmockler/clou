@@ -637,7 +637,7 @@ def _validate_decisions(path: Path) -> list[ValidationFinding]:
     # comprehension is preserved)
     cycle_blocks = _split_sections(content, "## Cycle")
     for i, block in enumerate(cycle_blocks, 1):
-        has_entry = bool(re.search(r"(?m)^### (Accepted|Overridden|Tradeoff):", block))
+        has_entry = bool(re.search(r"(?m)^### (Accepted|Overridden|Tradeoff|Convergence):", block))
         if not has_entry:
             # ASSESS sections with zero findings are valid (convergence).
             first_line = block.strip().split("\n", 1)[0].lower()

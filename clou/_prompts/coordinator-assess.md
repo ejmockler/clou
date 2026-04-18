@@ -7,11 +7,23 @@ Determine: rework needed, phase complete, or escalation required.
 </objective>
 
 <procedure>
-1. Read assessment.md — classified findings from the brutalist and
-   evaluator dispatches. This is your primary input.
-   
-   The brutalist read execution.md and compose.py. The evaluator
-   classified findings against requirements.md and intents.md.
+1. Read your golden context files (listed in the cycle prompt).
+
+   Normal path (pre-composed): Your primary context is the
+   pre-composed ASSESS summary (active/assess_summary.md), which
+   consolidates task criteria, execution outcomes, prior assessment,
+   and recent decisions into a single structured document.
+   requirements.md is included separately for the evaluator's
+   classification reference.
+
+   Fallback path (raw files): If pre-composition failed, the cycle
+   prompt lists the raw artifact files instead (execution.md,
+   requirements.md, decisions.md, assessment.md, etc.). Read these
+   directly -- they contain the same information, unconsolidated.
+
+   Sub-agent reads (both paths): The brutalist reads raw
+   execution.md and compose.py directly for detailed code review.
+   The evaluator classifies findings against requirements.md.
    You evaluate their CLASSIFIED output, not raw artifacts.
 
 2. Read the Routing Context section in your prompt — it provides
@@ -55,6 +67,13 @@ Determine: rework needed, phase complete, or escalation required.
    the coordinator can make targeted rework decisions.
    ```
 
+   If the finding trajectory across assessment rounds shows convergence
+   (consecutive rounds at terminal stage per calibrated pattern — e.g.,
+   bugs→edge cases→test gaps→stop), you may suppress the brutalist
+   dispatch. Write a `### Convergence:` entry in decisions.md with the
+   trajectory and reasoning. Do not suppress before at least 2 assessment
+   rounds have completed.
+
 4. Dispatch the assessor-evaluator. The evaluator classifies findings
    cold — reading assessment.md, not discovering new issues.
    ```
@@ -79,6 +98,7 @@ Determine: rework needed, phase complete, or escalation required.
    | noise          | Document dismissal   | Out of scope, stylistic, or fix cost exceeds value     |
    | architectural  | Write escalation     | Valid but beyond coordinator authority                  |
    | security       | Always valid         | Security findings never classified as noise             |
+   | convergence    | Suppress gate        | Finding trajectory plateaued; diminishing returns       |
 
    Write classified results back to:
    - .clou/milestones/{{milestone}}/assessment.md
@@ -160,6 +180,12 @@ decisions.md entries (newest cycle first):
 **Classification:** security
 **Action:** {what will be done — security findings always actioned}
 **Reasoning:** {analysis of security impact}
+
+### Convergence: {decision title}
+**Finding count trajectory:** {e.g., 16→10→1→1→1}
+**Classification:** convergence
+**Action:** Gate suppressed — convergence declared
+**Reasoning:** {why convergence threshold is met, referencing calibrated pattern}
 ```
 
 Non-gate judgments:

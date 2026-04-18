@@ -2459,6 +2459,47 @@ status: active
         cycle, read_set = determine_next_cycle(cp_path, "m1")
         assert cycle == "EXECUTE"
 
+    def test_symlink_write_rejected(self, tmp_path: Path) -> None:
+        """F7: symlink at _filtered_memory.md path prevents write_text."""
+        cp_path = tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md"
+        cp_path.parent.mkdir(parents=True)
+        (tmp_path / ".clou" / "memory.md").write_text(self._SAMPLE_MEMORY)
+
+        # Place a symlink where _filtered_memory.md would be written.
+        filtered_path = cp_path.parent / "_filtered_memory.md"
+        decoy = tmp_path / "decoy.md"
+        decoy.write_text("decoy")
+        filtered_path.symlink_to(decoy)
+
+        cycle, read_set = determine_next_cycle(cp_path, "m1")
+        assert cycle == "PLAN"
+        # The symlink should NOT have been followed for writing.
+        assert "active/_filtered_memory.md" not in read_set
+        # Decoy file should be unchanged.
+        assert decoy.read_text() == "decoy"
+
+    def test_symlink_unlink_rejected(self, tmp_path: Path) -> None:
+        """F7: symlink at _filtered_memory.md path prevents unlink."""
+        cp_path = tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md"
+        cp_path.parent.mkdir(parents=True)
+        # EXECUTE has no memory filter -- triggers the unlink branch.
+        cp_path.write_text(
+            "cycle: 2\nstep: PLAN\nnext_step: EXECUTE\ncurrent_phase: impl\n"
+        )
+
+        # Place a symlink where _filtered_memory.md would be unlinked.
+        filtered_path = cp_path.parent / "_filtered_memory.md"
+        decoy = tmp_path / "decoy.md"
+        decoy.write_text("decoy")
+        filtered_path.symlink_to(decoy)
+
+        cycle, read_set = determine_next_cycle(cp_path, "m1")
+        assert cycle == "EXECUTE"
+        # The symlink should still exist (not unlinked).
+        assert filtered_path.is_symlink()
+        # Decoy target should be untouched.
+        assert decoy.read_text() == "decoy"
+
 
 class TestFilterMemoryForCycle:
     """DB-18 I6: unit tests for _filter_memory_for_cycle helper."""
@@ -2669,6 +2710,359 @@ Stale.
         assert "debt" in _MEMORY_TYPE_FILTERS["PLAN"]
         assert "quality-gate" in _MEMORY_TYPE_FILTERS["ASSESS"]
         assert "escalation" in _MEMORY_TYPE_FILTERS["ASSESS"]
+
+
+class TestFilterMemoryTelemetry:
+    """M35 I1: telemetry emission when memory patterns pass retrieval filtering."""
+
+    _FULL_MEMORY = """\
+# Operational Memory
+
+## Patterns
+
+### cycle-count-distribution
+type: cost-calibration
+observed: 12-ms
+reinforced: 1
+last_active: 12-ms
+status: active
+
+5 cycles, ~10,000 output tokens, 3m.
+
+### task-decomposition-heuristic
+type: decomposition
+observed: 12-ms
+reinforced: 2
+last_active: 12-ms
+status: active
+
+Split by concern, not by file.
+
+### known-tech-debt
+type: debt
+observed: 11-ms
+reinforced: 1
+last_active: 11-ms
+status: active
+
+Stale fixture in test_ui.
+
+### gate-failure-patterns
+type: quality-gate
+observed: 12-ms
+reinforced: 3
+last_active: 12-ms
+status: active
+
+Lint errors in generated code.
+
+### escalation-threshold
+type: escalation
+observed: 10-ms
+reinforced: 1
+last_active: 10-ms
+status: active
+
+Escalate after 3 consecutive failures.
+
+### fading-pattern
+type: cost-calibration
+observed: 5-ms
+reinforced: 1
+last_active: 5-ms
+status: fading
+
+Old cost data.
+
+### archived-gate
+type: quality-gate
+observed: 3-ms
+reinforced: 1
+last_active: 3-ms
+status: archived
+
+No longer relevant.
+"""
+
+    def test_plan_emits_patterns_retrieved_event(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PLAN filtering emits memory.patterns_retrieved with correct structure."""
+        from clou import telemetry
+
+        captured: list[tuple[str, dict]] = []
+
+        def _capture_event(name: str, **attrs: object) -> None:
+            captured.append((name, attrs))
+
+        monkeypatch.setattr(telemetry, "event", _capture_event)
+
+        mem_path = tmp_path / "memory.md"
+        mem_path.write_text(self._FULL_MEMORY)
+        ms_dir = tmp_path / "milestones"
+        ms_dir.mkdir()
+
+        result = _filter_memory_for_cycle(
+            mem_path, "PLAN", ms_dir, milestone="test-ms", cycle_num=4,
+        )
+        assert result is not None
+
+        assert len(captured) == 1
+        name, attrs = captured[0]
+        assert name == "memory.patterns_retrieved"
+        assert attrs["milestone"] == "test-ms"
+        assert attrs["cycle_num"] == 4
+        assert attrs["cycle_type"] == "PLAN"
+        assert attrs["pattern_count"] == 3
+        patterns = attrs["patterns"]
+        assert len(patterns) == 3
+        names = {p["name"] for p in patterns}
+        assert names == {
+            "cycle-count-distribution",
+            "task-decomposition-heuristic",
+            "known-tech-debt",
+        }
+        # Each pattern dict has required fields.
+        for p in patterns:
+            assert "name" in p
+            assert "type" in p
+            assert "description" in p
+
+    def test_assess_emits_patterns_retrieved_event(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ASSESS filtering emits event with quality-gate and escalation patterns."""
+        from clou import telemetry
+
+        captured: list[tuple[str, dict]] = []
+
+        def _capture_event(name: str, **attrs: object) -> None:
+            captured.append((name, attrs))
+
+        monkeypatch.setattr(telemetry, "event", _capture_event)
+
+        mem_path = tmp_path / "memory.md"
+        mem_path.write_text(self._FULL_MEMORY)
+        ms_dir = tmp_path / "milestones"
+        ms_dir.mkdir()
+
+        result = _filter_memory_for_cycle(
+            mem_path, "ASSESS", ms_dir, milestone="test-ms", cycle_num=7,
+        )
+        assert result is not None
+
+        assert len(captured) == 1
+        name, attrs = captured[0]
+        assert name == "memory.patterns_retrieved"
+        assert attrs["cycle_num"] == 7
+        assert attrs["cycle_type"] == "ASSESS"
+        assert attrs["pattern_count"] == 2
+        names = {p["name"] for p in attrs["patterns"]}
+        assert names == {"gate-failure-patterns", "escalation-threshold"}
+
+    def test_no_event_when_no_patterns_match(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No telemetry event emitted when filtering yields no patterns."""
+        from clou import telemetry
+
+        captured: list[tuple[str, dict]] = []
+
+        def _capture_event(name: str, **attrs: object) -> None:
+            captured.append((name, attrs))
+
+        monkeypatch.setattr(telemetry, "event", _capture_event)
+
+        mem_path = tmp_path / "memory.md"
+        mem_path.write_text(self._FULL_MEMORY)
+        ms_dir = tmp_path / "milestones"
+        ms_dir.mkdir()
+
+        # EXECUTE has no filter entry -- returns None, no event.
+        result = _filter_memory_for_cycle(
+            mem_path, "EXECUTE", ms_dir, milestone="test-ms",
+        )
+        assert result is None
+        assert len(captured) == 0
+
+    def test_no_event_when_only_fading_patterns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No telemetry event emitted when all matching patterns are fading."""
+        from clou import telemetry
+
+        captured: list[tuple[str, dict]] = []
+
+        def _capture_event(name: str, **attrs: object) -> None:
+            captured.append((name, attrs))
+
+        monkeypatch.setattr(telemetry, "event", _capture_event)
+
+        mem_path = tmp_path / "memory.md"
+        mem_path.write_text("""\
+# Operational Memory
+
+## Patterns
+
+### old-cost-data
+type: cost-calibration
+observed: 5-ms
+reinforced: 1
+last_active: 5-ms
+status: fading
+
+Stale.
+""")
+        ms_dir = tmp_path / "milestones"
+        ms_dir.mkdir()
+
+        result = _filter_memory_for_cycle(
+            mem_path, "PLAN", ms_dir, milestone="test-ms",
+        )
+        assert result is None
+        assert len(captured) == 0
+
+    def test_event_pattern_description_populated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pattern descriptions in event match the parsed memory content."""
+        from clou import telemetry
+
+        captured: list[tuple[str, dict]] = []
+
+        def _capture_event(name: str, **attrs: object) -> None:
+            captured.append((name, attrs))
+
+        monkeypatch.setattr(telemetry, "event", _capture_event)
+
+        mem_path = tmp_path / "memory.md"
+        mem_path.write_text(self._FULL_MEMORY)
+        ms_dir = tmp_path / "milestones"
+        ms_dir.mkdir()
+
+        _filter_memory_for_cycle(
+            mem_path, "PLAN", ms_dir, milestone="test-ms", cycle_num=2,
+        )
+
+        _, attrs = captured[0]
+        assert attrs["cycle_num"] == 2
+        by_name = {p["name"]: p for p in attrs["patterns"]}
+        assert by_name["task-decomposition-heuristic"]["type"] == "decomposition"
+        assert "concern" in by_name["task-decomposition-heuristic"]["description"]
+
+    def test_return_value_unchanged_by_telemetry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Telemetry emission does not alter the function's return value."""
+        from clou import telemetry
+
+        monkeypatch.setattr(telemetry, "event", lambda name, **kw: None)
+
+        mem_path = tmp_path / "memory.md"
+        mem_path.write_text(self._FULL_MEMORY)
+        ms_dir = tmp_path / "milestones"
+        ms_dir.mkdir()
+
+        result_with = _filter_memory_for_cycle(
+            mem_path, "PLAN", ms_dir, milestone="test-ms",
+        )
+        # Call again without milestone (default empty string) -- same filtering.
+        result_without = _filter_memory_for_cycle(
+            mem_path, "PLAN", ms_dir,
+        )
+        assert result_with == result_without
+
+    def test_no_event_when_milestone_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No telemetry event emitted when milestone is empty string (F2)."""
+        from clou import telemetry
+
+        captured: list[tuple[str, dict]] = []
+
+        def _capture_event(name: str, **attrs: object) -> None:
+            captured.append((name, attrs))
+
+        monkeypatch.setattr(telemetry, "event", _capture_event)
+
+        mem_path = tmp_path / "memory.md"
+        mem_path.write_text(self._FULL_MEMORY)
+        ms_dir = tmp_path / "milestones"
+        ms_dir.mkdir()
+
+        # Default milestone="" -- should NOT emit event.
+        result = _filter_memory_for_cycle(mem_path, "PLAN", ms_dir)
+        assert result is not None  # Filtering still works.
+        assert len(captured) == 0  # But no orphaned telemetry event.
+
+    def test_cycle_num_defaults_to_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """cycle_num defaults to 0 when not provided."""
+        from clou import telemetry
+
+        captured: list[tuple[str, dict]] = []
+
+        def _capture_event(name: str, **attrs: object) -> None:
+            captured.append((name, attrs))
+
+        monkeypatch.setattr(telemetry, "event", _capture_event)
+
+        mem_path = tmp_path / "memory.md"
+        mem_path.write_text(self._FULL_MEMORY)
+        ms_dir = tmp_path / "milestones"
+        ms_dir.mkdir()
+
+        _filter_memory_for_cycle(mem_path, "PLAN", ms_dir, milestone="test-ms")
+
+        assert len(captured) == 1
+        assert captured[0][1]["cycle_num"] == 0
+
+    def test_cycle_num_matches_coordinator_convention(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retrieval cycle_num = checkpoint.cycle + 1, matching coordinator convention.
+
+        RF1: when checkpoint.cycle=3, the telemetry event should have cycle_num=4,
+        which is the same cycle_num the coordinator uses (cycle_count + 1).
+        """
+        cp_path = tmp_path / ".clou" / "milestones" / "test-ms" / "active" / "coordinator.md"
+        cp_path.parent.mkdir(parents=True)
+        (tmp_path / ".clou" / "memory.md").write_text(self._FULL_MEMORY)
+        # checkpoint.cycle=3, next_step=PLAN
+        cp_path.write_text("cycle: 3\nstep: PLAN\nnext_step: PLAN\ncurrent_phase: impl\n")
+
+        emitted: list[dict] = []
+        import clou.telemetry as _tel
+        monkeypatch.setattr(_tel, "event", lambda name, **kw: emitted.append({"name": name, **kw}))
+
+        cycle_type, read_set = determine_next_cycle(cp_path, "test-ms")
+        assert cycle_type == "PLAN"
+
+        # The retrieval event should have cycle_num = checkpoint.cycle + 1 = 4
+        retrieval_events = [e for e in emitted if e["name"] == "memory.patterns_retrieved"]
+        assert len(retrieval_events) == 1
+        assert retrieval_events[0]["cycle_num"] == 4  # 3 + 1
+
+    def test_no_checkpoint_uses_cycle_num_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When no checkpoint exists, retrieval event uses cycle_num=1 (first cycle)."""
+        cp_path = tmp_path / ".clou" / "milestones" / "test-ms" / "active" / "coordinator.md"
+        cp_path.parent.mkdir(parents=True)
+        (tmp_path / ".clou" / "memory.md").write_text(self._FULL_MEMORY)
+        # Do NOT create coordinator.md -- simulates first cycle
+
+        emitted: list[dict] = []
+        import clou.telemetry as _tel
+        monkeypatch.setattr(_tel, "event", lambda name, **kw: emitted.append({"name": name, **kw}))
+
+        cycle_type, read_set = determine_next_cycle(cp_path, "test-ms")
+        assert cycle_type == "PLAN"
+
+        retrieval_events = [e for e in emitted if e["name"] == "memory.patterns_retrieved"]
+        assert len(retrieval_events) == 1
+        assert retrieval_events[0]["cycle_num"] == 1
 
 
 class TestDetermineNextCycleAssessMemory:

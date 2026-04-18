@@ -248,6 +248,15 @@ def _fmt_duration(ms: int) -> str:
     return f"{m}m {sec:02d}s"
 
 
+def _sanitize_md_cell(value: str) -> str:
+    """Escape a string for safe inclusion in a markdown table cell.
+
+    Pipes would break column boundaries and newlines would break row
+    boundaries, so both are neutralized.
+    """
+    return value.replace("|", r"\|").replace("\n", " ")
+
+
 def write_milestone_summary(
     project_dir: Path,
     milestone: str,
@@ -557,7 +566,11 @@ def write_milestone_summary(
         ])
         for qg in qg_events:
             invoked = ", ".join(qg.get("tools_invoked", []))
-            unavail = ", ".join(qg.get("tools_unavailable", []))
+            suppressed = qg.get("tools_suppressed", [])
+            if suppressed:
+                unavail = ", ".join(suppressed) + " (suppressed)"
+            else:
+                unavail = ", ".join(qg.get("tools_unavailable", []))
             # Support both old (finding_count) and new (tools_invoked_count) field names.
             tool_count = qg.get("tools_invoked_count", qg.get("finding_count", 0))
             lines.append(
@@ -574,6 +587,7 @@ def write_milestone_summary(
         _full = sum(1 for q in qg_events if q.get("status") == "full")
         _partial = sum(1 for q in qg_events if q.get("status") == "partial")
         _degraded = sum(1 for q in qg_events if q.get("status") == "degraded")
+        _converged = sum(1 for q in qg_events if q.get("status") == "converged")
 
         # Per-tool availability.
         _tool_avail: dict[str, int] = {}
@@ -593,6 +607,7 @@ def write_milestone_summary(
             f"full: {_full}",
             f"partial: {_partial}",
             f"degraded: {_degraded}",
+            f"converged: {_converged}",
         ])
 
         if _all_tools:
@@ -632,6 +647,90 @@ def write_milestone_summary(
                 f"| {do.get('subsequent_valid_findings', '?')} "
                 f"| {'yes' if do.get('was_productive') else 'no'} |"
             )
+
+    # -- Cognitive Load section (DB-20 Step 2) --
+    cog_composition = [
+        r for r in records
+        if r.get("event") == "read_set.composition"
+        and r.get("milestone") == milestone
+    ]
+    cog_density = [
+        r for r in records
+        if r.get("event") == "read_set.reference_density"
+        and r.get("milestone") == milestone
+    ]
+    cog_span = [
+        r for r in records
+        if r.get("event") == "cognitive.compositional_span"
+        and r.get("milestone") == milestone
+    ]
+
+    # Group cognitive metrics by cycle_num for ASSESS cycles only.
+    # F3: When two read_set.composition events exist for the same cycle
+    # (raw + pre-composed), prefer the pre_composed=True event for
+    # file_count so the Cognitive Load table shows post-reduction data.
+    cog_cycles: dict[int, dict[str, Any]] = {}
+    for r in cog_composition:
+        cn = r.get("cycle_num")
+        ct = r.get("cycle_type", "")
+        if cn is not None and ct == "ASSESS":
+            entry = cog_cycles.setdefault(cn, {})
+            is_pre = bool(r.get("pre_composed"))
+            already_pre = entry.get("_has_pre_composed", False)
+            # Only overwrite file_count if this event is pre_composed
+            # or no pre_composed event has been seen yet for this cycle.
+            if is_pre or not already_pre:
+                entry["file_count"] = r.get("file_count")
+            if is_pre:
+                entry["_has_pre_composed"] = True
+                # Propagate pre_composed from composition event so the
+                # table renders it even when no span event exists.
+                entry["pre_composed"] = True
+    for r in cog_density:
+        cn = r.get("cycle_num")
+        if cn is not None and cn in cog_cycles:
+            cog_cycles[cn]["density"] = r.get("density")
+    for r in cog_span:
+        cn = r.get("cycle_num")
+        ct = r.get("cycle_type", "")
+        if cn is not None and ct == "ASSESS":
+            cog_cycles.setdefault(cn, {})
+            cog_cycles[cn]["span"] = r.get("span")
+            cog_cycles[cn]["pre_composed"] = r.get("pre_composed")
+
+    if cog_cycles:
+        lines.extend([
+            "",
+            "## Cognitive Load",
+            "",
+            "| Cycle | Type | Read Set Size | Ref Density | Comp Span | Pre-composed |",
+            "|---|---|---|---|---|---|",
+        ])
+        for cn in sorted(cog_cycles):
+            data = cog_cycles[cn]
+            file_count = data.get("file_count")
+            density = data.get("density")
+            span_val = data.get("span")
+            pre_composed = data.get("pre_composed")
+            lines.append(
+                f"| {cn} "
+                f"| ASSESS "
+                f"| {file_count if file_count is not None else '-'} "
+                f"| {density if density is not None else '-'} "
+                f"| {span_val if span_val is not None else '-'} "
+                f"| {'yes' if pre_composed else 'no' if pre_composed is not None else '-'} |"
+            )
+    elif not cog_composition and not cog_density and not cog_span:
+        # No cognitive events at all — skip the section entirely
+        pass
+    else:
+        # Some events exist but none for ASSESS cycles
+        lines.extend([
+            "",
+            "## Cognitive Load",
+            "",
+            "No cognitive metrics captured for this milestone.",
+        ])
 
     # -- Rework events (DB-18 telemetry extension) --
     rework_events = [
@@ -685,6 +784,106 @@ def write_milestone_summary(
                 f"| {esc.get('severity', '?')} "
                 f"| {_resolved} |"
             )
+
+    # -- Pattern Influence (M35: memory pattern influence telemetry) --
+    retrieval_events = [
+        r for r in records
+        if r.get("event") == "memory.patterns_retrieved"
+        and r.get("milestone") == milestone
+    ]
+    influence_events = [
+        r for r in records
+        if r.get("event") == "memory.pattern_influence"
+        and r.get("milestone") == milestone
+    ]
+
+    if retrieval_events or influence_events:
+        lines.extend(["", "## Pattern Influence"])
+
+        # Per-cycle influence table (from memory.pattern_influence events).
+        if influence_events:
+            influence_events_sorted = sorted(
+                influence_events, key=lambda r: r.get("cycle_num", 0),
+            )
+            lines.extend([
+                "",
+                "| Cycle | Type | Retrieved | Referenced | Influence |",
+                "|-------|------|-----------|------------|-----------|",
+            ])
+            for ie in influence_events_sorted:
+                retrieved = ie.get("retrieved", [])
+                referenced = ie.get("referenced", [])
+                ratio = ie.get("influence_ratio", 0.0)
+                lines.append(
+                    f"| {ie.get('cycle_num', '?')} "
+                    f"| {ie.get('cycle_type', '?')} "
+                    f"| {len(retrieved)} "
+                    f"| {len(referenced)} "
+                    f"| {ratio:.2f} |"
+                )
+
+        # Aggregate: Patterns Retrieved table.
+        if retrieval_events:
+            # Map pattern name -> (type, set of cycle_nums).
+            pat_retrieved: dict[str, tuple[str, set[int]]] = {}
+            for re_evt in retrieval_events:
+                cn = re_evt.get("cycle_num")
+                for pat in re_evt.get("patterns", []):
+                    name = pat.get("name", "?")
+                    ptype = pat.get("type", "?")
+                    if name not in pat_retrieved:
+                        pat_retrieved[name] = (ptype, set())
+                    if cn is not None:
+                        pat_retrieved[name][1].add(cn)
+
+            lines.extend([
+                "",
+                "### Patterns Retrieved",
+                "",
+                "| Pattern | Type | Cycles Retrieved |",
+                "|---------|------|------------------|",
+            ])
+            for name in sorted(pat_retrieved):
+                ptype, cycle_set = pat_retrieved[name]
+                cycles_str = ", ".join(str(c) for c in sorted(cycle_set))
+                lines.append(
+                    f"| {_sanitize_md_cell(name)} "
+                    f"| {_sanitize_md_cell(ptype)} "
+                    f"| {cycles_str} |"
+                )
+
+        # Aggregate: Patterns Referenced table.
+        if influence_events:
+            # Map pattern name -> (set of cycle_nums, set of match_types).
+            pat_referenced: dict[str, tuple[set[int], set[str]]] = {}
+            for ie in influence_events:
+                cn = ie.get("cycle_num")
+                for md in ie.get("match_details", []):
+                    pname = md.get("pattern", "?")
+                    mtype = md.get("match_type", "?")
+                    if pname not in pat_referenced:
+                        pat_referenced[pname] = (set(), set())
+                    if cn is not None:
+                        pat_referenced[pname][0].add(cn)
+                    pat_referenced[pname][1].add(mtype)
+
+            if pat_referenced:
+                lines.extend([
+                    "",
+                    "### Patterns Referenced",
+                    "",
+                    "| Pattern | Cycles | Match Type |",
+                    "|---------|--------|------------|",
+                ])
+                for pname in sorted(pat_referenced):
+                    cycle_set, mtype_set = pat_referenced[pname]
+                    cycles_str = ", ".join(str(c) for c in sorted(cycle_set))
+                    mtypes_str = ", ".join(sorted(mtype_set))
+                    lines.append(
+                        f"| {_sanitize_md_cell(pname)} "
+                        f"| {cycles_str} "
+                        f"| {_sanitize_md_cell(mtypes_str)} |"
+                    )
 
     # -- Incidents --
     if incidents:
@@ -949,3 +1148,65 @@ def emit_distribution_distance(
         validation_retries=validation_retries,
         **result,
     )
+
+
+# ---------------------------------------------------------------------------
+# Compositional span (DB-20 Step 2)
+# ---------------------------------------------------------------------------
+
+#: File-role classification for compositional span measurement.
+#: Each role represents one hop in the intent-to-evidence chain.
+_FILE_ROLE_PATTERNS: list[tuple[str, str]] = [
+    ("intent", "intents.md"),
+    ("criteria", "compose.py"),
+    ("criteria", "phase.md"),
+    ("execution", "execution.md"),
+    ("execution", "execution-"),
+    ("assessment", "assessment.md"),
+    ("decision", "decisions.md"),
+    ("requirements", "requirements.md"),
+    ("summary", "assess_summary.md"),
+]
+
+
+def _classify_file_role(filename: str) -> str | None:
+    """Classify a read-set file path into its artifact role.
+
+    Returns the role name or None if the file does not match any known role.
+    """
+    import os
+    basename = os.path.basename(filename)
+    for role, pattern in _FILE_ROLE_PATTERNS:
+        if basename == pattern or basename.startswith(pattern):
+            return role
+    return None
+
+
+def compute_compositional_span(
+    read_set: list[str],
+) -> dict[str, Any]:
+    """Compute compositional span for a cycle's read set.
+
+    The span counts how many distinct artifact roles are present
+    in the read set. Each role represents one hop in the
+    intent-to-evidence chain.
+
+    Returns dict with:
+        span: int -- max hop count from intent to evidence
+        chain: list[str] -- distinct role types in the read set
+        pre_composed: bool -- whether read set contains pre-composed summary
+    """
+    roles_seen: list[str] = []
+    pre_composed = False
+    for filepath in read_set:
+        role = _classify_file_role(filepath)
+        if role is not None and role not in roles_seen:
+            roles_seen.append(role)
+        if role == "summary":
+            pre_composed = True
+
+    return {
+        "span": len(roles_seen),
+        "chain": roles_seen,
+        "pre_composed": pre_composed,
+    }

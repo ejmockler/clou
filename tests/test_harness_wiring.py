@@ -398,3 +398,104 @@ def test_validation_accepts_quality_gate_cycle_header(
     errors = _validate_decisions(decisions_path)
     # Zero-finding quality gate cycle is valid (convergence)
     assert not any("no " in e and "entry" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Validation accepts Convergence decision entries
+# ---------------------------------------------------------------------------
+
+
+def test_validation_accepts_convergence_entry(tmp_path: Path) -> None:
+    """Convergence entries (### Convergence:) are valid decisions.md entries."""
+    from clou.validation import _validate_decisions
+
+    decisions_path = tmp_path / "decisions.md"
+    decisions_path.write_text(
+        "## Cycle 3 — Coordinator Judgment (Convergence)\n\n"
+        "### Convergence: Gate suppressed at convergence threshold\n"
+        "**Finding count trajectory:** 16\u219210\u21921\u21921\u21921\n"
+        "**Classification:** convergence\n"
+        "**Action:** Gate suppressed \u2014 convergence declared\n"
+        "**Reasoning:** Terminal stage reached per calibrated pattern\n"
+    )
+    findings = _validate_decisions(decisions_path)
+    errors = [f for f in findings if f.severity.name == "ERROR"]
+    warnings = [f for f in findings if f.severity.name == "WARNING"]
+    assert not errors
+    assert not warnings
+
+
+# ---------------------------------------------------------------------------
+# Convergence-aware gate status logic
+# ---------------------------------------------------------------------------
+
+
+def test_convergence_detection_produces_converged_status() -> None:
+    """When checkpoint shows convergence and no gate tools were seen,
+    status should be 'converged' not 'degraded'."""
+    from clou.recovery_checkpoint import parse_checkpoint, assess_convergence
+
+    checkpoint_content = (
+        "cycle: 5\n"
+        "step: ASSESS\n"
+        "next_step: VERIFY\n"
+        "current_phase: some_phase\n"
+        "phases_completed: 1\n"
+        "phases_total: 2\n"
+        "valid_findings: 0\n"
+        "consecutive_zero_valid: 2\n"
+    )
+    ckpt = parse_checkpoint(checkpoint_content)
+    conv = assess_convergence(ckpt)
+    assert conv.converged is True
+
+    # Simulate the coordinator status logic (coordinator.py ~L2210-2218)
+    _qg_expected = {"mcp__brutalist__roast"}
+    _qg_seen: set[str] = set()
+    _converged = conv.converged
+
+    if _qg_seen == _qg_expected:
+        status = "full"
+    elif _qg_seen:
+        status = "partial"
+    elif _converged:
+        status = "converged"
+    else:
+        status = "degraded"
+
+    assert status == "converged"
+
+
+def test_no_convergence_produces_degraded_status() -> None:
+    """When checkpoint does NOT show convergence and no gate tools were seen,
+    status should be 'degraded'."""
+    from clou.recovery_checkpoint import parse_checkpoint, assess_convergence
+
+    checkpoint_content = (
+        "cycle: 3\n"
+        "step: ASSESS\n"
+        "next_step: EXECUTE\n"
+        "current_phase: some_phase\n"
+        "phases_completed: 0\n"
+        "phases_total: 2\n"
+        "valid_findings: 1\n"
+        "consecutive_zero_valid: 0\n"
+    )
+    ckpt = parse_checkpoint(checkpoint_content)
+    conv = assess_convergence(ckpt)
+    assert conv.converged is False
+
+    _qg_expected = {"mcp__brutalist__roast"}
+    _qg_seen: set[str] = set()
+    _converged = conv.converged
+
+    if _qg_seen == _qg_expected:
+        status = "full"
+    elif _qg_seen:
+        status = "partial"
+    elif _converged:
+        status = "converged"
+    else:
+        status = "degraded"
+
+    assert status == "degraded"
