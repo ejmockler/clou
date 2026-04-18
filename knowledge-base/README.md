@@ -30,11 +30,6 @@ Software construction is the first domain. The architecture is domain-agnostic; 
 - [Brutalist MCP](./integration/brutalist-mcp.md) — Multi-perspective quality gate, available tools, usage patterns
 - [Playwright MCP](./integration/playwright-mcp.md) — Browser-driven verification, tool inventory, constraints
 
-### Implementation
-- [Status](./implementation/status.md) — What's built, what's next, quality gate results. Front-loaded like Clou's own `execution.md`.
-- [Findings](./implementation/findings.md) — Discoveries during implementation that affect design. Newest-first like Clou's own `decisions.md`.
-- [Slash Commands](./implementation/slash-commands.md) — Dispatch layer, completion menu, and per-command design plans for the discoverable harness surface.
-
 ### Decision Boundaries
 Architectural decisions resolved during the design phase. Each documents the problem, options with tradeoffs, constraints from the SDK, research basis, and final decision.
 

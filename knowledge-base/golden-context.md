@@ -355,7 +355,7 @@ If validation fails: git-revert golden context files to pre-cycle state, restart
 
 ## Memory Lifecycle
 
-> **Architecture:** [DB-18](./decision-boundaries/18-memory-architecture.md). Not yet implemented.
+> **Architecture:** [DB-18](./decision-boundaries/18-memory-architecture.md).
 
 Golden context is the external pattern library that the transformer retrieves from during each cycle (Research Foundations §2, §16). Three lifecycle operations transform it from append-only storage into a memory system:
 
