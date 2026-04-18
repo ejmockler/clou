@@ -1,3 +1,0 @@
-{"role": "system", "content": "session_start", "timestamp": 1774830624.8443892, "meta": {"session_id": "s1", "project_dir": "/Users/noot/clou/pytest-of-noot/pytest-193/test_verbatim_tail_included0", "model": "opus"}}
-{"role": "user", "content": "my question", "timestamp": 1774830624.8444521, "meta": {}}
-{"role": "assistant", "content": "my answer", "timestamp": 1774830624.8444889, "meta": {}}

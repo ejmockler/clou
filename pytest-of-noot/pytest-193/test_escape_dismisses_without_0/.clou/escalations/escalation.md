@@ -1,3 +1,0 @@
-# Escalation
-
-Some issue.

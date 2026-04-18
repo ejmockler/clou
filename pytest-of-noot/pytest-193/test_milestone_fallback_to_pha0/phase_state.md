@@ -1,1 +1,0 @@
-This milestone is active.
