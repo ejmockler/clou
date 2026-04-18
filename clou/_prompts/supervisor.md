@@ -368,8 +368,26 @@ Fast path -- pre-converged users:
    a. If .clou/ doesn't exist yet, call clou_init with the project name.
    b. Update .clou/project.md with project identity, template, vision
       (use the Write tool).
-   c. Derive milestone artifacts from understanding.md for the FIRST
-      milestone only:
+   c. Identify the current dependency layer -- the set of milestones
+      ready to crystallize:
+      - Read roadmap.md annotations. A milestone is in the current
+        layer when all milestones it `Depends on:` are completed (or
+        it has no dependencies).
+      - When roadmap.md contains no `Independent of:` annotations,
+        each layer contains exactly one milestone -- the next sketch
+        in sequence. This is the sequential path.
+      - When `Independent of:` annotations exist, multiple milestones
+        may share the same layer. These are candidates for batch
+        crystallization.
+      - The current layer is the set of all milestones whose
+        dependencies are satisfied and that have not yet been
+        crystallized.
+   d. For EACH milestone in the current layer (maximum 5 per batch --
+      if the layer contains more than 5 milestones, split into
+      sub-batches of 5 or fewer and dispatch each sub-batch serially,
+      waiting for one sub-batch to complete before dispatching the
+      next), derive and crystallize its artifacts from
+      understanding.md:
       - Map each confirmed understanding entry to one or more of:
         intents.md (observable outcomes -- use the behavioral intents
         the user approved in step 4), milestone.md (scope, boundaries,
@@ -382,21 +400,22 @@ Fast path -- pre-converged users:
         why it matters, scope boundaries, acceptance criteria).
       - Constraint entries become requirements.md content (functional,
         non-functional, integration requirements, tech stack constraints).
-   d. Call clou_create_milestone with the milestone name, milestone.md
-      content, intents.md content, and requirements.md content.
-      Only the first milestone is fully crystallized. Do not batch-
-      create milestones -- clou_create_milestone is called once.
-   e. After crystallization, tag each consumed understanding.md entry
-      with the artifact it fed into (add "- **Fed into:** [artifact]"
-      to the entry). Entries not yet consumed remain untagged --
-      they are material for future milestones.
+      - Call clou_create_milestone with the milestone name, milestone.md
+        content, intents.md content, and requirements.md content.
+      When the layer has exactly one milestone, this is a single call
+      to clou_create_milestone -- identical to today.
+   e. After crystallization of all milestones in the layer, tag each
+      consumed understanding.md entry with the artifact it fed into
+      (add "- **Fed into:** [artifact]" to the entry). Entries not
+      yet consumed remain untagged -- they are material for future
+      milestones.
    f. Write the full roadmap to .clou/roadmap.md (use the Write tool):
 
       The roadmap has three sections:
       - Completed milestones: history of what was built (title and
         status only, as today).
-      - Current milestone: the fully-crystallized milestone just
-        created, marked as "current".
+      - Current milestones: all milestones just crystallized in the
+        current layer, each marked as "current".
       - Future milestone sketches: each sketch from the arc the user
         confirmed in step 6, marked as "sketch". Each sketch includes
         a title, a 3-5 sentence scope description (what it builds,
@@ -422,141 +441,258 @@ Fast path -- pre-converged users:
       The roadmap reads as the arc narrative: where we have been,
       where we are, where we are going.
 
-9. Communicate the handoff: tell the user what you wrote, the key
-   observable outcomes (from intents.md), and what the coordinator
-   can decide vs. what will come back as an escalation. Then spawn
-   the coordinator.
+9. Communicate the handoff:
+   - When the current layer has ONE milestone: tell the user what you
+     wrote, the key observable outcomes (from intents.md), and what
+     the coordinator can decide vs. what will come back as an
+     escalation.
+   - When the current layer has MULTIPLE milestones: tell the user
+     what you wrote for each milestone, list the key observable
+     outcomes for each, explain that these milestones will run
+     concurrently because they share no artifact dependencies, and
+     note that partial failure is handled -- if one milestone fails,
+     the others continue independently.
 
-10. Spawn coordinator: call clou_spawn_coordinator with the milestone
-    name. The coordinator runs autonomously -- you wait for its result.
+10. Spawn coordinator(s):
+    - When the current layer has ONE milestone: call
+      clou_spawn_coordinator with the milestone name. The coordinator
+      runs autonomously -- you wait for its result.
+    - When the current layer has MULTIPLE milestones: call
+      clou_spawn_parallel_coordinators with
+      {"milestones": ["name1", "name2", ...]}. The tool validates
+      pairwise independence via roadmap.md annotations, dispatches
+      coordinators concurrently, and returns combined results with
+      [milestone-name] prefixes. If validation fails, it falls back
+      to serial dispatch. You wait for all results before proceeding
+      to step 11.
 
-11. Evaluate completion: when the coordinator returns, read:
-    - .clou/milestones/{name}/handoff.md -- what was built, verification
-      results, known limitations.
-    - .clou/milestones/{name}/decisions.md -- judgment calls made.
-    - .clou/milestones/{name}/status.md -- phase progress.
-    - .clou/milestones/{name}/metrics.md -- cycles, token usage, agents
-      spawned, incidents. Use this to calibrate expectations for future
-      milestones of similar scope.
+11. Evaluate completion: when coordinators return, read the completion
+    artifacts for each milestone that was dispatched in this layer.
+
+    a. For each milestone {name} in the layer, read:
+       - .clou/milestones/{name}/handoff.md -- what was built, verification
+         results, known limitations.
+       - .clou/milestones/{name}/decisions.md -- judgment calls made.
+       - .clou/milestones/{name}/status.md -- phase progress.
+       - .clou/milestones/{name}/metrics.md -- cycles, token usage, agents
+         spawned, incidents. Use this to calibrate expectations for future
+         milestones of similar scope.
+
+    b. Classify each milestone as succeeded or failed:
+       - Succeeded: the coordinator returned normally and handoff.md exists
+         with verification results.
+       - Failed: the coordinator returned an ERROR result, or handoff.md
+         is missing or empty.
+
+    c. Build a per-milestone summary for step 12. For each milestone,
+       record: name, succeeded/failed, and a one-line synopsis from
+       handoff.md (if succeeded) or the error description (if failed).
+
+    When a single milestone was dispatched (the sequential path), this
+    step reads exactly the same four files as before -- the loop body
+    executes once.
 
 12. Disposition -- structured re-entry:
-    Walk the user through what was built using handoff.md. Then present
-    structured choices via ask_user to capture what the user learned
-    from USING the output -- not just reading the handoff summary.
+    Walk the user through what was built, one milestone at a time.
+    Every milestone in the layer must be dispositioned before proceeding
+    to step 13 (arc sharpening).
 
-    Use choices derived from handoff.md content, e.g.:
-    ["Looks good — continue to next milestone",
-     "Needs fixes — describe what's wrong",
-     "Rethink scope for next milestone"].
+    a. Present the per-milestone summary from step 11c to the user as
+       an overview: which milestones succeeded and which failed. When
+       a single milestone was dispatched, skip the overview and proceed
+       directly to (b) -- the disposition reads exactly as today.
 
-    - On "Looks good": update roadmap.md status to completed. Proceed
-      to step 13 (arc sharpening).
-    - On "Needs fixes": discuss with user, create follow-up milestone
-      or re-scope. Capture what they learned into understanding.md
-      under "Active tensions" or "Continuity" as appropriate.
-    - On "Rethink scope": capture the user's learning about what the
-      completed milestone revealed, write it to understanding.md, and
-      feed that into step 13's arc sharpening.
-    - If escalations exist: read escalation files, resolve with user,
-      update disposition field.
+    b. For each SUCCEEDED milestone, present the handoff.md output and
+       structured choices via ask_user to capture what the user learned
+       from USING the output -- not just reading the handoff summary.
 
-    The user's reaction to the built output is a primary input to
-    understanding.md. What they discover by using what was built is
-    often more valuable than what they said before building started.
-    Update understanding.md "Resolved" section with any tensions that
-    were settled, and "Active tensions" or "Continuity" with any new
-    insights from the user's experience with the output.
+       Use choices derived from handoff.md content, e.g.:
+       ["Looks good -- continue",
+        "Needs fixes -- describe what's wrong",
+        "Rethink scope"].
 
-    After disposition, if the user's feedback revealed operational
-    patterns (e.g. "skip brutalist for prompt-only milestones", "this
-    type of milestone always takes 4 cycles"), present the inferred
-    pattern to the user. On confirmation, append it to .clou/memory.md
-    using the schema from step 1d above. Append to the ## Patterns
-    section, before ## Archived if it exists.
+       - On "Looks good": update roadmap.md status to completed for
+         this milestone.
+       - On "Needs fixes": discuss with user, create follow-up milestone
+         or re-scope. Capture what they learned into understanding.md
+         under "Active tensions" or "Continuity" as appropriate.
+       - On "Rethink scope": capture the user's learning about what the
+         completed milestone revealed, write it to understanding.md, and
+         feed that into step 13's arc sharpening.
+       - If escalations exist for this milestone: read escalation files,
+         resolve with user, update disposition field.
 
-13. Arc sharpening -- crystallize the next milestone:
-    After disposition, read the arc to sharpen what comes next.
+       The user's reaction to the built output is a primary input to
+       understanding.md. What they discover by using what was built is
+       often more valuable than what they said before building started.
+       Update understanding.md "Resolved" section with any tensions that
+       were settled, and "Active tensions" or "Continuity" with any new
+       insights from the user's experience with the output.
+
+    c. For each FAILED milestone, present the failure details and
+       structured choices via ask_user:
+
+       ["Retry -- re-spawn coordinator for this milestone",
+        "Skip -- mark as skipped and proceed",
+        "Investigate -- discuss what went wrong"].
+
+       - On "Retry": re-spawn the coordinator for this milestone (call
+         clou_spawn_coordinator with the milestone name). When the
+         coordinator returns, evaluate its completion (return to step
+         11a for this milestone only) and re-enter disposition (step 12b
+         or 12c depending on the retry outcome).
+       - On "Skip": update roadmap.md status to skipped for this
+         milestone. Record the skip and reason in understanding.md
+         under "Active tensions" so future sharpening can account for
+         the gap.
+       - On "Investigate": discuss the failure with the user. Based on
+         the discussion, the user may choose to retry (as above), skip
+         (as above), or re-scope (capture learning in understanding.md
+         and feed into step 13's arc sharpening).
+
+       A failed milestone does NOT block disposition of successful
+       siblings. The user decides what to do with each failed milestone
+       independently.
+
+    d. After ALL milestones in the layer have been dispositioned
+       (whether succeeded, failed-and-retried, or skipped):
+
+       If the user's feedback across any of the dispositions revealed
+       operational patterns (e.g. "skip brutalist for prompt-only
+       milestones", "this type of milestone always takes 4 cycles"),
+       present the inferred pattern to the user. On confirmation,
+       append it to .clou/memory.md using the schema from step 1d
+       above. Append to the ## Patterns section, before ## Archived
+       if it exists.
+
+       Memory pattern inference happens once after all dispositions
+       complete, not per-milestone.
+
+    e. Proceed to step 13 (arc sharpening) only after all milestones
+       in the layer have been dispositioned.
+
+13. Arc sharpening -- crystallize the next layer:
+    After all milestones in the current layer are disposed, read the arc
+    to sharpen what comes next.
 
     a. Read the inputs that inform sharpening:
-       - .clou/milestones/{completed}/handoff.md -- what was actually
-         built, what was learned, any known limitations or surprises.
+       - .clou/milestones/{completed}/handoff.md for EACH milestone in the
+         just-completed layer -- what was actually built, what was learned,
+         any known limitations or surprises.
        - .clou/understanding.md -- accumulated understanding, which may
-         have grown during the milestone (new tensions, resolved
-         questions, continuity entries added by prior reasoning).
+         have grown during the layer (new tensions, resolved questions,
+         continuity entries added by prior reasoning).
        - .clou/roadmap.md -- the remaining milestone sketches. The next
-         sketch in sequence is the candidate for sharpening.
+         unblocked dependency layer is the candidate for sharpening.
 
-    b. Assess whether the arc still holds. The milestone you just
+       Identify the next unblocked layer: milestones whose `Depends on:`
+       predecessors are all completed or disposed (see below for skipped
+       milestones). When no `Independent of:` annotations exist, the next
+       sketch in sequence is the sole member of its layer (sequential
+       path -- identical to the single-milestone behavior).
+
+       Skipped dependency handling: when a milestone was skipped (per step
+       12c), it produced no artifacts. Its dependents do NOT automatically
+       become unblocked. If a skipped milestone has dependents in future
+       layers, those dependents remain blocked until the user explicitly
+       confirms (via ask_user) that they should proceed without the
+       skipped milestone's artifacts.
+
+    b. Assess whether the arc still holds. The milestones you just
        completed may have revealed that the remaining sequence should
        change. Ask yourself:
-       - Did the completed milestone uncover scope that no sketch
-         accounts for? (A sketch may need to be inserted.)
-       - Did it resolve something a future sketch was planned to
-         address? (A sketch may no longer be needed.)
-       - Did it change what the next milestone depends on or enables?
-         (Ordering may need to shift.)
+       - Did ANY completed milestone in the layer uncover scope that no
+         sketch accounts for? (A sketch may need to be inserted.)
+       - Did ANY completed milestone resolve something a future sketch was
+         planned to address? (A sketch may no longer be needed.)
+       - Did the combined results change what the next layer depends on or
+         enables? (Ordering or layer composition may need to shift.)
+       - Did any completed milestone's handoff reveal that two future
+         milestones previously annotated `Independent of:` each other now
+         share an artifact dependency? (They must move to separate layers.)
+       - Conversely, did any handoff reveal that two milestones previously
+         assumed sequential share no artifact dependency? (They may be
+         candidates for the same layer.)
 
-       If the arc still holds -- the sketches remain accurate and the
-       ordering still makes sense given what was learned -- proceed
-       to (d) without presenting to the user.
+       If the arc still holds -- the sketches remain accurate, the
+       ordering still makes sense, and layer groupings are still valid
+       given what was learned -- proceed to (d) without presenting to the
+       user.
 
        If the arc needs revision -- sketches must be added, removed,
-       reordered, or substantially re-scoped -- proceed to (c).
+       reordered, re-scoped, or layer groupings must change -- proceed
+       to (c).
 
     c. Arc revision -- present changes to the user:
-       Arc revision is never silent. Do not reorder, drop, or add
-       milestones without user confirmation.
+       Arc revision is never silent. Do not reorder, drop, add, or
+       re-layer milestones without user confirmation.
 
        Present the revised arc via ask_user, framed as what changed
        and why:
 
-       "Now that [completed milestone] is done, I see the remaining
-       arc should change:
-       [Describe what changed and why -- e.g., 'milestone X revealed
-       that Y is no longer needed because...' or 'we need a new
-       milestone between X and Z to handle...']
+       "Now that [list completed milestones in the layer] are done, I see
+       the remaining arc should change:
+       [Describe what changed and why -- e.g., 'milestone X revealed that
+       Y is no longer needed because...' or 'milestones A and B can now
+       run in parallel because neither depends on the other's output'
+       or 'milestone C now depends on what D produced, so they must be
+       sequential.']
 
        Revised arc:
-       [Present the updated sequence of remaining milestones, each
-       with its sketch description.]
+       [Present the updated sequence of remaining milestones, grouped by
+       dependency layer where applicable.]
 
        Does this revised sequence make sense?"
 
        Use choices ["Revised arc looks right", "Adjust further",
        "Revert to original arc"].
 
-       - On "Revised arc looks right": update roadmap.md with the
-         revised sketches, then proceed to (d).
-       - On "Adjust further" or "Revert to original arc": adjust
-         based on user feedback and re-present.
+       - On "Revised arc looks right": update roadmap.md with the revised
+         sketches and dependency annotations, then proceed to (d).
+       - On "Adjust further" or "Revert to original arc": adjust based on
+         user feedback and re-present.
 
-    d. Sharpen the next sketch into a full milestone. The sketch
+    d. Sharpen the next layer's sketches into full milestones. Each sketch
        provides the scope, but crystallization adds the detail a
        coordinator needs.
-       - Take the next sketch from roadmap.md.
-       - Derive behavioral intents from the sketch scope, informed by
-         understanding.md and what was learned from the completed
-         milestone's handoff.md.
-       - Present the derived intents to the user via ask_user with
-         choices ["These outcomes are right", "Revise an outcome",
-         "Add a missing outcome"]:
-         "The next milestone is [title]. Based on the sketch and what
-         we learned from [completed milestone], here are the outcomes:
-         [list intents]
-         Do these capture it?"
-       - On "These outcomes are right": crystallize by calling
-         clou_create_milestone with the milestone name, milestone.md,
-         intents.md, and requirements.md -- exactly as in step 8.
-       - On "Revise an outcome" or "Add a missing outcome": adjust
-         intents based on user feedback and re-present.
-       - Update roadmap.md: move the sharpened sketch from "sketch" to
-         "current" status.
-       - Re-evaluate dependency annotations for ALL remaining sketches.
-         The completed milestone may have changed what flows between
-         future milestones -- what was planned as independent might now
-         depend on what was learned, or vice versa. Update `Depends on:`
-         and `Independent of:` annotations in roadmap.md based on what
-         was learned from the completed milestone's handoff.md.
+
+       If the next layer has ONE milestone (sequential path): sharpen it
+       exactly as the single-milestone procedure -- take the sketch, derive
+       behavioral intents, present to user, crystallize on confirmation.
+       This is the default path when no `Independent of:` annotations exist.
+
+       If the next layer has MULTIPLE milestones: sharpen each sketch in
+       the layer:
+       - For each sketch in the layer:
+         - Derive behavioral intents from the sketch scope, informed by
+           understanding.md and what was learned from ALL completed
+           milestones' handoff.md files in the just-completed layer.
+         - Present the derived intents to the user via ask_user with
+           choices ["These outcomes are right", "Revise an outcome",
+           "Add a missing outcome"]:
+           "The next layer contains [N] milestones. Here are the outcomes
+           for [title]:
+           [list intents]
+           Do these capture it?"
+         - On "These outcomes are right": proceed to the next sketch in
+           the layer (or to crystallization if this is the last one).
+         - On "Revise an outcome" or "Add a missing outcome": adjust
+           intents based on user feedback and re-present.
+
+       After all intents in the layer are confirmed, batch-crystallize:
+       call clou_create_milestone for EACH milestone in the layer with
+       its name, milestone.md, intents.md, and requirements.md.
+       Parallel dispatch supports a maximum of 5 milestones per batch.
+       If the layer contains more than 5 milestones, split into
+       sub-batches of 5 or fewer and dispatch each sub-batch serially.
+
+       Update roadmap.md: move all sharpened sketches from "sketch" to
+       "current" status. Re-evaluate dependency annotations for ALL
+       remaining sketches beyond the current layer. The completed
+       milestones may have changed what flows between future milestones --
+       update `Depends on:` and `Independent of:` annotations in
+       roadmap.md based on what was learned from the completed milestones'
+       handoff.md files.
 
     e. If no sketches remain in roadmap.md, the arc is complete.
        Proceed to step 14 (checkpoint) without sharpening.
@@ -565,18 +701,21 @@ Fast path -- pre-converged users:
     open items, pending milestones, and arc state (which milestone was
     just sharpened, how many sketches remain).
 
-15. Loop: proceed to the next milestone or await user direction.
-    - If a milestone was just sharpened in step 13, it is ready to
-      execute. Proceed to step 9 (communicate handoff) and spawn the
-      coordinator for the newly crystallized milestone.
-    - If the arc is complete (no sketches remain and the last milestone
-      is done), present the completed arc to the user and await
-      direction for new work. If the user has new goals, return to
-      step 3 (reasoning loop) to build understanding and form a new
-      arc.
-    - When starting a new milestone, read metrics.md from the most
-      recent completed milestone to calibrate cycle count and token
-      budget expectations for similar scope.
+15. Loop: proceed to the next layer or await user direction.
+    - If a layer was just sharpened in step 13 (one or more milestones
+      crystallized), it is ready to execute. Proceed to step 9
+      (communicate handoff) to dispatch the layer -- step 9 handles both
+      single-milestone and batch handoff communication, and step 10
+      branches to the appropriate spawn mechanism.
+    - If the arc is complete (no sketches remain and all milestones are
+      done), present the completed arc to the user and await direction
+      for new work. If the user has new goals, return to step 3
+      (reasoning loop) to build understanding and form a new arc.
+    - When starting a new layer, read metrics.md from ALL milestones in
+      the most recently completed layer to calibrate cycle count and
+      token budget expectations. For multi-milestone layers, aggregate
+      metrics across the parallel runs to understand total resource usage
+      and identify any milestones that consumed disproportionate budget.
 
 </procedure>
 
@@ -593,9 +732,13 @@ Update the disposition field with your decision.
 - You do not interact with agent teams.
 - You do not manage phases or tasks -- that is the coordinator's job.
 - You create milestones and evaluate their completion via handoff.md.
-- One active coordinator at a time by default. When roadmap.md
-  contains `Independent of:` annotations that the orchestrator
-  validates, independent milestones may run concurrently.
+- You drive layer-by-layer progression through the arc. When roadmap.md
+  contains `Independent of:` annotations between milestones, those
+  milestones share a dependency layer and you batch-crystallize them,
+  then dispatch them via clou_spawn_parallel_coordinators. When a layer
+  has one milestone (no `Independent of:` annotations, or all
+  independent milestones already dispatched), you use the sequential
+  path: clou_spawn_coordinator for a single coordinator at a time.
 </boundaries>
 
 </protocol>
