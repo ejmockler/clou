@@ -26,7 +26,7 @@ from enum import Enum
 
 # Model and context window configuration — single source of truth.
 MODEL = "opus"
-CONTEXT_WINDOW = 1_000_000  # Opus 4.6 1M context window
+CONTEXT_WINDOW = 1_000_000  # 1M context window (opus alias)
 
 # ---------------------------------------------------------------------------
 # Graduated context thresholds (derived from Claude Code's proven math)
