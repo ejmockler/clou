@@ -97,3 +97,42 @@ description: Wire the full DB-20 Step 7 pipeline: supervisor writes dependency a
 ### 32. Orchestrator Cleanup Authority — completed
 path: 32-orchestrator-cleanup-authority
 description: Extend the orchestrator's DB-18 lifecycle cleanup pipeline with authority to delete root-level `.clou/` files flagged as obsolete in handoff.md known limitations. Keeps coordinator write boundary milestone-scoped. 2 cycles, 19m, 4 agents. 474 tests (40 M32-specific). Quality gate converged 22→20→14 findings, 9→1→0 actionable.
+
+### 33. Supervisor Parallel Milestones — completed
+path: 33-supervisor-parallel-milestones
+description: Update the supervisor protocol to drive multiple milestones concurrently when the arc contains independent milestones. Batch crystallization of dependency layers, parallel spawn via clou_spawn_parallel_coordinators, multi-completion disposition with per-milestone evaluation, and layer-by-layer sharpening. Prompt-only change — M31's runtime machinery is complete. 7 cycles, 71m, 13 agents. Quality gate converged 4→0.
+
+### 34. ASSESS Compositionality Reduction — completed
+path: 34-assess-compositionality-reduction
+description: Reduce ASSESS cycle compositionality from 5+ file reads to ≤2-hop pre-composed context. Instrument cognitive metrics (read set size, reference density, compositional span) and wire into metrics.md. DB-20 Steps 1-2. 15 cycles, 248m, 37 agents. Quality gate converged 16→10→1→1→1→0.
+**Independent of:** Memory Pattern Influence Telemetry
+
+### 35. Memory Pattern Influence Telemetry — completed
+path: 35-memory-pattern-influence-telemetry
+description: Add retrieval and reference tracing telemetry to the memory pipeline. Measure whether patterns from memory.md actually reach and influence coordinator decisions. Wire pattern influence data into metrics.md. 14 cycles, 169m, 29 agents. Quality gate converged 10→4→2→2→0.
+**Independent of:** ASSESS Compositionality Reduction
+
+### 36. ORIENT Cycle Prefix — sketch
+path: 36-orient-cycle-prefix
+description: Add ORIENT as the first cycle in every coordinator session. Reads an adaptive small set (intents.md + status.md + glob phases/*/execution.md + git diff --stat) and emits a structured judgment artifact `{next_action, rationale, evidence_paths, expected_artifact}` per DB-14 ArtifactForm. Orchestrator logs the judgment alongside its own determine_next_cycle choice but does not yet act on disagreements — telemetry only. Establishes the new entry-point protocol (coordinator-orient.md) and the judgment artifact form without changing existing dispatch authority. Foundational for the cycle-type-as-prescription redesign uncovered by the safety-net loop (2026-04-18).
+
+### 37. ORIENT Cycle Gating — sketch
+path: 37-orient-cycle-gating
+description: Promote ORIENT from telemetry to gating. When the coordinator's judgment disagrees with orchestrator's determine_next_cycle, judgment wins. Orchestrator validates judgment.evidence_paths exist on disk before honoring (sanity check, not gatekeeping). The safety-net loop scenario — PLAN repeated 3× with phases_completed:0 despite 4 execution.md files showing completed and 239 tests passing — becomes structurally impossible: ORIENT routes to EXIT on first re-entry. Includes a regression test reconstructed from the 2026-04-18 production trace.
+**Depends on:** ORIENT Cycle Prefix
+
+### 38. Artifact-Authoritative Bookkeeping — sketch
+path: 38-artifact-authoritative-bookkeeping
+description: phases_completed becomes orchestrator-computed from `phases/*/execution.md` evidence at cycle boundary; coordinator loses write authority over the field. status.md table becomes a rendered view of disk truth, not a coordinator-written ledger. PLAN cannot demote a completed phase to pending. Extends M21 R1's "status.md as render of checkpoint" pattern to phase-completion bookkeeping. Independently fixes the safety-net loop class via a different path than M37 — completion bookkeeping can never diverge from artifacts because artifacts are the source.
+**Depends on:** ORIENT Cycle Prefix
+**Independent of:** ORIENT Cycle Gating
+
+### 39. Cycle-Type Prescription Dissolution — sketch
+path: 39-cycle-type-prescription-dissolution
+description: determine_next_cycle inverts into validate_judgment — its job becomes auditing the coordinator's chosen action against artifacts rather than choosing the cycle type. The cycle-type→read-set table is deleted. coordinator-orient.md becomes the sole entry-point protocol; existing coordinator-{plan,execute,assess,verify,exit}.md files become behavior libraries loaded post-judgment. ~20 `if cycle_type == X` branches in coordinator.py route off `judgment.next_action`. Cycle types stop being states the orchestrator runs through and become the vocabulary the coordinator uses to describe what it's about to do.
+**Depends on:** ORIENT Cycle Gating, Artifact-Authoritative Bookkeeping
+
+### 40. Adaptive Read-Set Composition — sketch
+path: 40-adaptive-read-set-composition
+description: Read sets compose from `judgment.evidence_paths` plus minimal behavior-specific augments. The cycle-type→read-set categorical mapping is fully retired. M34's reference-density telemetry graduates from observability to invariant: density > 0 required on every cycle (regression test against the M34 baseline). The coordinator's behavior session asks "what do I need to cite?" before "what am I doing?" — closing the loop the M34 instrumentation opened.
+**Depends on:** Cycle-Type Prescription Dissolution
