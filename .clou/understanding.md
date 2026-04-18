@@ -24,20 +24,6 @@ user response via ask_user — never updated silently.
 - **When:** 2026-04-08
 - **Fed into:** intents.md, milestone.md, requirements.md (26-agent-observability)
 
-### Compose.py is docstrings with structural decoration
-- **Asked:** What's the problem in the supervisor/planning layer with milestone scoping and decomposition?
-- **Response:** User pointed at M23's task graphs — compose.py has empty NamedTuples, meaningless fields, specs in docstrings. DB-02 already prescribes the fix (graph.py validator, one-line docstrings, phase.md separation, width enforcement) but none of it is built.
-- **Framing:** The compose.py format carries no verifiable information. The decision boundary is decided but not implemented. The coordinator generates hollow typed DAGs. Research (Routine 2025, Section 19) shows structural enforcement is the fix, not more prompt guidance.
-- **When:** 2026-04-08
-- **Fed into:** intents.md, milestone.md, requirements.md (24-verified-decomposition)
-
-### Lifecycle pipeline: designed but not wired
-- **Asked:** One milestone for the full DB-18 lifecycle, or fix the broken pipeline first and extend in a second?
-- **Response:** Two milestones — fix broken pipeline first, then extend with the remaining DB-18 mechanisms.
-- **Framing:** Three mechanisms have code but don't fire: _apply_decay() (status field never persisted), archive_milestone_episodic() (consolidated gate fails), compact_decisions() (zero callers). First milestone wires these so consolidation → decay → archival → compaction runs end-to-end. Second milestone implements the five designed-but-unbuilt DB-18 mechanisms.
-- **When:** 2026-04-06
-- **Fed into:** intents.md, milestone.md, requirements.md (22-lifecycle-pipeline-wiring)
-
 ### SDK agent data is name-only — need transcript access
 - **Asked:** The SDK only gives tool names for coordinator agents. Given this, what matters more — real-time enrichment or post-hoc inspection?
 - **Response:** Both, but post-hoc is higher priority. Being able to review the full agent conversation after completion matters more than live streaming of rich data.
