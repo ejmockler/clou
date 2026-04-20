@@ -204,10 +204,16 @@ def test_load_template_validation_failure_falls_back() -> None:
 
 
 def test_software_template_tools_match_orchestrator() -> None:
-    """Template agent tools match orchestrator._build_agents() exactly."""
+    """Template agent tools match orchestrator._build_agents() exactly.
+
+    Brutalist and assess-evaluator no longer carry Write for the
+    ``assessment.md`` path; that pathway goes through the
+    ``clou_write_assessment`` / ``clou_append_classifications`` MCP
+    tools under the drift-class remolding (LLM owns content, code
+    owns canonical structure).
+    """
     from clou.harnesses.software_construction import template
 
-    # These are the exact tool lists from the template.
     expected_tools = {
         "implementer": [
             "Read", "Write", "Edit", "MultiEdit",
@@ -215,11 +221,13 @@ def test_software_template_tools_match_orchestrator() -> None:
             "WebSearch", "WebFetch",
         ],
         "brutalist": [
-            "Read", "Write", "Grep", "Glob",
+            "Read", "Grep", "Glob",
             "mcp__brutalist__roast",
+            "mcp__clou_coordinator__clou_write_assessment",
         ],
         "assess-evaluator": [
             "Read", "Write", "Grep", "Glob",
+            "mcp__clou_coordinator__clou_append_classifications",
         ],
         "verifier": [
             "Read", "Write", "Bash", "Grep", "Glob",

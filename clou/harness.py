@@ -341,12 +341,15 @@ _INLINE_FALLBACK = HarnessTemplate(
                 "Read-only quality gate agent. Invokes brutalist MCP "
                 "tools on changed code and records raw findings via "
                 "clou_write_assessment (code owns the assessment.md "
-                "structure; no direct Write)."
+                "structure; no direct Write). Cannot evaluate, "
+                "dismiss, or edit code."
             ),
             prompt_ref="assessor",
             tier="brutalist",
             tools=[
-                "Read", "Grep", "Glob",
+                "Read",
+                "Grep",
+                "Glob",
                 "mcp__brutalist__roast",
                 "mcp__clou_coordinator__clou_write_assessment",
             ],
@@ -354,14 +357,18 @@ _INLINE_FALLBACK = HarnessTemplate(
         "assess-evaluator": AgentSpec(
             description=(
                 "Classify each finding in assessment.md against "
-                "requirements.md.  Appends classifications via "
-                "clou_append_classifications.  Writes decisions.md "
-                "via Write."
+                "requirements.md. Appends classifications via "
+                "clou_append_classifications (drift-tolerant parse + "
+                "canonical re-render). Writes decisions.md via Write. "
+                "Does not discover new findings or edit code."
             ),
             prompt_ref="assess-evaluator",
             tier="assess-evaluator",
             tools=[
-                "Read", "Write", "Grep", "Glob",
+                "Read",
+                "Write",
+                "Grep",
+                "Glob",
                 "mcp__clou_coordinator__clou_append_classifications",
             ],
         ),
