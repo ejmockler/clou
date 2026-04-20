@@ -886,6 +886,72 @@ No findings.
     assert validate_golden_context(tmp_path, "m1") == []
 
 
+def test_assessment_drifted_phase_organized_warns_not_errors(
+    tmp_path: Path,
+) -> None:
+    """'## Phase: X' subsections are drift-tolerated — WARNING, not ERROR.
+
+    This exact shape was what blocked the integrate-observability
+    milestone under the regex-only validator (error: "missing
+    '## Findings'").  The parse-based validator sees the findings
+    extracted from the drifted layout and emits a warning instead.
+    """
+    content = """\
+# Assessment: Layer 1 Rework
+
+## Summary
+status: completed
+tools_invoked: 1
+findings: 2 total, 0 critical, 2 major, 0 minor
+phase_evaluated: phase_a, phase_b
+
+## Phase: phase_a
+
+### F1: Alpha issue
+**Severity:** major
+**Source tool:** roast
+**Finding:** "alpha"
+
+## Phase: phase_b
+
+### F2: Beta issue
+**Severity:** major
+**Source tool:** roast
+**Finding:** "beta"
+"""
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "assessment.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    # No blocking errors.
+    errors = [f for f in findings if f.severity == Severity.ERROR]
+    assert errors == [], f"should not error on drift, got: {errors}"
+    # But a warning nudges toward canonical re-render.
+    msgs = _messages(findings)
+    assert any(
+        "drifted" in m.lower() or "canonical" in m.lower() for m in msgs
+    ), f"expected drift warning, got: {msgs}"
+
+
+def test_assessment_drifted_with_no_findings_at_all_still_errors(
+    tmp_path: Path,
+) -> None:
+    """Drift tolerance does NOT mean "anything goes" — zero findings fails."""
+    content = """\
+# Assessment: impl
+
+## Summary
+status: completed
+findings: 0 total
+
+## Critic failures and blocked runs
+
+- nothing useful
+"""
+    _write(tmp_path / ".clou" / "milestones" / "m1" / "assessment.md", content)
+    findings = validate_golden_context(tmp_path, "m1")
+    msgs = _messages(findings)
+    assert any("missing '## Findings'" in m for m in msgs)
+
+
 # ---------------------------------------------------------------------------
 # Cross-file / integration
 # ---------------------------------------------------------------------------

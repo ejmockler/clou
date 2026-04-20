@@ -339,26 +339,30 @@ _INLINE_FALLBACK = HarnessTemplate(
         "brutalist": AgentSpec(
             description=(
                 "Read-only quality gate agent. Invokes brutalist MCP "
-                "tools on changed code and writes raw findings to "
-                "assessment.md. Cannot evaluate, dismiss, or edit code."
+                "tools on changed code and records raw findings via "
+                "clou_write_assessment (code owns the assessment.md "
+                "structure; no direct Write)."
             ),
             prompt_ref="assessor",
             tier="brutalist",
             tools=[
-                "Read", "Write", "Grep", "Glob",
+                "Read", "Grep", "Glob",
                 "mcp__brutalist__roast",
+                "mcp__clou_coordinator__clou_write_assessment",
             ],
         ),
         "assess-evaluator": AgentSpec(
             description=(
                 "Classify each finding in assessment.md against "
-                "requirements.md. Writes classifications to decisions.md. "
-                "Does not discover new findings or edit code."
+                "requirements.md.  Appends classifications via "
+                "clou_append_classifications.  Writes decisions.md "
+                "via Write."
             ),
             prompt_ref="assess-evaluator",
             tier="assess-evaluator",
             tools=[
                 "Read", "Write", "Grep", "Glob",
+                "mcp__clou_coordinator__clou_append_classifications",
             ],
         ),
         "verifier": AgentSpec(
@@ -426,7 +430,8 @@ _INLINE_FALLBACK = HarnessTemplate(
         ],
         "worker": [
             "milestones/*/phases/*/execution.md",
-            "milestones/*/phases/*/execution-*.md",
+            # execution-*.md intentionally absent — those are
+            # coordinator-generated failure shards written in-process.
         ],
         "verifier": [
             "milestones/*/phases/verification/execution.md",
@@ -434,10 +439,13 @@ _INLINE_FALLBACK = HarnessTemplate(
             "milestones/*/handoff.md",
         ],
         "brutalist": [
-            "milestones/*/assessment.md",
+            # assessment.md intentionally absent — MCP-only writes via
+            # clou_write_assessment (code owns canonical structure).
         ],
         "assess-evaluator": [
-            "milestones/*/assessment.md",
+            # assessment.md intentionally absent — classifications go
+            # through clou_append_classifications.  decisions.md stays
+            # freeform.
             "milestones/*/decisions.md",
         ],
     },

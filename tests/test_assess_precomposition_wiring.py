@@ -647,7 +647,7 @@ class TestCoordinatorPrecompositionIntegration:
             patch("clou.coordinator.validate_delivery", return_value=[]),
             patch("clou.coordinator.validate_golden_context", return_value=[]),
             patch("clou.coordinator.git_commit_phase", new_callable=AsyncMock),
-            patch("clou.coordinator.clean_stale_shards"),
+            patch("clou.coordinator.clean_stale_shards_for_layer"),
             patch(
                 "clou.precompose.precompose_assess_context",
                 mock_precompose,
@@ -719,7 +719,7 @@ class TestCoordinatorPrecompositionIntegration:
             patch("clou.coordinator.validate_delivery", return_value=[]),
             patch("clou.coordinator.validate_golden_context", return_value=[]),
             patch("clou.coordinator.git_commit_phase", new_callable=AsyncMock),
-            patch("clou.coordinator.clean_stale_shards"),
+            patch("clou.coordinator.clean_stale_shards_for_layer"),
             patch(
                 "clou.precompose.precompose_assess_context",
                 mock_precompose,
@@ -779,7 +779,7 @@ class TestCoordinatorPrecompositionIntegration:
             patch("clou.coordinator.validate_delivery", return_value=[]),
             patch("clou.coordinator.validate_golden_context", return_value=[]),
             patch("clou.coordinator.git_commit_phase", new_callable=AsyncMock),
-            patch("clou.coordinator.clean_stale_shards"),
+            patch("clou.coordinator.clean_stale_shards_for_layer"),
             patch(
                 "clou.precompose.precompose_assess_context",
                 mock_precompose,
@@ -794,15 +794,20 @@ class TestCoordinatorPrecompositionIntegration:
 
 
 # ---------------------------------------------------------------------------
-# F5: clean_stale_shards rejects traversal phase names via _PHASE_RE guard
+# Layer-wide stale cleanup — DAG task names are validated before reaching disk.
+#
+# Previously the cleanup read ``checkpoint.current_phase`` (a freeform string
+# that a malicious checkpoint could poison).  The layer-wide remolding now
+# iterates compose.py's DAG task names — Python identifiers parsed via
+# ``ast.parse`` — so classic traversal attacks are structurally impossible.
+# The ``_PHASE_RE`` guard stays as defense-in-depth: any identifier that
+# somehow bypasses AST extraction but fails the phase naming convention
+# (leading underscore, non-lowercase, etc.) is silently dropped.
 # ---------------------------------------------------------------------------
 
 
 class TestStaleShardPhaseValidation:
-    """F5: _phase_for_clean is validated against _PHASE_RE before being
-    passed to clean_stale_shards.  Path traversal patterns like '../../'
-    must be rejected, and clean_stale_shards must NOT be called.
-    """
+    """Layer-wide cleanup filters DAG task names through _PHASE_RE."""
 
     @pytest.fixture
     def milestone_dir(self, tmp_path: Path) -> Path:
@@ -814,82 +819,16 @@ class TestStaleShardPhaseValidation:
         (ms_dir / "phases" / "write_tests").mkdir(parents=True)
         return ms_dir
 
-    TRAVERSAL_PHASES = [
-        "../../",
-        "../x",
-        "../evil",
-        "../../etc/passwd",
-        "/root",
-        "a/b",
-        "",
-    ]
-
-    @pytest.mark.parametrize("bad_phase", TRAVERSAL_PHASES)
-    def test_traversal_phase_rejected(
-        self, bad_phase: str, milestone_dir: Path, tmp_path: Path,
-    ) -> None:
-        """clean_stale_shards is NOT called when checkpoint has traversal phase."""
-        from unittest.mock import AsyncMock
-
-        from clou.coordinator import _run_single_cycle
-
-        clou_dir = tmp_path / ".clou"
-
-        # compose.py with >1 task (triggers stale shard cleanup path).
-        (milestone_dir / "compose.py").write_text(MOCK_COMPOSE)
-
-        # Checkpoint with a malicious current_phase value.
-        cp_path = milestone_dir / "active" / "coordinator.md"
-        cp_path.write_text(
-            f"cycle: 1\nstep: EXECUTE\nnext_step: EXECUTE\n"
-            f"current_phase: {bad_phase}\n"
-        )
-
-        # Mock the SDK client so _run_single_cycle does not make real API calls.
-        mock_client = MagicMock()
-        mock_client.query = AsyncMock()
-
-        async def _receive():
-            # Yield a minimal ResultMessage to end the cycle.
-            yield MagicMock(
-                type="result",
-                usage={"input_tokens": 100},
-                summary="done",
-                uuid="test-uuid",
-                session_id="test-sess",
-            )
-
-        mock_client.receive_response = _receive
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with (
-            patch("clou.coordinator.load_prompt", return_value="<system/>"),
-            patch("clou.coordinator._build_agents", return_value={}),
-            patch("clou.coordinator.build_hooks", return_value={"PreToolUse": []}),
-            patch("clou.coordinator.ClaudeSDKClient", return_value=mock_client),
-            patch("clou.coordinator.read_cycle_outcome", return_value="ok"),
-            patch("clou.coordinator.clean_stale_shards") as mock_clean,
-        ):
-            asyncio.run(_run_single_cycle(tmp_path, "m1", "EXECUTE", "do work"))
-
-        # clean_stale_shards must NOT have been called for traversal phases.
-        mock_clean.assert_not_called()
-
-    def test_valid_phase_passes_to_clean_stale_shards(
+    def test_valid_dag_phases_reach_layer_cleanup(
         self, milestone_dir: Path, tmp_path: Path,
     ) -> None:
-        """Sanity check: a valid phase name DOES reach clean_stale_shards."""
+        """Well-formed DAG task names are passed to the layer-wide sweep."""
         from unittest.mock import AsyncMock
 
         from clou.coordinator import _run_single_cycle
 
-        clou_dir = tmp_path / ".clou"
-
-        # compose.py with >1 task.
         (milestone_dir / "compose.py").write_text(MOCK_COMPOSE)
 
-        # Checkpoint with a valid current_phase.
         cp_path = milestone_dir / "active" / "coordinator.md"
         cp_path.write_text(
             "cycle: 1\nstep: EXECUTE\nnext_step: EXECUTE\n"
@@ -918,14 +857,17 @@ class TestStaleShardPhaseValidation:
             patch("clou.coordinator.build_hooks", return_value={"PreToolUse": []}),
             patch("clou.coordinator.ClaudeSDKClient", return_value=mock_client),
             patch("clou.coordinator.read_cycle_outcome", return_value="ok"),
-            patch("clou.coordinator.clean_stale_shards") as mock_clean,
+            patch(
+                "clou.coordinator.clean_stale_shards_for_layer"
+            ) as mock_clean,
         ):
             asyncio.run(_run_single_cycle(tmp_path, "m1", "EXECUTE", "do work"))
 
-        # Valid phase should reach clean_stale_shards.
+        # The layer-wide helper is called exactly once, with the DAG's
+        # well-formed phase names passed as the phase list.
         mock_clean.assert_called_once()
-        call_args = mock_clean.call_args[0]
-        assert call_args[1] == "build_feature"
+        _ms_arg, phase_list = mock_clean.call_args[0]
+        assert set(phase_list) == {"build_feature", "write_tests"}
 
 
 # ---------------------------------------------------------------------------

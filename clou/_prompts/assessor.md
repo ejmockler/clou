@@ -76,8 +76,8 @@ source is internal review, not the external gate.
 
 ## Stage 3: Structure Findings
 
-Write assessment.md following the schema below. For each quality gate
-finding across all tools invoked:
+Collect the findings from every quality gate tool (or from degraded
+internal reviewers) and normalize them to structured form:
 
 1. Assign a finding ID (F1, F2, ...).
 2. Extract the exact finding text — quote, do not paraphrase.
@@ -88,74 +88,64 @@ finding across all tools invoked:
    - critical: security vulnerability, data loss risk, crash
    - major: functional issue, regression, missing implementation
    - minor: style, naming, suggestions, optimization
+6. If the cycle covers multiple phases (e.g. a gather-layer rework),
+   tag each finding with its originating phase via the `phase` field —
+   a single flat findings list with per-entry phase tags is canonical.
+   Do NOT invent `## Phase: X` subsections in the markdown; the code
+   owns section structure.
+
+## Stage 4: Write via clou_write_assessment
+
+Call the `clou_write_assessment` MCP tool with the structured findings.
+You do NOT write assessment.md directly — the tool owns the canonical
+`## Summary` / `## Tools Invoked` / `## Findings` structure so no
+per-run section-name drift can occur.  Your Write tool does not have
+permission to touch assessment.md; the hook will deny it.
+
+Example invocation:
+
+```
+clou_write_assessment(
+  phase_name="implementation",
+  summary={
+    "status": "completed",
+    "tools_invoked": 1,
+    "findings_total": 2,
+    "findings_critical": 0,
+    "findings_major": 1,
+    "findings_minor": 1,
+    "phase_evaluated": "implementation",
+  },
+  tools=[{"tool": "roast", "domain": "codebase", "status": "invoked"}],
+  findings=[
+    {
+      "number": 1,
+      "title": "Missing error handling in API client",
+      "severity": "major",
+      "source_tool": "roast",
+      "source_models": ["CODEX", "CLAUDE"],
+      "affected_files": ["src/api.py"],
+      "finding_text": "\"no error handling for network failures\"",
+      "context": "main request method",
+    },
+    {
+      "number": 2,
+      "title": "Inconsistent naming",
+      "severity": "minor",
+      "source_tool": "roast",
+      "affected_files": ["src/utils.py"],
+    },
+  ],
+)
+```
+
+Degraded mode works the same way — pass `status: "degraded"`, set
+`internal_reviewers` and `gate_error` in the summary, and pass findings
+sourced from internal reviewers.  Do NOT invent separate
+`## Quality Gate Status` / `## Internal Reviewers` sections; the
+structured summary carries that data.
 
 </procedure>
-
-<assessment-md-schema>
-```
-# Assessment: {phase-name}
-
-## Summary
-status: completed
-tools_invoked: {N}
-findings: {N} total, {N} critical, {N} major, {N} minor
-phase_evaluated: {phase-name}
-
-## Tools Invoked
-
-- roast (domain={domain}): invoked
-
-## Findings
-
-### F1: {finding title}
-**Severity:** {critical | major | minor}
-**Source tool:** {tool name}
-**Source models:** {model list, if available}
-**Affected files:**
-  - {path}
-**Finding:** "{exact quote from quality gate}"
-**Context:** {surrounding context from the tool output}
-
-### F2: ...
-```
-
-If quality gate is unavailable and degraded fallback ran:
-```
-# Assessment: {phase-name}
-
-## Summary
-status: degraded
-tools_invoked: 0
-internal_reviewers: {N}
-findings: {N} total, {N} critical, {N} major, {N} minor
-phase_evaluated: {phase-name}
-gate_error: {specific error message}
-
-## Quality Gate Status
-gate: unavailable
-error: {error detail}
-fallback: internal vertical review
-
-## Internal Reviewers
-- architecture: invoked | skipped ({reason})
-- security: invoked | skipped ({reason})
-- code_quality: invoked
-- test_coverage: invoked | skipped ({reason})
-- dependencies: invoked | skipped ({reason})
-
-## Findings
-
-### F1: {finding title}
-**Severity:** {critical | major | minor}
-**Source:** internal/{vertical name}
-**Affected files:**
-  - {path}
-**Finding:** "{finding from internal reviewer}"
-**Context:** {surrounding context}
-
-### F2: ...
-```
-</assessment-md-schema>
 
 <constraints>
 - You are READ-ONLY. You do not edit code, fix code, or suggest fixes.

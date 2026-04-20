@@ -19,79 +19,49 @@ quality — that is ASSESS's job.
    dispatch them as a gather() group. Tasks in later layers depend on
    earlier layers — dispatch them after their dependencies complete.
 
+   compose.py expresses parallelism at the phase level: each function in
+   a gather() group is its own phase, so each worker writes to its OWN
+   phase directory.  One canonical execution.md per phase — no sharding,
+   no slug freeform.  Stale shards from prior cycles are swept by the
+   orchestrator before EXECUTE dispatches.
+
    a. gather() group (tasks in same layer, >1 task):
       - Spawn one agent per function simultaneously.
-      - Each worker writes to its own shard file (see briefing template).
+      - Each worker writes to its own phase's execution.md (see template).
       - Monitor TaskNotificationMessages.
       - SELECTIVE ABORT: if any member fails, compute which remaining
         tasks transitively depend on the failed task using the DAG deps.
         Abort only those dependents. Let independent siblings continue.
         If ALL remaining tasks depend on the failed task, write
         checkpoint (see step 6) with next_step: ASSESS and exit.
-      - After all agents finish: merge shards into unified execution.md.
       - Collect all completion states.
 
    b. Sequential task (single-task layer):
       - Spawn one agent.
-      - Worker writes directly to execution.md (no sharding).
+      - Worker writes to execution.md.
       - On completion: read execution.md summary status line.
       - CIRCUIT BREAKER: if failures or blockers detected, write
         checkpoint (see step 6) with next_step: ASSESS. Exit.
       - If clean: proceed to next layer.
 
-5. Agent briefing template for each spawned worker:
+5. Agent briefing for each spawned worker.
 
-   For gather() groups, each worker's phase directory matches its
-   function name in compose.py. Worker for `pipeline_completion`
-   reads phases/pipeline_completion/phase.md, worker for
-   `protocol_lifecycle` reads phases/protocol_lifecycle/phase.md, etc.
+   Call the `clou_brief_worker` MCP tool to get the canonical briefing
+   text.  Pass the worker's `function_name`, plus optional `intent_ids`
+   (from the DAG Context intent mapping) and `extra_reads` (additional
+   files the worker needs).  Use the returned text verbatim as the
+   Task tool's prompt — do NOT construct briefings by hand.  The tool
+   computes the deterministic execution.md path and bakes it into the
+   briefing, eliminating any opportunity for per-invocation slug drift.
 
-   For gather() groups (>1 task in the layer), include the shard path:
+   Example:
    ```
-   You are implementing `{function_name}` for milestone
-   '{milestone}', phase '{function_name}'.
-
-   Read your protocol file: .clou/prompts/worker.md
-
-   Then read these files:
-   - .clou/milestones/{milestone}/compose.py — find your function
-     signature `{function_name}`. Your criteria are in the docstring.
-   - .clou/milestones/{milestone}/phases/{function_name}/phase.md
-   - .clou/project.md — coding conventions
-
-   Write results to:
-   - .clou/milestones/{milestone}/phases/{function_name}/execution-{task_slug}.md
-
-   Write execution.md incrementally as you complete work.
-   ```
-
-   For serial tasks (single-task layer), use the standard path:
-   ```
-   You are implementing `{function_name}` for milestone
-   '{milestone}', phase '{function_name}'.
-
-   Read your protocol file: .clou/prompts/worker.md
-
-   Then read these files:
-   - .clou/milestones/{milestone}/compose.py — find your function
-     signature `{function_name}`. Your criteria are in the docstring.
-   - .clou/milestones/{milestone}/phases/{function_name}/phase.md
-   - .clou/project.md — coding conventions
-
-   Write results to:
-   - .clou/milestones/{milestone}/phases/{function_name}/execution.md
-
-   Write execution.md incrementally as you complete work.
-   ```
-
-   If the DAG Context includes an intent mapping for the function,
-   append the intent IDs to the worker briefing:
-   ```
-   Your task addresses these intents: {intent_ids}
-   Structure your execution.md with per-intent sections:
-   ## {intent_id}: {one-line description}
-   Status: [implemented | in-progress | blocked]
-   {details}
+   clou_brief_worker(
+     function_name="extend_logger",
+     intent_ids=["I3"],
+     extra_reads=["src/logger.ts"],
+   )
+   → "You are implementing `extend_logger` for milestone '...' ..."
    ```
 
 6. After all tasks complete:

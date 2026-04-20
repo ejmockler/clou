@@ -44,23 +44,27 @@ template = HarnessTemplate(
         "brutalist": AgentSpec(
             description=(
                 "Read-only quality gate agent. Invokes brutalist MCP "
-                "tools on changed code and writes raw findings to "
-                "assessment.md. Cannot evaluate, dismiss, or edit code."
+                "tools on changed code and records raw findings via "
+                "clou_write_assessment (code owns the assessment.md "
+                "structure; no direct Write). Cannot evaluate, "
+                "dismiss, or edit code."
             ),
             prompt_ref="assessor",
             tier="brutalist",
             tools=[
                 "Read",
-                "Write",
                 "Grep",
                 "Glob",
                 "mcp__brutalist__roast",
+                "mcp__clou_coordinator__clou_write_assessment",
             ],
         ),
         "assess-evaluator": AgentSpec(
             description=(
                 "Classify each finding in assessment.md against "
-                "requirements.md. Writes classifications to decisions.md. "
+                "requirements.md. Appends classifications via "
+                "clou_append_classifications (drift-tolerant parse + "
+                "canonical re-render). Writes decisions.md via Write. "
                 "Does not discover new findings or edit code."
             ),
             prompt_ref="assess-evaluator",
@@ -70,6 +74,7 @@ template = HarnessTemplate(
                 "Write",
                 "Grep",
                 "Glob",
+                "mcp__clou_coordinator__clou_append_classifications",
             ],
         ),
         "verifier": AgentSpec(
@@ -143,7 +148,8 @@ template = HarnessTemplate(
         ],
         "worker": [
             "milestones/*/phases/*/execution.md",
-            "milestones/*/phases/*/execution-*.md",
+            # execution-*.md intentionally absent — those are
+            # coordinator-generated failure shards written in-process.
         ],
         "verifier": [
             "milestones/*/phases/verification/execution.md",
@@ -151,10 +157,15 @@ template = HarnessTemplate(
             "milestones/*/handoff.md",
         ],
         "brutalist": [
-            "milestones/*/assessment.md",
+            # assessment.md intentionally absent — writes go through
+            # clou_write_assessment so code owns the structure and
+            # drift (e.g. ad-hoc "## Phase: X" sections) is impossible.
         ],
         "assess-evaluator": [
-            "milestones/*/assessment.md",
+            # assessment.md intentionally absent — classifications go
+            # through clou_append_classifications.  decisions.md remains
+            # freeform because it's prose-per-cycle without a validator
+            # structure expectation.
             "milestones/*/decisions.md",
         ],
     },

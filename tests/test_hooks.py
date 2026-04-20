@@ -11,11 +11,13 @@ import pytest
 from clou.hooks import (
     AGENT_TIER_MAP,
     CLEANUP_SCOPE,
+    SUPERVISOR_CLEANUP_SCOPE,
     WRITE_PERMISSIONS,
     HookConfig,
     _scoped_permissions,
     build_hooks,
     is_cleanup_allowed,
+    supervisor_cleanup_allowed,
 )
 
 
@@ -157,6 +159,185 @@ def test_bash_outside_clou_allowed() -> None:
         )
     )
     assert _is_allowed(result)
+
+
+def test_bash_cd_into_clou_denied() -> None:
+    """``cd .clou && <mutation>`` evades path-based checks → denied.
+
+    After ``cd .clou``, subsequent ``rm foo`` targets ``.clou/foo``
+    without the regex ever seeing ``.clou/foo``. Denying any ``cd``
+    that mentions ``.clou`` closes this bypass.
+    """
+    hook = _get_pre_hook("supervisor")
+    for cmd in [
+        "cd .clou && rm project.md",
+        "cd .clou && echo bad > project.md",
+        "cd .clou/milestones && rm -rf m1",
+        "(cd .clou && rm foo.md)",
+    ]:
+        result = _run(
+            hook(
+                {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                "tool-1",
+                {},
+            )
+        )
+        assert not _is_allowed(result), f"Should deny: {cmd}"
+
+
+def test_bash_rm_bare_clou_directory_denied() -> None:
+    """``rm -rf .clou`` (no trailing path) is also denied."""
+    hook = _get_pre_hook("supervisor")
+    for cmd in [
+        "rm -rf .clou",
+        "rm -rf .clou/",
+        "mv .clou /tmp/gone",
+    ]:
+        result = _run(
+            hook(
+                {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                "tool-1",
+                {},
+            )
+        )
+        assert not _is_allowed(result), f"Should deny: {cmd}"
+
+
+def test_bash_cloudlike_names_not_falsely_denied() -> None:
+    """``.cloud`` / ``.cloudy`` / etc. are not confused with ``.clou``."""
+    hook = _get_pre_hook("supervisor")
+    for cmd in [
+        "rm .cloudy/foo",
+        "echo > .cloud/bar",
+        "mv .cloud-config dest/",
+    ]:
+        result = _run(
+            hook(
+                {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                "tool-1",
+                {},
+            )
+        )
+        assert _is_allowed(result), f"Should allow: {cmd}"
+
+
+def test_bash_find_delete_targeting_clou_denied() -> None:
+    """``find .clou/ ... -delete`` is denied (polyglot deletion path)."""
+    hook = _get_pre_hook("supervisor")
+    for cmd in [
+        "find .clou/milestones -name '*.md' -delete",
+        "find .clou -type f -delete",
+    ]:
+        result = _run(
+            hook(
+                {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                "tool-1",
+                {},
+            )
+        )
+        assert not _is_allowed(result), f"Should deny: {cmd}"
+
+
+def test_bash_script_interpreters_targeting_clou_denied() -> None:
+    """Script interpreters that mention .clou/ are denied.
+
+    These could be used to bypass the MCP cleanup pathway
+    (e.g. ``python -c 'Path(".clou/...").unlink()'``).
+    """
+    hook = _get_pre_hook("supervisor")
+    for cmd in [
+        "python -c 'import os; os.unlink(\".clou/project.md\")'",
+        "python3 -c 'from pathlib import Path; Path(\".clou/roadmap.md\").unlink()'",
+        "node -e 'require(\"fs\").unlinkSync(\".clou/foo.md\")'",
+        "perl -e 'unlink \".clou/bar.md\"'",
+        "ruby -e 'File.delete(\".clou/x.md\")'",
+        "bun run -e 'Bun.write(\".clou/foo.md\", \"\")'",
+        "deno eval 'Deno.removeSync(\".clou/foo.md\")'",
+    ]:
+        result = _run(
+            hook(
+                {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                "tool-1",
+                {},
+            )
+        )
+        assert not _is_allowed(result), f"Should deny: {cmd}"
+
+
+def test_bash_ln_symlink_into_clou_denied() -> None:
+    """``ln -s target .clou/...`` creates a persistent symlink → denied.
+
+    Without this, the supervisor could plant an ``ln`` and later
+    legitimately read through it, poisoning subsequent file reads.
+    """
+    hook = _get_pre_hook("supervisor")
+    for cmd in [
+        "ln -s /etc/passwd .clou/milestones/m1/phases/p1/execution.md",
+        "ln -sf evil .clou/project.md",
+        "ln /src/real .clou/link",
+    ]:
+        result = _run(
+            hook(
+                {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                "tool-1",
+                {},
+            )
+        )
+        assert not _is_allowed(result), f"Should deny: {cmd}"
+
+
+def test_bash_rsync_tar_into_clou_denied() -> None:
+    """Archive extractors that land in .clou/ are denied."""
+    hook = _get_pre_hook("supervisor")
+    for cmd in [
+        "rsync -a src/ .clou/",
+        "rsync malicious/ .clou/milestones/",
+        "tar xf payload.tar -C .clou/",
+    ]:
+        result = _run(
+            hook(
+                {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                "tool-1",
+                {},
+            )
+        )
+        assert not _is_allowed(result), f"Should deny: {cmd}"
+
+
+def test_bash_find_exec_and_xargs_rm_denied() -> None:
+    """``find ... -exec rm`` and ``xargs rm`` bypass -delete — both denied."""
+    hook = _get_pre_hook("supervisor")
+    for cmd in [
+        "find .clou -type f -exec rm {} +",
+        "find .clou/milestones -name '*.md' -exec rm {} \\;",
+        "find .clou -type f -print0 | xargs -0 rm",
+    ]:
+        result = _run(
+            hook(
+                {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                "tool-1",
+                {},
+            )
+        )
+        assert not _is_allowed(result), f"Should deny: {cmd}"
+
+
+def test_bash_interpreters_outside_clou_allowed() -> None:
+    """Script interpreters that do NOT mention .clou/ are allowed."""
+    hook = _get_pre_hook("supervisor")
+    for cmd in [
+        "python -c 'print(1)'",
+        "node -e 'console.log(1)'",
+        "perl -e 'print 42'",
+    ]:
+        result = _run(
+            hook(
+                {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                "tool-1",
+                {},
+            )
+        )
+        assert _is_allowed(result), f"Should allow: {cmd}"
 
 
 def test_worker_allowed_execution_md() -> None:
@@ -617,8 +798,14 @@ def test_active_coordinator_md_root_denied() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_brutalist_allowed_assessment_md(tmp_path: Path) -> None:
-    """Brutalist subagent can write assessment.md."""
+def test_brutalist_blocked_from_writing_assessment_md(tmp_path: Path) -> None:
+    """Brutalist subagent CANNOT Write assessment.md directly.
+
+    Writes go through clou_write_assessment so code owns the canonical
+    ## Summary / ## Tools Invoked / ## Findings structure.  Granting
+    direct Write permission would reintroduce the section-name drift
+    class of bug (## Phase: X, ## Classification Summary, etc.).
+    """
     hook = _get_pre_hook("coordinator", tmp_path)
     path = tmp_path / ".clou" / "milestones" / "m1" / "assessment.md"
     result = _run(
@@ -632,7 +819,8 @@ def test_brutalist_allowed_assessment_md(tmp_path: Path) -> None:
             {},
         )
     )
-    assert _is_allowed(result)
+    assert _is_denied(result)
+    assert "brutalist" in _deny_reason(result)
 
 
 def test_brutalist_blocked_from_execution_md(tmp_path: Path) -> None:
@@ -695,8 +883,10 @@ def test_brutalist_blocked_from_compose_py(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_assess_evaluator_allowed_assessment_md(tmp_path: Path) -> None:
-    """Assess-evaluator subagent can write assessment.md."""
+def test_assess_evaluator_blocked_from_writing_assessment_md(
+    tmp_path: Path,
+) -> None:
+    """Assess-evaluator CANNOT Write assessment.md; uses clou_append_classifications."""
     hook = _get_pre_hook("coordinator", tmp_path)
     path = tmp_path / ".clou" / "milestones" / "m1" / "assessment.md"
     result = _run(
@@ -710,7 +900,8 @@ def test_assess_evaluator_allowed_assessment_md(tmp_path: Path) -> None:
             {},
         )
     )
-    assert _is_allowed(result)
+    assert _is_denied(result)
+    assert "assess-evaluator" in _deny_reason(result)
 
 
 def test_assess_evaluator_allowed_decisions_md(tmp_path: Path) -> None:
@@ -3056,3 +3247,279 @@ def test_write_permissions_unchanged() -> None:
         "verifier", "brutalist", "assess-evaluator",
     }
     assert set(WRITE_PERMISSIONS.keys()) == expected_tiers
+
+
+def test_brutalist_cannot_write_assessment_md_directly() -> None:
+    """The brutalist tier has NO write scope for assessment.md.
+
+    Writes must go through ``clou_write_assessment`` (in-process MCP
+    tool that bypasses the hook).  Granting direct Write permission
+    would reintroduce the assessment-drift class of bug (LLM-owned
+    section headers diverging from the validator's expectations).
+    """
+    brutalist_perms = WRITE_PERMISSIONS["brutalist"]
+    import fnmatch
+    for path in (
+        "milestones/m1/assessment.md",
+        "milestones/foo-bar/assessment.md",
+    ):
+        assert not any(fnmatch.fnmatch(path, p) for p in brutalist_perms), (
+            f"Brutalist should NOT be able to Write {path}"
+        )
+
+
+def test_assess_evaluator_cannot_write_assessment_md_directly() -> None:
+    """Assess-evaluator uses clou_append_classifications, not Write."""
+    evaluator_perms = WRITE_PERMISSIONS["assess-evaluator"]
+    import fnmatch
+    for path in (
+        "milestones/m1/assessment.md",
+        "milestones/anywhere/assessment.md",
+    ):
+        assert not any(fnmatch.fnmatch(path, p) for p in evaluator_perms), (
+            f"Evaluator should NOT be able to Write {path}"
+        )
+
+
+def test_assess_evaluator_can_still_write_decisions_md() -> None:
+    """decisions.md remains freeform prose — evaluator keeps Write access."""
+    evaluator_perms = WRITE_PERMISSIONS["assess-evaluator"]
+    import fnmatch
+    path = "milestones/m1/decisions.md"
+    assert any(fnmatch.fnmatch(path, p) for p in evaluator_perms)
+
+
+# ---------------------------------------------------------------------------
+# Supervisor cleanup scope — SUPERVISOR_CLEANUP_SCOPE + supervisor_cleanup_allowed
+# ---------------------------------------------------------------------------
+
+
+def test_supervisor_cleanup_scope_is_tuple_of_strings() -> None:
+    """SUPERVISOR_CLEANUP_SCOPE is a non-empty immutable tuple of glob patterns."""
+    assert isinstance(SUPERVISOR_CLEANUP_SCOPE, tuple)
+    assert len(SUPERVISOR_CLEANUP_SCOPE) > 0
+    for pat in SUPERVISOR_CLEANUP_SCOPE:
+        assert isinstance(pat, str)
+
+
+def test_supervisor_cleanup_allows_worker_execution() -> None:
+    """Worker execution.md is an intermediate artifact — removable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/phases/bar/execution.md"
+    ) is True
+
+
+def test_supervisor_cleanup_allows_parallel_worker_execution() -> None:
+    """Parallel worker execution-*.md files are removable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/phases/bar/execution-baz.md"
+    ) is True
+    # The original orphan that motivated this feature:
+    assert supervisor_cleanup_allowed(
+        "milestones/structural-extraction/phases/"
+        "extract_cli_adapters/execution-extract_cli_adapters.md"
+    ) is True
+
+
+def test_supervisor_cleanup_allows_verifier_artifacts() -> None:
+    """Verifier artifacts under phases/*/artifacts/ are removable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/phases/verification/artifacts/report.md"
+    ) is True
+
+
+def test_supervisor_cleanup_allows_brutalist_assessment() -> None:
+    """Brutalist assessment.md is supersedable — removable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/assessment.md"
+    ) is True
+
+
+def test_supervisor_cleanup_allows_escalation() -> None:
+    """Stale escalation files are removable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/escalations/auth-failure.md"
+    ) is True
+
+
+def test_supervisor_cleanup_rejects_milestone_md() -> None:
+    """milestone.md is a protocol artifact — immutable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/milestone.md"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_intents_md() -> None:
+    """intents.md is a protocol artifact — immutable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/intents.md"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_requirements_md() -> None:
+    """requirements.md is a protocol artifact — immutable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/requirements.md"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_compose_py() -> None:
+    """compose.py is a protocol artifact — immutable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/compose.py"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_status_md() -> None:
+    """status.md is a protocol artifact — immutable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/status.md"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_handoff_md() -> None:
+    """handoff.md is a protocol artifact — immutable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/handoff.md"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_decisions_md() -> None:
+    """decisions.md is a protocol artifact — immutable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/decisions.md"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_phase_md() -> None:
+    """phase.md is a protocol artifact — immutable."""
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/phases/bar/phase.md"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_root_project_md() -> None:
+    """Root-level golden context files are immutable."""
+    assert supervisor_cleanup_allowed("project.md") is False
+    assert supervisor_cleanup_allowed("roadmap.md") is False
+    assert supervisor_cleanup_allowed("memory.md") is False
+    assert supervisor_cleanup_allowed("understanding.md") is False
+
+
+def test_supervisor_cleanup_rejects_active_checkpoints() -> None:
+    """Active/*.md checkpoints are cycle state — immutable."""
+    assert supervisor_cleanup_allowed("active/supervisor.md") is False
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/active/coordinator.md"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_empty_string() -> None:
+    """Empty string is rejected."""
+    assert supervisor_cleanup_allowed("") is False
+
+
+def test_supervisor_cleanup_rejects_traversal() -> None:
+    """Path traversal via .. segments is rejected defensively."""
+    assert supervisor_cleanup_allowed(
+        "milestones/../../etc/passwd"
+    ) is False
+    assert supervisor_cleanup_allowed("..") is False
+    assert supervisor_cleanup_allowed(
+        "milestones/foo/../bar/assessment.md"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_backslash() -> None:
+    """Backslash separators are rejected (Windows path shape)."""
+    assert supervisor_cleanup_allowed(
+        "milestones\\foo\\assessment.md"
+    ) is False
+
+
+def test_supervisor_cleanup_scope_distinct_from_root_cleanup() -> None:
+    """SUPERVISOR_CLEANUP_SCOPE and CLEANUP_SCOPE are separate concerns."""
+    # Root-level cleanup patterns don't belong to supervisor scope.
+    assert supervisor_cleanup_allowed("roadmap.py.example") is False
+    # And supervisor-scope paths don't belong to root cleanup.
+    assert is_cleanup_allowed(
+        "milestones/foo/phases/bar/execution.md"
+    ) is False
+
+
+def test_supervisor_cleanup_glob_is_segment_aware() -> None:
+    """Pattern ``milestones/*/assessment.md`` must NOT match nested paths.
+
+    ``fnmatch`` treats ``*`` as crossing ``/`` boundaries (so
+    ``milestones/m1/extra/path/assessment.md`` would match under fnmatch).
+    We use ``_strict_segment_match`` (left-anchored, segment-count-equal)
+    instead — this test pins that behavior so a regression to looser
+    semantics fails.
+    """
+    # These paths would match under fnmatch but must not match under
+    # path-segment-aware globbing.
+    assert supervisor_cleanup_allowed(
+        "milestones/m1/extra/depth/assessment.md"
+    ) is False
+    assert supervisor_cleanup_allowed(
+        "milestones/m1/unexpected/nesting/escalations/x.md"
+    ) is False
+    # And the intended shape still matches.
+    assert supervisor_cleanup_allowed(
+        "milestones/m1/assessment.md"
+    ) is True
+
+
+def test_supervisor_cleanup_artifacts_glob_is_single_segment() -> None:
+    """``phases/*/artifacts/*`` is one-segment-deep, not recursive."""
+    # Flat artifact file: allowed.
+    assert supervisor_cleanup_allowed(
+        "milestones/m1/phases/verification/artifacts/report.md"
+    ) is True
+    # Nested subdirectory inside artifacts: currently out of scope
+    # (segment-aware glob rejects extra depth).
+    assert supervisor_cleanup_allowed(
+        "milestones/m1/phases/verification/artifacts/sub/report.md"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_empty_segments() -> None:
+    """Malformed paths with empty segments (``//``) are rejected.
+
+    ``fnmatch("", "*")`` is True, so without an explicit guard an
+    empty segment between slashes would sneak a malformed path
+    into scope.
+    """
+    assert supervisor_cleanup_allowed(
+        "milestones//assessment.md"
+    ) is False
+    assert supervisor_cleanup_allowed(
+        "milestones/m1//execution.md"
+    ) is False
+    assert supervisor_cleanup_allowed(
+        "/milestones/m1/assessment.md"
+    ) is False
+    assert supervisor_cleanup_allowed(
+        "milestones/m1/assessment.md/"
+    ) is False
+
+
+def test_supervisor_cleanup_rejects_prefix_absorbed_paths() -> None:
+    """Prefix segments before the pattern root do NOT widen scope.
+
+    ``PurePosixPath.match`` was right-anchored, so it would have
+    allowed ``archive/milestones/m1/assessment.md`` to match
+    ``milestones/*/assessment.md``. ``_strict_segment_match`` is
+    left-anchored and requires equal segment counts — otherwise a
+    future ``.clou/archive/`` or ``.clou/snapshots/`` tree would
+    silently enter cleanup scope.
+    """
+    assert supervisor_cleanup_allowed(
+        "archive/milestones/m1/assessment.md"
+    ) is False
+    assert supervisor_cleanup_allowed(
+        "snapshots/old/milestones/m1/phases/p1/execution.md"
+    ) is False
+    assert supervisor_cleanup_allowed(
+        "trash/milestones/m1/escalations/e.md"
+    ) is False

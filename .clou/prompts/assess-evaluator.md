@@ -58,14 +58,45 @@ classification. Single-source findings deserve more scrutiny.
 
 ## Stage 3: Write Classifications
 
-### Update assessment.md
+### Update assessment.md via clou_append_classifications
 
-Add a `## Classifications` section to assessment.md with the
-classification for each finding.
+Call the `clou_append_classifications` MCP tool with one entry per
+finding.  Do NOT Write assessment.md directly — the tool reads the
+existing file (tolerating any drifted structure), merges your
+classifications into the structured form, and re-renders to canonical
+markdown.  Your Write permissions do not include assessment.md; the
+hook will deny direct writes.
+
+Example invocation:
+
+```
+clou_append_classifications(
+  classifications=[
+    {
+      "finding_number": 1,
+      "classification": "valid",
+      "action": "Add retry with exponential backoff in src/api.py",
+      "reasoning": "Network failures silently drop requests today.",
+    },
+    {
+      "finding_number": 2,
+      "classification": "noise",
+      "reasoning": "Style only; out of milestone scope.",
+    },
+  ],
+)
+```
+
+Classification values must be one of: ``valid``, ``security``,
+``architectural``, ``noise``, ``next-layer``, ``out-of-milestone``,
+``convergence``.  Re-classifying the same finding_number replaces the
+prior classification (last-writer-wins), so you can correct mistakes
+with a second call.
 
 ### Write to decisions.md
 
-Prepend new entries at the top (newest-first ordering per DB-08).
+Use the regular Write tool to append to decisions.md.  Prepend new
+entries at the top (newest-first ordering per DB-08).
 
 ```
 ## Cycle {N} — Quality Gate Assessment

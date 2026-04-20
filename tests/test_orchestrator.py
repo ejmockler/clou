@@ -2784,3 +2784,445 @@ class TestCleanupObsoleteFiles:
         assert deleted == []
         assert symlink_target.is_symlink()  # symlink preserved
         assert real_file.exists()  # real file preserved
+
+
+# ---------------------------------------------------------------------------
+# remove_artifact_tool (clou_remove_artifact MCP tool) tests
+# ---------------------------------------------------------------------------
+
+
+def _extract_tool(tmp_path: Path, tool_name: str) -> Any:
+    """Return the decorated MCP tool from _build_mcp_server by name."""
+    from clou.orchestrator import _build_mcp_server
+
+    captured: list[Any] = []
+
+    def _capture_create(*args: Any, **kwargs: Any) -> MagicMock:
+        tools = kwargs.get("tools", args[1] if len(args) > 1 else [])
+        captured.extend(tools)
+        return MagicMock()
+
+    with patch(
+        "clou.orchestrator.create_sdk_mcp_server", side_effect=_capture_create,
+    ):
+        _build_mcp_server(tmp_path)
+
+    for fn in captured:
+        name = getattr(fn, "__name__", "") or getattr(
+            getattr(fn, "handler", None), "__name__", "",
+        )
+        if name == tool_name:
+            return getattr(fn, "handler", fn)
+    raise AssertionError(f"{tool_name} not found in captured tools")
+
+
+class TestRemoveArtifactTool:
+    """Tests for clou_remove_artifact MCP tool (supervisor cleanup)."""
+
+    def _write(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+    def _scope_path(self, tmp_path: Path) -> Path:
+        """Return a concrete path that lies within SUPERVISOR_CLEANUP_SCOPE."""
+        return (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "phases" / "p1" / "execution.md"
+        )
+
+    def _run(self, coro: Any) -> dict[str, Any]:
+        result: Any = asyncio.run(coro)
+        assert isinstance(result, dict)
+        return result
+
+    def _is_error(self, result: dict[str, Any]) -> bool:
+        return bool(result.get("is_error"))
+
+    def _text(self, result: dict[str, Any]) -> str:
+        content = result.get("content", [])
+        if not content:
+            return ""
+        first = content[0]
+        if isinstance(first, dict):
+            return str(first.get("text", ""))
+        return ""
+
+    # --- Happy path ---
+
+    def test_removes_worker_execution(self, tmp_path: Path) -> None:
+        """Worker execution file within scope is removed."""
+        target = self._scope_path(tmp_path)
+        self._write(target, "stale worker output")
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/phases/p1/execution.md",
+            "reason": "orphan from truncated run",
+        }))
+
+        assert not self._is_error(result)
+        assert "Removed .clou/milestones/m1/phases/p1/execution.md" in self._text(result)
+        assert not target.exists()
+
+    def test_removes_parallel_worker_execution(self, tmp_path: Path) -> None:
+        """execution-<name>.md files match scope and are removed."""
+        target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "phases" / "p1" / "execution-alpha.md"
+        )
+        self._write(target, "parallel worker output")
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/phases/p1/execution-alpha.md",
+            "reason": "superseded by serial rerun",
+        }))
+
+        assert not self._is_error(result)
+        assert not target.exists()
+
+    def test_removes_brutalist_assessment(self, tmp_path: Path) -> None:
+        """assessment.md is supersedable and removable."""
+        target = tmp_path / ".clou" / "milestones" / "m1" / "assessment.md"
+        self._write(target, "old report")
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/assessment.md",
+            "reason": "replaced by cycle 3 assessment",
+        }))
+
+        assert not self._is_error(result)
+        assert not target.exists()
+
+    def test_removes_verifier_artifact(self, tmp_path: Path) -> None:
+        """Files under phases/*/artifacts/ match scope and are removable."""
+        target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "phases" / "verification" / "artifacts" / "report.md"
+        )
+        self._write(target, "stale artifact")
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/phases/verification/artifacts/report.md",
+            "reason": "aborted verification run",
+        }))
+
+        assert not self._is_error(result)
+        assert not target.exists()
+
+    def test_removes_escalation(self, tmp_path: Path) -> None:
+        """Escalation files within scope are removable."""
+        target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "escalations" / "auth.md"
+        )
+        self._write(target, "old escalation")
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/escalations/auth.md",
+            "reason": "resolved in follow-up milestone",
+        }))
+
+        assert not self._is_error(result)
+        assert not target.exists()
+
+    def test_tolerates_leading_clou_prefix(self, tmp_path: Path) -> None:
+        """'.clou/...' prefix on path argument is stripped, not rejected."""
+        target = self._scope_path(tmp_path)
+        self._write(target, "content")
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": ".clou/milestones/m1/phases/p1/execution.md",
+            "reason": "orphan",
+        }))
+
+        assert not self._is_error(result)
+        assert not target.exists()
+
+    # --- Protocol artifact rejection ---
+
+    @pytest.mark.parametrize(
+        "protocol_path",
+        [
+            "milestones/m1/milestone.md",
+            "milestones/m1/intents.md",
+            "milestones/m1/requirements.md",
+            "milestones/m1/compose.py",
+            "milestones/m1/status.md",
+            "milestones/m1/handoff.md",
+            "milestones/m1/decisions.md",
+            "milestones/m1/phases/p1/phase.md",
+            "project.md",
+            "roadmap.md",
+            "memory.md",
+            "understanding.md",
+            "active/supervisor.md",
+            "milestones/m1/active/coordinator.md",
+        ],
+    )
+    def test_rejects_protocol_artifacts(
+        self, tmp_path: Path, protocol_path: str,
+    ) -> None:
+        """Protocol artifacts are immutable."""
+        target = tmp_path / ".clou" / protocol_path
+        self._write(target, "protocol content")
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": protocol_path,
+            "reason": "attempting to delete protocol artifact",
+        }))
+
+        assert self._is_error(result)
+        assert "not in supervisor cleanup scope" in self._text(result)
+        assert target.exists()  # preserved
+
+    # --- Input validation ---
+
+    def test_rejects_empty_path(self, tmp_path: Path) -> None:
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({"path": "", "reason": "test"}))
+        assert self._is_error(result)
+        assert "path" in self._text(result)
+
+    def test_rejects_missing_path(self, tmp_path: Path) -> None:
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({"reason": "test"}))
+        assert self._is_error(result)
+
+    def test_rejects_non_string_path(self, tmp_path: Path) -> None:
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({"path": 123, "reason": "test"}))
+        assert self._is_error(result)
+
+    def test_rejects_empty_reason(self, tmp_path: Path) -> None:
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/assessment.md",
+            "reason": "",
+        }))
+        assert self._is_error(result)
+        assert "reason" in self._text(result)
+
+    def test_rejects_whitespace_reason(self, tmp_path: Path) -> None:
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/assessment.md",
+            "reason": "   \n\t  ",
+        }))
+        assert self._is_error(result)
+
+    def test_rejects_oversize_reason(self, tmp_path: Path) -> None:
+        """Reasons larger than the cap are rejected to bound audit bloat."""
+        target = tmp_path / ".clou" / "milestones" / "m1" / "assessment.md"
+        self._write(target, "content")
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/assessment.md",
+            "reason": "x" * 2049,  # one past the cap
+        }))
+
+        assert self._is_error(result)
+        assert "exceeds" in self._text(result).lower()
+        assert target.exists()  # not deleted
+
+    def test_accepts_reason_at_cap(self, tmp_path: Path) -> None:
+        """A reason exactly at the cap is accepted."""
+        target = tmp_path / ".clou" / "milestones" / "m1" / "assessment.md"
+        self._write(target, "content")
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/assessment.md",
+            "reason": "x" * 2048,
+        }))
+
+        assert not self._is_error(result)
+        assert not target.exists()
+
+    def test_rejects_missing_reason(self, tmp_path: Path) -> None:
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/assessment.md",
+        }))
+        assert self._is_error(result)
+
+    # --- Path safety ---
+
+    def test_rejects_path_traversal(self, tmp_path: Path) -> None:
+        """'..' segments in path resolve outside .clou/ and are rejected."""
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "../../etc/passwd",
+            "reason": "escape attempt",
+        }))
+        assert self._is_error(result)
+
+    def test_rejects_absolute_path_outside_clou(self, tmp_path: Path) -> None:
+        """Absolute paths outside .clou/ are rejected."""
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "/etc/passwd",
+            "reason": "escape attempt",
+        }))
+        assert self._is_error(result)
+
+    def test_rejects_symlink_pointing_outside_clou(self, tmp_path: Path) -> None:
+        """A symlink whose target escapes .clou/ is refused."""
+        real_file = tmp_path / "outside.md"
+        real_file.write_text("outside content")
+        link = self._scope_path(tmp_path)
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real_file)
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/phases/p1/execution.md",
+            "reason": "attempting symlink traversal",
+        }))
+
+        assert self._is_error(result)
+        # symlink target (real_file) preserved
+        assert real_file.exists()
+
+    def test_rejects_symlink_pointing_inside_clou(self, tmp_path: Path) -> None:
+        """A symlink whose target is another in-scope artifact is still refused.
+
+        This guards against the post-resolve() is_symlink() dead-code pattern —
+        .resolve() dereferences symlinks, so the is_symlink check must happen
+        on the unresolved path. Otherwise an attacker can name an in-scope
+        symlink and cause the tool to delete its target instead of the link.
+        """
+        # A legitimate in-scope target that must not be touched.
+        real_target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "phases" / "p1" / "execution-real.md"
+        )
+        self._write(real_target, "real content to preserve")
+
+        # A symlink at another in-scope location pointing to real_target.
+        link = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "phases" / "p1" / "execution-link.md"
+        )
+        link.symlink_to(real_target)
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/phases/p1/execution-link.md",
+            "reason": "in-scope symlink removal attempt",
+        }))
+
+        assert self._is_error(result)
+        assert "symlink" in self._text(result).lower()
+        # Both the link and its target must remain untouched.
+        assert link.is_symlink()
+        assert real_target.exists()
+
+    def test_rejects_nonexistent_file(self, tmp_path: Path) -> None:
+        """Nonexistent files are a structured error, not silent success."""
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/assessment.md",
+            "reason": "ghost removal attempt",
+        }))
+
+        assert self._is_error(result)
+        assert "not found" in self._text(result).lower()
+
+    def test_rejects_directory(self, tmp_path: Path) -> None:
+        """Directories are out of scope for V1 (files only)."""
+        dir_path = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "phases" / "verification" / "artifacts"
+        )
+        dir_path.mkdir(parents=True)
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/phases/verification/artifacts",
+            "reason": "bulk cleanup",
+        }))
+
+        assert self._is_error(result)
+        assert dir_path.exists()
+
+    # --- Telemetry ---
+
+    def test_emits_telemetry_on_success(self, tmp_path: Path) -> None:
+        """Successful removal emits supervisor.artifact_removed event."""
+        target = self._scope_path(tmp_path)
+        self._write(target, "12345")  # 5 bytes
+
+        events: list[dict[str, Any]] = []
+
+        def _capture(name: str, **attrs: Any) -> None:
+            events.append({"name": name, **attrs})
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        with patch("clou.telemetry.event", side_effect=_capture):
+            self._run(tool_fn({
+                "path": "milestones/m1/phases/p1/execution.md",
+                "reason": "orphan from truncated run",
+            }))
+
+        removed = [e for e in events if e["name"] == "supervisor.artifact_removed"]
+        assert len(removed) == 1
+        evt = removed[0]
+        assert evt["path"] == "milestones/m1/phases/p1/execution.md"
+        assert evt["reason"] == "orphan from truncated run"
+        assert evt["bytes"] == 5
+
+    def test_no_telemetry_on_rejection(self, tmp_path: Path) -> None:
+        """Rejected calls do not emit supervisor.artifact_removed."""
+        events: list[dict[str, Any]] = []
+
+        def _capture(name: str, **attrs: Any) -> None:
+            events.append({"name": name, **attrs})
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        with patch("clou.telemetry.event", side_effect=_capture):
+            self._run(tool_fn({
+                "path": "project.md",
+                "reason": "test",
+            }))
+
+        removed = [e for e in events if e["name"] == "supervisor.artifact_removed"]
+        assert removed == []
+
+    def test_telemetry_failure_does_not_block_removal(
+        self, tmp_path: Path, caplog: Any,
+    ) -> None:
+        """If telemetry.event raises, the file is still removed and a warning
+        is emitted — log becomes the audit of record, but the operation
+        does not silently fail.
+        """
+        import logging
+
+        target = self._scope_path(tmp_path)
+        self._write(target, "content")
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        with (
+            patch(
+                "clou.telemetry.event",
+                side_effect=RuntimeError("telemetry down"),
+            ),
+            caplog.at_level(logging.WARNING, logger="clou"),
+        ):
+            result = self._run(tool_fn({
+                "path": "milestones/m1/phases/p1/execution.md",
+                "reason": "orphan, telemetry-probing",
+            }))
+
+        # File removed, operation succeeded.
+        assert not self._is_error(result)
+        assert not target.exists()
+        # Warning was surfaced so the dropped event is visible.
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("Telemetry emission failed" in r.message for r in warnings)

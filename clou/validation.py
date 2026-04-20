@@ -662,12 +662,32 @@ def _validate_decisions(path: Path) -> list[ValidationFinding]:
 
 
 def _validate_assessment(path: Path) -> list[ValidationFinding]:
-    """Validate assessment.md per-milestone file structure."""
+    """Validate assessment.md — schema checks + drift tolerance.
+
+    Structural errors still gate (missing ``## Summary`` / ``status:``
+    / no findings of any form), so existing callers keep the same
+    cycle-gating semantics they had before the remolding.  Drifted but
+    parseable layouts (``## Phase: X`` subsections replacing
+    ``## Findings``) downgrade to a WARNING that nudges toward
+    canonical re-render via ``clou_write_assessment`` /
+    ``clou_append_classifications``.
+
+    Uses :func:`clou.assessment.parse_assessment` under the hood so
+    validator + writer + parser all share one schema; the only regex
+    checks on raw text are for per-finding body hygiene (missing
+    ``**Severity:**`` / ``**Finding:**``), which is metadata the
+    tolerant parser intentionally defaults through.
+    """
+    from clou.assessment import (
+        VALID_STATUSES,
+        parse_assessment,
+    )
+
     rel = _rel(path)
     findings: list[ValidationFinding] = []
     content = path.read_text()
 
-    # Must have ## Summary with status: field — ERROR (structural)
+    # --- Summary section presence (literal check) ---
     if "## Summary" not in content:
         findings.append(
             ValidationFinding(
@@ -690,13 +710,30 @@ def _validate_assessment(path: Path) -> list[ValidationFinding]:
         )
         return findings
 
-    # "blocked" is a valid terminal state — no findings required.
-    # "degraded" proceeds like "completed" — findings are expected.
-    if status_match.group(1) == "blocked":
+    raw_status = status_match.group(1).lower()
+    if raw_status not in VALID_STATUSES:
+        findings.append(
+            ValidationFinding(
+                severity=Severity.ERROR,
+                message=(
+                    f"'## Summary' status must be one of "
+                    f"{sorted(VALID_STATUSES)}, got {raw_status!r}"
+                ),
+                path=rel,
+            )
+        )
         return findings
 
-    # Must have ## Findings section — ERROR (structural)
-    if "## Findings" not in content:
+    # "blocked" is a terminal state — no findings required.
+    if raw_status == "blocked":
+        return findings
+
+    # --- Findings section presence ---
+    has_canonical_findings = "## Findings" in content
+    form = parse_assessment(content)
+
+    if not has_canonical_findings and not form.findings:
+        # Neither canonical nor drifted-but-parseable findings exist.
         findings.append(
             ValidationFinding(
                 severity=Severity.ERROR,
@@ -706,28 +743,51 @@ def _validate_assessment(path: Path) -> list[ValidationFinding]:
         )
         return findings
 
-    # Each finding must have **Severity:** and **Finding:** — WARNING (formatting)
-    findings_block = _section_text(content, "## Findings")
-    finding_headers = re.findall(r"(?m)^### F\d+:", findings_block)
-    if finding_headers:
-        finding_blocks = _split_sections(findings_block, r"### F\d+:")
-        for k, block in enumerate(finding_blocks, 1):
-            if not re.search(r"\*\*Severity:\*\*", block):
-                findings.append(
-                    ValidationFinding(
-                        severity=Severity.WARNING,
-                        message=f"finding {k} missing '**Severity:**'",
-                        path=rel,
-                    )
+    # Drift-tolerant: if canonical '## Findings' isn't present but the
+    # parser extracted findings from ## Phase: X subsections, warn.
+    if not has_canonical_findings and form.findings:
+        findings.append(
+            ValidationFinding(
+                severity=Severity.WARNING,
+                message=(
+                    "assessment.md uses drifted '## Phase: X' structure "
+                    "instead of canonical '## Findings'.  MCP-mediated "
+                    "writes (clou_write_assessment, clou_append_"
+                    "classifications) re-render to canonical form."
+                ),
+                path=rel,
+            )
+        )
+
+    # --- Per-finding body hygiene (warnings) ---
+    # Iterate every '### F{N}:' header in the document and check for
+    # **Severity:** and **Finding:** in the body.  Classification
+    # entries under '## Classifications' use **Classification:** not
+    # **Severity:**, so skip blocks that carry that marker.
+    for match in re.finditer(r"(?m)^### F(\d+):", content):
+        num = match.group(1)
+        start = match.end()
+        next_header = re.search(r"(?m)^### ", content[start:])
+        end = start + next_header.start() if next_header else len(content)
+        block = content[start:end]
+        if "**Classification:**" in block:
+            continue
+        if "**Severity:**" not in block:
+            findings.append(
+                ValidationFinding(
+                    severity=Severity.WARNING,
+                    message=f"finding {num} missing '**Severity:**'",
+                    path=rel,
                 )
-            if not re.search(r"\*\*Finding:\*\*", block):
-                findings.append(
-                    ValidationFinding(
-                        severity=Severity.WARNING,
-                        message=f"finding {k} missing '**Finding:**'",
-                        path=rel,
-                    )
+            )
+        if "**Finding:**" not in block:
+            findings.append(
+                ValidationFinding(
+                    severity=Severity.WARNING,
+                    message=f"finding {num} missing '**Finding:**'",
+                    path=rel,
                 )
+            )
 
     return findings
 

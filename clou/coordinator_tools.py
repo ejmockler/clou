@@ -364,7 +364,449 @@ def _build_coordinator_tools(
         path.write_text(content, encoding="utf-8")
         return {"written": str(path), "task_count": len(tasks_raw)}
 
-    return [write_checkpoint_tool, update_status_tool, write_execution_tool]
+    @tool(
+        "clou_brief_worker",
+        "Construct the canonical worker briefing for a compose.py "
+        "function.  The briefing contains the deterministic "
+        "execution.md path computed by code — the coordinator calls "
+        "this and pipes the returned text directly into the Task "
+        "tool's prompt, removing any LLM-owned slug construction "
+        "from worker dispatch.  Optional intent_ids append a per-"
+        "intent structuring instruction; extra_reads append "
+        "additional context files to the worker's read list.",
+        {
+            "type": "object",
+            "properties": {
+                "function_name": {
+                    "type": "string",
+                    "description": (
+                        "The compose.py function name the worker will "
+                        "implement.  Also the phase slug — one "
+                        "function per phase directory."
+                    ),
+                },
+                "intent_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Intent IDs (e.g. I1, I3) from compose.py "
+                        "docstrings.  When provided, the briefing "
+                        "includes per-intent structuring guidance."
+                    ),
+                },
+                "extra_reads": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional additional files the worker should "
+                        "read, each as a path string relative to "
+                        "project root (e.g. 'src/logger.ts')."
+                    ),
+                },
+            },
+            "required": ["function_name"],
+        },
+    )
+    async def brief_worker_tool(args: dict[str, Any]) -> dict[str, Any]:
+        from clou.shard import canonical_execution_path
+
+        fn_raw = args.get("function_name")
+        if not isinstance(fn_raw, str) or not fn_raw:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": "function_name must be a non-empty string",
+                }],
+                "is_error": True,
+            }
+
+        # sanitize_phase doubles as the function-name validator: a phase
+        # directory's name is always the function name.  Drift between
+        # "what the coordinator briefs" and "where workers actually land"
+        # can't open up here because the tool resolves the path from the
+        # validated name.
+        try:
+            fn = sanitize_phase(fn_raw)
+        except ValueError as exc:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": f"invalid function_name: {exc}",
+                }],
+                "is_error": True,
+            }
+
+        intent_ids_raw = _coerce_json_array(
+            args.get("intent_ids"), param="intent_ids",
+        )
+        intent_ids: list[str] = []
+        for i, item in enumerate(intent_ids_raw):
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(
+                    f"intent_ids[{i}]: expected non-empty string"
+                )
+            intent_ids.append(item.strip())
+
+        extra_reads_raw = _coerce_json_array(
+            args.get("extra_reads"), param="extra_reads",
+        )
+        extra_reads: list[str] = []
+        for i, item in enumerate(extra_reads_raw):
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(
+                    f"extra_reads[{i}]: expected non-empty string"
+                )
+            extra_reads.append(item.strip())
+
+        execution_rel = canonical_execution_path(fn)
+
+        lines: list[str] = [
+            f"You are implementing `{fn}` for milestone "
+            f"'{milestone}', phase '{fn}'.",
+            "",
+            "Read your protocol file: .clou/prompts/worker.md",
+            "",
+            "Then read these files:",
+            f"- .clou/milestones/{milestone}/compose.py — find your "
+            f"function signature `{fn}`. Your criteria are in the "
+            "docstring.",
+            f"- .clou/milestones/{milestone}/phases/{fn}/phase.md",
+            "- .clou/project.md — coding conventions",
+        ]
+        for extra in extra_reads:
+            lines.append(f"- {extra}")
+        lines += [
+            "",
+            "Write results to:",
+            f"- .clou/milestones/{milestone}/{execution_rel}",
+            "",
+            "Write execution.md incrementally as you complete work.",
+        ]
+        if intent_ids:
+            lines += [
+                "",
+                f"Your task addresses these intents: {', '.join(intent_ids)}",
+                "Structure your execution.md with per-intent sections:",
+                "## {intent_id}: {one-line description}",
+                "Status: [implemented | in-progress | blocked]",
+                "{details}",
+            ]
+
+        briefing = "\n".join(lines)
+        return {"content": [{"type": "text", "text": briefing}]}
+
+    @tool(
+        "clou_write_assessment",
+        "Write assessment.md from structured findings.  Use this "
+        "instead of Write — code owns the canonical ## Summary / "
+        "## Tools Invoked / ## Findings structure; you own the "
+        "values.  Called by the brutalist to produce the initial "
+        "assessment after a quality-gate run.  For evaluator "
+        "classifications, use clou_append_classifications.",
+        {
+            "type": "object",
+            "properties": {
+                "phase_name": {
+                    "type": "string",
+                    "description": (
+                        "Header label — for single-phase cycles pass "
+                        "the phase slug; for multi-phase layers pass "
+                        "a layer identifier (e.g. 'Layer 1 Cycle 2')."
+                    ),
+                },
+                "summary": {
+                    "type": "object",
+                    "description": (
+                        "status (completed|degraded|blocked), "
+                        "tools_invoked, findings counts, "
+                        "phase_evaluated.  For degraded gate runs also "
+                        "pass internal_reviewers and gate_error."
+                    ),
+                },
+                "findings": {
+                    "type": "array",
+                    "description": (
+                        "Findings list.  Each entry: number, title, "
+                        "severity (critical|major|minor), source_tool, "
+                        "source_models, affected_files, finding_text, "
+                        "context, optional phase for multi-phase layers."
+                    ),
+                },
+                "tools": {
+                    "type": "array",
+                    "description": (
+                        "Tool invocations.  Each: tool, domain, "
+                        "status, optional note."
+                    ),
+                },
+            },
+            "required": ["phase_name", "summary"],
+        },
+    )
+    async def write_assessment_tool(args: dict[str, Any]) -> dict[str, Any]:
+        from clou.assessment import (
+            AssessmentForm,
+            AssessmentSummary,
+            Finding,
+            ToolInvocation,
+            VALID_SEVERITIES,
+            VALID_STATUSES,
+            render_assessment,
+        )
+
+        phase_name = args.get("phase_name", "")
+        if not isinstance(phase_name, str) or not phase_name.strip():
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": "phase_name must be a non-empty string",
+                }],
+                "is_error": True,
+            }
+
+        summary_raw = _coerce_json_object(
+            args.get("summary"), param="summary",
+        )
+        if summary_raw is None:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": "summary is required (status, findings counts, etc.)",
+                }],
+                "is_error": True,
+            }
+
+        status_raw = str(summary_raw.get("status", "")).lower().strip()
+        if status_raw not in VALID_STATUSES:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"summary.status must be one of "
+                        f"{sorted(VALID_STATUSES)}, got {status_raw!r}"
+                    ),
+                }],
+                "is_error": True,
+            }
+
+        def _int(value: Any, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        summary = AssessmentSummary(
+            status=status_raw,  # type: ignore[arg-type]
+            tools_invoked=_int(summary_raw.get("tools_invoked", 0)),
+            findings_total=_int(summary_raw.get("findings_total", 0)),
+            findings_critical=_int(
+                summary_raw.get("findings_critical", 0),
+            ),
+            findings_major=_int(summary_raw.get("findings_major", 0)),
+            findings_minor=_int(summary_raw.get("findings_minor", 0)),
+            phase_evaluated=str(
+                summary_raw.get("phase_evaluated", ""),
+            ).strip(),
+            internal_reviewers=(
+                _int(summary_raw["internal_reviewers"])
+                if "internal_reviewers" in summary_raw
+                else None
+            ),
+            gate_error=(
+                str(summary_raw["gate_error"]).strip()
+                if "gate_error" in summary_raw
+                else None
+            ),
+        )
+
+        tools_raw = _coerce_json_array(args.get("tools"), param="tools")
+        tools: list[ToolInvocation] = []
+        for i, item in enumerate(tools_raw):
+            coerced = _coerce_json_object(item, param=f"tools[{i}]")
+            if coerced is None:
+                continue
+            tool_name = str(coerced.get("tool", "")).strip()
+            if not tool_name:
+                raise ValueError(
+                    f"tools[{i}]: 'tool' field is required"
+                )
+            tools.append(ToolInvocation(
+                tool=tool_name,
+                domain=(
+                    str(coerced["domain"]).strip()
+                    if "domain" in coerced
+                    else None
+                ),
+                status=str(coerced.get("status", "invoked")).strip(),
+                note=str(coerced.get("note", "")).strip(),
+            ))
+
+        findings_raw = _coerce_json_array(
+            args.get("findings"), param="findings",
+        )
+        findings: list[Finding] = []
+        for i, item in enumerate(findings_raw):
+            coerced = _coerce_json_object(item, param=f"findings[{i}]")
+            if coerced is None:
+                raise ValueError(
+                    f"findings[{i}]: expected object, got null/empty"
+                )
+            severity = str(coerced.get("severity", "")).lower().strip()
+            if severity not in VALID_SEVERITIES:
+                raise ValueError(
+                    f"findings[{i}].severity must be one of "
+                    f"{sorted(VALID_SEVERITIES)}, got {severity!r}"
+                )
+            affected = _coerce_json_array(
+                coerced.get("affected_files"),
+                param=f"findings[{i}].affected_files",
+            )
+            source_models = _coerce_json_array(
+                coerced.get("source_models"),
+                param=f"findings[{i}].source_models",
+            )
+            phase_opt = coerced.get("phase")
+            findings.append(Finding(
+                number=_int(coerced.get("number", i + 1), i + 1),
+                title=str(coerced.get("title", "")).strip(),
+                severity=severity,  # type: ignore[arg-type]
+                source_tool=str(coerced.get("source_tool", "")).strip(),
+                source_models=tuple(
+                    str(m).strip() for m in source_models if str(m).strip()
+                ),
+                affected_files=tuple(
+                    str(p).strip() for p in affected if str(p).strip()
+                ),
+                finding_text=str(coerced.get("finding_text", "")).strip(),
+                context=str(coerced.get("context", "")).strip(),
+                phase=(str(phase_opt).strip() if phase_opt else None),
+            ))
+
+        form = AssessmentForm(
+            phase_name=phase_name.strip(),
+            summary=summary,
+            tools=tuple(tools),
+            findings=tuple(findings),
+        )
+        content = render_assessment(form)
+        path = ms_dir / "assessment.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return {
+            "written": str(path),
+            "finding_count": len(findings),
+            "status": summary.status,
+        }
+
+    @tool(
+        "clou_append_classifications",
+        "Append evaluator classifications to assessment.md.  Reads "
+        "the existing (possibly-drifted) file, parses it into "
+        "structured form, merges the classifications (last-writer-"
+        "wins per finding), and re-renders to canonical form.  This "
+        "is the evaluator's amendment pathway — no Write required, "
+        "no drift possible.",
+        {
+            "type": "object",
+            "properties": {
+                "classifications": {
+                    "type": "array",
+                    "description": (
+                        "Classifications list.  Each entry: "
+                        "finding_number (int matching a Finding.number), "
+                        "classification "
+                        "(valid|security|architectural|noise|"
+                        "next-layer|out-of-milestone|convergence), "
+                        "action, reasoning."
+                    ),
+                },
+            },
+            "required": ["classifications"],
+        },
+    )
+    async def append_classifications_tool(
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        from clou.assessment import (
+            Classification,
+            VALID_CLASSIFICATIONS,
+            merge_classifications,
+            parse_assessment,
+            render_assessment,
+        )
+
+        path = ms_dir / "assessment.md"
+        if not path.exists():
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        "assessment.md does not exist — the brutalist "
+                        "must run clou_write_assessment first"
+                    ),
+                }],
+                "is_error": True,
+            }
+
+        raw = _coerce_json_array(
+            args.get("classifications"), param="classifications",
+        )
+        if not raw:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        "classifications must be a non-empty array"
+                    ),
+                }],
+                "is_error": True,
+            }
+
+        classifications: list[Classification] = []
+        for i, item in enumerate(raw):
+            coerced = _coerce_json_object(
+                item, param=f"classifications[{i}]",
+            )
+            if coerced is None:
+                raise ValueError(
+                    f"classifications[{i}]: expected object, got null"
+                )
+            kind = str(coerced.get("classification", "")).lower().strip()
+            if kind not in VALID_CLASSIFICATIONS:
+                raise ValueError(
+                    f"classifications[{i}].classification must be one "
+                    f"of {sorted(VALID_CLASSIFICATIONS)}, got {kind!r}"
+                )
+            try:
+                number = int(coerced.get("finding_number"))
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"classifications[{i}].finding_number must be an int"
+                )
+            classifications.append(Classification(
+                finding_number=number,
+                classification=kind,  # type: ignore[arg-type]
+                action=str(coerced.get("action", "")).strip(),
+                reasoning=str(coerced.get("reasoning", "")).strip(),
+            ))
+
+        existing = parse_assessment(path.read_text(encoding="utf-8"))
+        merged = merge_classifications(existing, classifications)
+        content = render_assessment(merged)
+        path.write_text(content, encoding="utf-8")
+        return {
+            "written": str(path),
+            "classification_count": len(merged.classifications),
+        }
+
+    return [
+        write_checkpoint_tool,
+        update_status_tool,
+        write_execution_tool,
+        brief_worker_tool,
+        write_assessment_tool,
+        append_classifications_tool,
+    ]
 
 
 def build_coordinator_mcp_server(

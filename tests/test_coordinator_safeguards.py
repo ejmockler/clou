@@ -189,8 +189,7 @@ class TestWriteFailureShard:
         """Timeout failure shard has correct structure."""
         ms_dir = tmp_path / "milestones" / "test-ms"
         ms_dir.mkdir(parents=True)
-        # Set name so write_shard_path can use it.
-        # We pass ms_dir directly; write_shard_path uses milestone_dir.name
+        # failure_shard_path uses milestone_dir.name for the slug path.
         path = _write_failure_shard(
             ms_dir, "my-phase", "build_thing",
             "timeout", "Task terminated after 600s",
@@ -784,11 +783,18 @@ class TestStaleShardCleaning:
     async def test_stale_shards_cleaned_before_gather_dispatch(
         self, project_dir: Path,
     ) -> None:
-        """Stale execution-*.md files from prior cycles are removed before dispatch."""
+        """Stale execution-*.md in every gather-layer phase dir is swept.
+
+        Compose.py expresses parallelism at the phase level — each
+        function is its own phase directory.  The layer-wide cleanup
+        must sweep every DAG task's phase dir, not only the
+        checkpoint's ``current_phase``.  The prior bug swept only one,
+        leaving orphans in the other parallel phases.
+        """
         ms_dir = project_dir / ".clou" / "milestones" / "ms"
         ms_dir.mkdir(parents=True)
 
-        # Write a compose.py with a gather() group (>1 task).
+        # Gather() group across two parallel function/phases.
         (ms_dir / "compose.py").write_text('''
 class R: ...
 class S: ...
@@ -803,28 +809,30 @@ async def execute():
     a, b = await gather(task_a(), task_b())
 ''', encoding="utf-8")
 
-        # Write a checkpoint so current_phase is available.
         active_dir = ms_dir / "active"
         active_dir.mkdir()
+        # current_phase names one of the layer's phases; layer-wide
+        # sweep still covers BOTH.
         (active_dir / "coordinator.md").write_text(
             "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
-            "current_phase: build-phase\nphases_completed: 0\nphases_total: 1\n",
+            "current_phase: task_a\nphases_completed: 0\nphases_total: 2\n",
             encoding="utf-8",
         )
 
-        # Create stale shard files from a prior crashed cycle.
-        phase_dir = ms_dir / "phases" / "build-phase"
-        phase_dir.mkdir(parents=True)
-        stale_a = phase_dir / "execution-task-a.md"
-        stale_b = phase_dir / "execution-task-b.md"
+        # Stale shards planted in BOTH phase dirs — the prior single-
+        # phase cleanup would only have swept task_a's dir.
+        phase_a = ms_dir / "phases" / "task_a"
+        phase_a.mkdir(parents=True)
+        stale_a = phase_a / "execution-old-cycle.md"
         stale_a.write_text("## Summary\nstatus: in_progress\n", encoding="utf-8")
+        normal_a = phase_a / "execution.md"
+        normal_a.write_text("## Summary\nstatus: completed\n", encoding="utf-8")
+
+        phase_b = ms_dir / "phases" / "task_b"
+        phase_b.mkdir(parents=True)
+        stale_b = phase_b / "execution-orphan-slug.md"
         stale_b.write_text("## Summary\nstatus: failed\n", encoding="utf-8")
 
-        # Also create a normal execution.md which should NOT be removed.
-        normal_exec = phase_dir / "execution.md"
-        normal_exec.write_text("## Summary\nstatus: completed\n", encoding="utf-8")
-
-        # Normal completion messages.
         messages = [
             _make_task_started("tid-a", "task_a"),
             _make_task_started("tid-b", "task_b"),
@@ -844,22 +852,35 @@ async def execute():
 
         assert result == "ASSESS"
 
-        # Stale shards should have been removed before dispatch.
-        assert not stale_a.exists(), "Stale shard execution-task-a.md was not cleaned"
-        assert not stale_b.exists(), "Stale shard execution-task-b.md was not cleaned"
-
-        # Normal execution.md should be untouched.
-        assert normal_exec.exists(), "execution.md was incorrectly removed"
+        # Stale shards removed from BOTH phases (the whole layer, not
+        # just current_phase).
+        assert not stale_a.exists(), (
+            "Stale shard in task_a/ was not cleaned"
+        )
+        assert not stale_b.exists(), (
+            "Stale shard in task_b/ was not cleaned — layer-wide sweep "
+            "regressed to single-phase behavior"
+        )
+        # Canonical execution.md preserved.
+        assert normal_a.exists(), "Canonical execution.md was incorrectly removed"
 
     @pytest.mark.asyncio
-    async def test_no_cleaning_for_single_task(
+    async def test_cleaning_covers_single_task_dag(
         self, project_dir: Path,
     ) -> None:
-        """Single-task DAGs (no gather) skip stale shard cleaning."""
+        """Single-task DAGs also get their phase swept before dispatch.
+
+        The prior invariant was ``gather-only cleanup``, which led to
+        stale shards surviving in solo-task phase directories across
+        cycles and tripping validation.  The layer-wide remolding
+        sweeps every DAG phase regardless of layer width — by the time
+        the cycle starts, nothing is ``current`` and every
+        ``execution-*.md`` is stale by definition.
+        """
         ms_dir = project_dir / ".clou" / "milestones" / "ms"
         ms_dir.mkdir(parents=True)
 
-        # Write a compose.py with a single task (no gather).
+        # Single-task DAG: function name must match _PHASE_RE.
         (ms_dir / "compose.py").write_text('''
 class R: ...
 
@@ -870,19 +891,18 @@ async def execute():
     a = await task_a()
 ''', encoding="utf-8")
 
-        # Write a checkpoint.
         active_dir = ms_dir / "active"
         active_dir.mkdir()
         (active_dir / "coordinator.md").write_text(
             "cycle: 1\nstep: EXECUTE\nnext_step: ASSESS\n"
-            "current_phase: build-phase\nphases_completed: 0\nphases_total: 1\n",
+            "current_phase: task_a\nphases_completed: 0\nphases_total: 1\n",
             encoding="utf-8",
         )
 
-        # Create a shard file that should NOT be cleaned (single-task DAG).
-        phase_dir = ms_dir / "phases" / "build-phase"
+        # Plant a stale shard in the single task's phase dir.
+        phase_dir = ms_dir / "phases" / "task_a"
         phase_dir.mkdir(parents=True)
-        shard = phase_dir / "execution-task-a.md"
+        shard = phase_dir / "execution-prior.md"
         shard.write_text("## Summary\nstatus: in_progress\n", encoding="utf-8")
 
         messages = [
@@ -901,8 +921,246 @@ async def execute():
             )
 
         assert result == "ASSESS"
-        # Single-task DAG: shard should NOT be cleaned.
-        assert shard.exists(), "Shard was incorrectly cleaned for single-task DAG"
+        # Layer-wide sweep removes the stale shard in the single-task DAG.
+        assert not shard.exists(), (
+            "Stale shard was not cleaned in single-task DAG"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Slug-drift remolding integration test — the "never again" invariant.
+# ---------------------------------------------------------------------------
+
+
+class TestSlugDriftRemoldingInvariant:
+    """Prove the three remolding protections compose correctly.
+
+    The original incident (~/.config/clou/.clou/milestones/quality-
+    infrastructure/) accumulated duplicate execution-<slug>.md files in
+    a gather() layer of three parallel functions.  Each cycle wrote a
+    new slug variant, stale shards accumulated, and validation trapped
+    on malformed orphans — blocking the 4th phase from ever running.
+
+    The fixes that make it architecturally impossible:
+      1. **Boundary enforcement.** Worker ``WRITE_PERMISSIONS`` no
+         longer include ``execution-*.md`` — even a misbriefed worker
+         can't create a drifted path via the Write tool.
+      2. **Layer-wide cleanup at EXECUTE start.** Every phase in the
+         active DAG layer is swept for ``execution-*.md`` orphans
+         before workers dispatch.  Cleanup is gated on
+         ``cycle_type == "EXECUTE"`` so ASSESS/REPLAN/VERIFY cycles
+         preserve legitimate failure shards as evidence.
+      3. **Drift telemetry.** Every sweep emits ``shard.cleaned_stale``
+         with per-phase counts; per-file failures emit
+         ``shard.cleanup_failed``; helper crashes emit
+         ``shard.cleanup_error``.  Silent cleanup failure was a root
+         cause of the original incident.
+
+    This test composes all three against a 3-function gather layer
+    that mirrors the brutalist-mcp-server topology.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_prompt_io(self) -> Any:
+        with (
+            patch(f"{_PC}.load_prompt", return_value="<system/>"),
+            patch(f"{_PC}._build_agents", return_value={}),
+            patch(f"{_PC}.build_hooks", return_value={"PreToolUse": []}),
+        ):
+            yield
+
+    def _three_function_gather_compose(self) -> str:
+        """compose.py matching the brutalist-mcp-server quality-infrastructure shape."""
+        return '''
+class R: ...
+
+async def set_coverage_thresholds() -> R:
+    """Thresholds."""
+
+async def create_metrics_module() -> R:
+    """Metrics."""
+
+async def extend_logger() -> R:
+    """Logger."""
+
+async def execute():
+    a, b, c = await gather(
+        set_coverage_thresholds(),
+        create_metrics_module(),
+        extend_logger(),
+    )
+'''
+
+    @pytest.mark.asyncio
+    async def test_gather_layer_orphans_from_prior_cycles_never_accumulate(
+        self, tmp_path: Path,
+    ) -> None:
+        """Rework cycle on a 3-function gather() layer leaves no orphans."""
+        project_dir = tmp_path
+        clou_dir = project_dir / ".clou"
+        clou_dir.mkdir()
+        ms_dir = clou_dir / "milestones" / "quality-infrastructure"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "compose.py").write_text(
+            self._three_function_gather_compose(), encoding="utf-8",
+        )
+
+        active_dir = ms_dir / "active"
+        active_dir.mkdir()
+        (active_dir / "coordinator.md").write_text(
+            "cycle: 4\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: extend_logger\n"
+            "phases_completed: 0\nphases_total: 4\n",
+            encoding="utf-8",
+        )
+
+        # Plant prior-cycle orphans — the exact slug-drift pattern that
+        # caused the original incident: mixed hyphen/underscore slugs
+        # across the 3 parallel phases.
+        orphans: list[Path] = []
+        for phase, slug_a, slug_b in [
+            ("set_coverage_thresholds",
+             "execution-set-coverage-thresholds.md",
+             "execution-set_coverage_thresholds.md"),
+            ("create_metrics_module",
+             "execution-create-metrics-module.md",
+             "execution-create_metrics_module.md"),
+            ("extend_logger",
+             "execution-extend-logger.md",
+             "execution-extend_logger.md"),
+        ]:
+            phase_dir = ms_dir / "phases" / phase
+            phase_dir.mkdir(parents=True)
+            for slug in (slug_a, slug_b):
+                orphan = phase_dir / slug
+                orphan.write_text(
+                    "## Summary\nstatus: in_progress\n",
+                    encoding="utf-8",
+                )
+                orphans.append(orphan)
+            # Canonical execution.md from the prior cycle — must survive.
+            (phase_dir / "execution.md").write_text(
+                "## Summary\nstatus: completed\n", encoding="utf-8",
+            )
+
+        # Mock the SDK surface (no real coordinator subprocess).
+        messages = [
+            _make_task_started("ta", "set_coverage_thresholds"),
+            _make_task_started("tb", "create_metrics_module"),
+            _make_task_started("tc", "extend_logger"),
+            _make_task_notification("ta", "completed", "done"),
+            _make_task_notification("tb", "completed", "done"),
+            _make_task_notification("tc", "completed", "done"),
+            _make_result(usage={"input_tokens": 100}),
+        ]
+        client = _mock_sdk_client(messages)
+
+        # Capture telemetry to verify drift events fire.
+        events: list[dict[str, Any]] = []
+
+        def _capture(name: str, **attrs: Any) -> None:
+            events.append({"name": name, **attrs})
+
+        with (
+            patch(f"{_PC}.ClaudeSDKClient", return_value=client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="ASSESS"),
+            patch("clou.telemetry.event", side_effect=_capture),
+        ):
+            result = await _run_single_cycle(
+                project_dir, "quality-infrastructure",
+                "EXECUTE", "do work",
+            )
+
+        assert result == "ASSESS"
+
+        # (2) Every orphan across every phase in the active layer is gone.
+        for orphan in orphans:
+            assert not orphan.exists(), (
+                f"Orphan {orphan} survived remolding cleanup — "
+                "the original slug-drift bug regressed"
+            )
+
+        # Canonical execution.md preserved in every phase dir.
+        for phase in (
+            "set_coverage_thresholds",
+            "create_metrics_module",
+            "extend_logger",
+        ):
+            canonical = ms_dir / "phases" / phase / "execution.md"
+            assert canonical.exists(), (
+                f"Canonical execution.md missing in {phase}/"
+            )
+
+        # (3) Drift telemetry fired with the layer-wide counts.
+        swept = [e for e in events if e["name"] == "shard.cleaned_stale"]
+        assert len(swept) == 1, (
+            "shard.cleaned_stale should fire once per EXECUTE sweep"
+        )
+        evt = swept[0]
+        # All three phases in the layer produced removals.
+        assert evt["phase_count"] == 3
+        # Two orphans per phase × three phases = six total.
+        assert evt["total_removed"] == 6
+        assert evt["milestone"] == "quality-infrastructure"
+
+    @pytest.mark.asyncio
+    async def test_cleanup_skipped_for_non_execute_cycles(
+        self, tmp_path: Path,
+    ) -> None:
+        """ASSESS/REPLAN/VERIFY cycles MUST preserve failure shards.
+
+        Recovery and precompose surface coordinator-generated failure
+        shards (written by _write_failure_shard on timeout/budget abort)
+        so ASSESS can see the failure context.  Cleanup at the start
+        of those cycles would erase the evidence.
+        """
+        project_dir = tmp_path
+        clou_dir = project_dir / ".clou"
+        clou_dir.mkdir()
+        ms_dir = clou_dir / "milestones" / "ms"
+        ms_dir.mkdir(parents=True)
+
+        (ms_dir / "compose.py").write_text(
+            self._three_function_gather_compose(), encoding="utf-8",
+        )
+
+        active_dir = ms_dir / "active"
+        active_dir.mkdir()
+        (active_dir / "coordinator.md").write_text(
+            "cycle: 2\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: extend_logger\n"
+            "phases_completed: 1\nphases_total: 4\n",
+            encoding="utf-8",
+        )
+
+        # A legitimate failure shard from a timeout in the PREVIOUS
+        # EXECUTE — ASSESS is about to read this as evidence.
+        phase_dir = ms_dir / "phases" / "extend_logger"
+        phase_dir.mkdir(parents=True)
+        failure_shard = phase_dir / "execution-extend-logger.md"
+        failure_shard.write_text(
+            "## Summary\nstatus: failed\nfailures: timeout\n",
+            encoding="utf-8",
+        )
+
+        messages = [_make_result(usage={"input_tokens": 50})]
+        client = _mock_sdk_client(messages)
+
+        with (
+            patch(f"{_PC}.ClaudeSDKClient", return_value=client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="VERIFY"),
+        ):
+            result = await _run_single_cycle(
+                project_dir, "ms", "ASSESS", "assess",
+            )
+
+        assert result == "VERIFY"
+        # The failure shard must survive the ASSESS cycle — ASSESS
+        # reads it as evidence, cleanup would destroy that evidence.
+        assert failure_shard.exists(), (
+            "ASSESS cleanup destroyed failure shard evidence — "
+            "cycle-type gating regressed"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -489,15 +489,21 @@ class TestBuildCyclePromptDagContext:
 
 
 # ---------------------------------------------------------------------------
-# Shard-aware path generation (M17 — protocol integration)
+# Canonical execution.md path generation — post-M17, post-slug-drift remolding.
+# Sharded execution-{task_slug}.md paths were dropped because the slug was
+# LLM-freeformed and drifted across cycles, leaving orphans that broke
+# validation.  Now every phase has exactly one execution.md regardless of
+# gather()-group membership.
 # ---------------------------------------------------------------------------
 
 
-class TestShardAwarePaths:
-    """EXECUTE prompts include shard write paths for gather() layers."""
+class TestCanonicalExecutionPaths:
+    """EXECUTE prompts list phase-level execution.md paths, not slugged shards."""
 
-    def test_execute_prompt_shard_paths(self, tmp_path: Path) -> None:
-        """gather() layers include shard paths in write section."""
+    def test_execute_prompt_gather_layer_lists_one_execution_per_phase(
+        self, tmp_path: Path,
+    ) -> None:
+        """gather() layers list execution.md per phase, no shard suffix."""
         tasks = [
             {"name": "build_a", "status": "pending"},
             {"name": "build_b", "status": "pending"},
@@ -514,13 +520,14 @@ class TestShardAwarePaths:
             cycle_type="EXECUTE",
             read_set=["status.md", "compose.py"],
             dag_data=(tasks, deps),
-            current_phase="infra",
+            current_phase="build_a",
         )
-        # Standard execution.md write path is always present.
-        assert "phases/infra/execution.md" in result
-        # Shard pattern for gather() layers is present.
-        assert "execution-{task}.md" in result
-        assert "per-task shards for gather() groups" in result
+        # Both phases in the co-layer have their execution.md listed.
+        assert "phases/build_a/execution.md" in result
+        assert "phases/build_b/execution.md" in result
+        # The old per-task-shard form is gone.
+        assert "execution-{task}.md" not in result
+        assert "per-task shards for gather() groups" not in result
 
     def test_execute_prompt_serial_no_shards(self, tmp_path: Path) -> None:
         """Serial layers (all single-task) produce no shard write paths."""

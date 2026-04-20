@@ -1,12 +1,17 @@
-"""Execution state sharding for concurrent gather() groups.
+"""Execution artifact path derivation — code owns format AND path.
 
-When the coordinator dispatches a gather() group with >1 concurrent task,
-each worker writes to its own shard file (``execution-{task}.md``) instead
-of the shared ``execution.md``.  After all workers complete, the coordinator
-merges shards into a unified execution.md.
+Canonical invariant: one ``execution.md`` per phase directory.
+Workers always write to :func:`canonical_execution_path` regardless of
+whether the DAG layer contains one function or many — compose.py expresses
+parallelism at the phase level (multiple functions in ``gather()``), not
+within a phase.
 
-Narrow graphs (single task per layer) bypass sharding entirely -- workers
-write directly to ``execution.md`` with zero overhead.
+The ``execution-{slug}.md`` form is reserved for **coordinator-generated
+failure shards** (timeouts, budget exceedances) where the coordinator
+records a structured failure record for a terminated task without the
+worker having a chance to write its own execution.md.  That slug path is
+deterministic via :func:`_slugify` — callers pass a task name, code
+computes the slug — so no LLM-owned slugification enters the filesystem.
 """
 
 from __future__ import annotations
@@ -27,11 +32,29 @@ def _slugify(name: str) -> str:
     return _SLUG_RE.sub("-", name.lower()).strip("-")
 
 
-def write_shard_path(milestone: str, phase: str, task: str) -> str:
-    """Return the relative path for a task's execution shard.
+def canonical_execution_path(phase: str) -> str:
+    """Return the canonical execution artifact path for a phase.
 
     The path is relative to the milestone directory
-    (``.clou/milestones/{milestone}/``).
+    (``.clou/milestones/{milestone}/``).  This is the ONLY path workers
+    should be briefed to write — there is exactly one execution.md per
+    phase directory, regardless of gather-group membership.
+
+    Returns:
+        ``phases/{phase}/execution.md``.
+    """
+    return f"phases/{phase}/execution.md"
+
+
+def failure_shard_path(milestone: str, phase: str, task: str) -> str:
+    """Return the path for a coordinator-generated failure shard.
+
+    Used ONLY when the coordinator terminates a task (timeout, budget
+    exceeded) and must record the failure record itself because the
+    worker never finished.  The slug is computed by :func:`_slugify`
+    from the task name — deterministic, no LLM involvement.
+
+    For normal worker output, use :func:`canonical_execution_path`.
 
     Returns:
         ``phases/{phase}/execution-{slug}.md`` where *slug* is the
@@ -45,163 +68,106 @@ def write_shard_path(milestone: str, phase: str, task: str) -> str:
     if not slug:
         raise ValueError(
             f"Task name {task!r} produces an empty slug; "
-            "cannot generate a valid shard path"
+            "cannot generate a valid failure shard path"
         )
     return f"phases/{phase}/execution-{slug}.md"
 
 
-def _parse_summary(content: str) -> dict[str, str]:
-    """Extract key-value pairs from a ``## Summary`` block.
+def _clean_stale_shards_in_dir(
+    phase_dir: Path,
+) -> tuple[list[Path], list[tuple[Path, OSError]]]:
+    """Internal sweeper: remove every ``execution-*.md`` in *phase_dir*.
 
-    Expects lines like ``status: completed`` immediately after the heading.
-    Stops at the first blank line or next heading.
-    """
-    result: dict[str, str] = {}
-    in_summary = False
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("## Summary"):
-            in_summary = True
-            continue
-        if in_summary:
-            if not stripped or stripped.startswith("#"):
-                break
-            if ":" in stripped:
-                key, _, value = stripped.partition(":")
-                result[key.strip()] = value.strip()
-    return result
-
-
-def _aggregate_summaries(
-    summaries: list[dict[str, str]],
-) -> str:
-    """Build a merged Summary section from individual shard summaries.
-
-    Aggregates numeric task counts and collects non-``none`` failures/blockers.
-    Status is ``completed`` only if all shards are completed; ``failed`` if
-    any failed; otherwise ``in_progress``.
-    """
-    total = 0
-    completed = 0
-    failed = 0
-    in_progress = 0
-    failures: list[str] = []
-    blockers: list[str] = []
-
-    for s in summaries:
-        # Parse the "tasks" line: "N total, N completed, ..."
-        tasks_line = s.get("tasks", "")
-        for part in tasks_line.split(","):
-            part = part.strip()
-            if "total" in part:
-                total += _extract_int(part)
-            elif "completed" in part:
-                completed += _extract_int(part)
-            elif "failed" in part:
-                failed += _extract_int(part)
-            elif "in_progress" in part:
-                in_progress += _extract_int(part)
-
-        f = s.get("failures", "none")
-        if f and f != "none":
-            failures.append(f)
-
-        b = s.get("blockers", "none")
-        if b and b != "none":
-            blockers.append(b)
-
-    # Derive aggregate status.
-    if failed > 0:
-        status = "failed"
-    elif completed == total and total > 0:
-        status = "completed"
-    else:
-        status = "in_progress"
-
-    failures_str = "; ".join(failures) if failures else "none"
-    blockers_str = "; ".join(blockers) if blockers else "none"
-
-    return (
-        f"## Summary\n"
-        f"status: {status}\n"
-        f"tasks: {total} total, {completed} completed, "
-        f"{failed} failed, {in_progress} in_progress\n"
-        f"failures: {failures_str}\n"
-        f"blockers: {blockers_str}\n"
-    )
-
-
-def _extract_int(s: str) -> int:
-    """Extract the first integer from a string, defaulting to 0."""
-    m = re.search(r"\d+", s)
-    return int(m.group()) if m else 0
-
-
-def merge_shards(milestone_dir: Path, phase: str) -> str:
-    """Merge all execution shard files in a phase directory.
-
-    Reads all ``execution-*.md`` files, concatenates them into a unified
-    document with an aggregated Summary section followed by per-task
-    sections.
-
-    Args:
-        milestone_dir: Absolute path to the milestone directory
-            (e.g. ``/project/.clou/milestones/17-foo``).
-        phase: Phase slug (e.g. ``shard-infrastructure``).
+    Per-file error isolation — one unlink failure does NOT abort the
+    sweep.  Symlinks are refused as defense-in-depth (a ``.clou/`` symlink
+    shouldn't exist, but if one does, dereferencing it on unlink would
+    remove the target rather than the orphan).
 
     Returns:
-        Merged content as a string.  Empty string if no shards exist.
-        If only one shard exists, returns it as-is (no merge overhead).
+        Tuple ``(removed, failed)`` where *removed* is the list of
+        deleted paths and *failed* is a list of ``(path, exception)``
+        tuples for shards that could not be removed.
     """
-    phase_dir = milestone_dir / "phases" / phase
+    removed: list[Path] = []
+    failed: list[tuple[Path, OSError]] = []
     if not phase_dir.is_dir():
-        return ""
-
-    shards = sorted(phase_dir.glob("execution-*.md"))
-    if not shards:
-        return ""
-
-    if len(shards) == 1:
-        return shards[0].read_text(encoding="utf-8")
-
-    # Multiple shards -- merge.
-    summaries: list[dict[str, str]] = []
-    bodies: list[str] = []
-
-    for shard_path in shards:
-        content = shard_path.read_text(encoding="utf-8")
-        summary = _parse_summary(content)
-        summaries.append(summary)
-
-        # Extract the task name from the filename: execution-{task}.md
-        task_name = shard_path.stem.removeprefix("execution-")
-        bodies.append(f"---\n### Shard: {task_name}\n\n{content}")
-
-    header = _aggregate_summaries(summaries)
-    return header + "\n" + "\n".join(bodies) + "\n"
+        return removed, failed
+    for shard in sorted(phase_dir.glob("execution-*.md")):
+        if shard.is_symlink():
+            failed.append((
+                shard,
+                OSError(f"refusing to unlink symlink: {shard}"),
+            ))
+            continue
+        try:
+            shard.unlink()
+        except OSError as exc:
+            failed.append((shard, exc))
+            continue
+        removed.append(shard)
+    return removed, failed
 
 
 def clean_stale_shards(milestone_dir: Path, phase: str) -> list[Path]:
-    """Remove stale execution shard files from a phase directory.
+    """Remove stale ``execution-*.md`` shard files from a phase directory.
 
-    Deletes all ``execution-*.md`` files (shards from a previous cycle)
-    while leaving ``execution.md`` untouched.  Intended to be called by the
-    coordinator before dispatching a new gather() group so that only
-    current-cycle shards are present when merge runs.
+    Deletes every ``execution-*.md`` file (shards from a previous cycle,
+    or orphans from an earlier topology) while leaving the canonical
+    ``execution.md`` untouched.  Per-file failures are swallowed and
+    the function returns the list of successfully removed paths —
+    callers who need failure visibility should use
+    :func:`clean_stale_shards_for_layer`, which surfaces them.
 
     Args:
         milestone_dir: Absolute path to the milestone directory.
         phase: Phase slug.
 
     Returns:
-        List of paths that were removed (for logging/diagnostics).
+        List of paths that were removed.
     """
-    phase_dir = milestone_dir / "phases" / phase
-    if not phase_dir.is_dir():
-        return []
-
-    removed: list[Path] = []
-    for shard in sorted(phase_dir.glob("execution-*.md")):
-        shard.unlink()
-        removed.append(shard)
+    removed, _failed = _clean_stale_shards_in_dir(
+        milestone_dir / "phases" / phase,
+    )
     return removed
+
+
+def clean_stale_shards_for_layer(
+    milestone_dir: Path,
+    phase_names: list[str],
+) -> tuple[dict[str, list[Path]], dict[str, list[tuple[Path, OSError]]]]:
+    """Clean stale shards across every phase in a DAG layer.
+
+    The prior single-phase cleanup was called against
+    ``checkpoint.current_phase`` only — which for gather() layers
+    containing multiple functions in parallel left the other phases'
+    orphan shards in place.  This iterates every phase in the active
+    layer, closing that gap.  Per-file failures are isolated: one
+    un-unlinkable shard does not prevent others from being cleaned.
+
+    Args:
+        milestone_dir: Absolute path to the milestone directory.
+        phase_names: Phase slugs in the layer to sweep.
+
+    Returns:
+        Tuple ``(removed, failed)``:
+
+        * ``removed`` — mapping phase → list of deleted paths.  Phases
+          with nothing to clean are omitted.
+        * ``failed``  — mapping phase → list of ``(path, exception)``
+          pairs for shards that could not be removed (permission,
+          symlink refusal, transient filesystem error).  Phases with
+          no failures are omitted.  Callers should surface these at
+          least as warnings — silent cleanup failure was a root cause
+          of the slug-drift class of bug.
+    """
+    removed: dict[str, list[Path]] = {}
+    failed: dict[str, list[tuple[Path, OSError]]] = {}
+    for phase in phase_names:
+        phase_removed, phase_failed = _clean_stale_shards_in_dir(
+            milestone_dir / "phases" / phase,
+        )
+        if phase_removed:
+            removed[phase] = phase_removed
+        if phase_failed:
+            failed[phase] = phase_failed
+    return removed, failed

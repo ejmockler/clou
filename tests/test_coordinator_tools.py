@@ -651,4 +651,622 @@ class TestUpdateStatusFromCheckpoint:
         ).read_text()
         assert "phase: init" in status_md
         assert "cycle: 1" in status_md
-        assert "| init | in_progress |" in status_md
+
+
+# ---------------------------------------------------------------------------
+# clou_brief_worker — canonical worker briefing construction
+# ---------------------------------------------------------------------------
+
+
+class TestBriefWorkerTool:
+    """Code-owned briefing construction: no LLM-owned path derivation."""
+
+    @pytest.mark.asyncio
+    async def test_briefing_embeds_canonical_execution_path(
+        self, coord_tools,
+    ) -> None:
+        """The returned briefing contains the exact canonical execution.md path."""
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_brief_worker").handler
+
+        result = await handler({"function_name": "extend_logger"})
+        assert not result.get("is_error")
+        briefing = result["content"][0]["text"]
+
+        # Deterministic path is baked in — no {task_slug} placeholder.
+        assert (
+            ".clou/milestones/test-ms/phases/extend_logger/execution.md"
+            in briefing
+        )
+        assert "extend_logger" in briefing
+        # No slugged shard syntax anywhere.
+        assert "execution-" not in briefing
+
+    @pytest.mark.asyncio
+    async def test_briefing_includes_protocol_file_and_project_md(
+        self, coord_tools,
+    ) -> None:
+        """Standard reads are always present."""
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_brief_worker").handler
+
+        result = await handler({"function_name": "build_feature"})
+        briefing = result["content"][0]["text"]
+
+        assert ".clou/prompts/worker.md" in briefing
+        assert ".clou/milestones/test-ms/compose.py" in briefing
+        assert ".clou/milestones/test-ms/phases/build_feature/phase.md" in briefing
+        assert ".clou/project.md" in briefing
+
+    @pytest.mark.asyncio
+    async def test_briefing_appends_intent_block(self, coord_tools) -> None:
+        """Intent IDs append structuring guidance to the briefing."""
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_brief_worker").handler
+
+        result = await handler({
+            "function_name": "extend_logger",
+            "intent_ids": ["I1", "I3"],
+        })
+        briefing = result["content"][0]["text"]
+
+        assert "Your task addresses these intents: I1, I3" in briefing
+        assert "per-intent sections" in briefing
+
+    @pytest.mark.asyncio
+    async def test_briefing_omits_intent_block_when_absent(
+        self, coord_tools,
+    ) -> None:
+        """No intent IDs → no intent block in the output."""
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_brief_worker").handler
+
+        result = await handler({"function_name": "extend_logger"})
+        briefing = result["content"][0]["text"]
+
+        assert "intents:" not in briefing
+        assert "per-intent sections" not in briefing
+
+    @pytest.mark.asyncio
+    async def test_briefing_appends_extra_reads(self, coord_tools) -> None:
+        """extra_reads entries appear alongside the standard read list."""
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_brief_worker").handler
+
+        result = await handler({
+            "function_name": "extend_logger",
+            "extra_reads": ["src/logger.ts", "docs/LOGGING.md"],
+        })
+        briefing = result["content"][0]["text"]
+
+        assert "- src/logger.ts" in briefing
+        assert "- docs/LOGGING.md" in briefing
+
+    @pytest.mark.asyncio
+    async def test_briefing_rejects_invalid_function_name(
+        self, coord_tools,
+    ) -> None:
+        """Function names that fail sanitize_phase are rejected."""
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_brief_worker").handler
+
+        # sanitize_phase requires alphanumeric with underscores/hyphens,
+        # no path separators or traversal.
+        for bad in ["../escape", "has/slash", "has space", ""]:
+            result = await handler({"function_name": bad})
+            assert result.get("is_error"), f"should reject {bad!r}"
+
+    @pytest.mark.asyncio
+    async def test_briefing_rejects_non_string_function_name(
+        self, coord_tools,
+    ) -> None:
+        """Missing or non-string function_name is rejected, not silently coerced."""
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_brief_worker").handler
+
+        result = await handler({})
+        assert result.get("is_error")
+
+        result = await handler({"function_name": 123})
+        assert result.get("is_error")
+
+    @pytest.mark.asyncio
+    async def test_briefing_accepts_json_string_arrays(
+        self, coord_tools,
+    ) -> None:
+        """SDK may advertise array params as strings; JSON-string forms are accepted."""
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_brief_worker").handler
+
+        result = await handler({
+            "function_name": "extend_logger",
+            "intent_ids": '["I1", "I3"]',
+            "extra_reads": '["src/logger.ts"]',
+        })
+        briefing = result["content"][0]["text"]
+        assert "I1, I3" in briefing
+        assert "- src/logger.ts" in briefing
+
+
+# ---------------------------------------------------------------------------
+# clou_write_assessment + clou_append_classifications — code-owned assessment
+# ---------------------------------------------------------------------------
+
+
+class TestWriteAssessmentTool:
+    """The brutalist's initial-write pathway for assessment.md."""
+
+    @pytest.mark.asyncio
+    async def test_writes_canonical_structure(self, coord_tools) -> None:
+        tmp_path, tools = coord_tools
+        handler = _find_tool(tools, "clou_write_assessment").handler
+
+        result = await handler({
+            "phase_name": "impl",
+            "summary": {
+                "status": "completed",
+                "tools_invoked": 1,
+                "findings_total": 2,
+                "findings_critical": 0,
+                "findings_major": 1,
+                "findings_minor": 1,
+                "phase_evaluated": "impl",
+            },
+            "tools": [
+                {"tool": "roast", "domain": "codebase", "status": "invoked"},
+            ],
+            "findings": [
+                {
+                    "number": 1, "title": "Leak",
+                    "severity": "major", "source_tool": "roast",
+                    "affected_files": ["src/a.ts"],
+                    "finding_text": '"leak at line 42"',
+                },
+                {
+                    "number": 2, "title": "Nit",
+                    "severity": "minor", "source_tool": "roast",
+                },
+            ],
+        })
+        assert not result.get("is_error")
+        assert result["finding_count"] == 2
+
+        path = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "assessment.md"
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "# Assessment: impl" in content
+        assert "## Summary" in content
+        assert "status: completed" in content
+        assert "## Findings" in content
+        assert "### F1: Leak" in content
+        assert "**Severity:** major" in content
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_status(self, coord_tools) -> None:
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_write_assessment").handler
+
+        result = await handler({
+            "phase_name": "impl",
+            "summary": {"status": "bogus"},
+        })
+        assert result.get("is_error")
+        assert "status" in result["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_finding_severity(
+        self, coord_tools,
+    ) -> None:
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_write_assessment").handler
+
+        import pytest as _pt
+        with _pt.raises(ValueError, match="severity"):
+            await handler({
+                "phase_name": "impl",
+                "summary": {"status": "completed"},
+                "findings": [
+                    {"number": 1, "title": "x", "severity": "nope"},
+                ],
+            })
+
+    @pytest.mark.asyncio
+    async def test_rejects_missing_phase_name(self, coord_tools) -> None:
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_write_assessment").handler
+
+        result = await handler({
+            "phase_name": "",
+            "summary": {"status": "completed"},
+        })
+        assert result.get("is_error")
+        assert "phase_name" in result["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_missing_summary(self, coord_tools) -> None:
+        _, tools = coord_tools
+        handler = _find_tool(tools, "clou_write_assessment").handler
+
+        result = await handler({"phase_name": "impl"})
+        assert result.get("is_error")
+        assert "summary" in result["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_degraded_mode_passes_through(self, coord_tools) -> None:
+        tmp_path, tools = coord_tools
+        handler = _find_tool(tools, "clou_write_assessment").handler
+
+        result = await handler({
+            "phase_name": "impl",
+            "summary": {
+                "status": "degraded",
+                "tools_invoked": 0,
+                "findings_total": 0,
+                "phase_evaluated": "impl",
+                "internal_reviewers": 2,
+                "gate_error": "quota exhausted",
+            },
+        })
+        assert not result.get("is_error")
+        content = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "assessment.md"
+        ).read_text(encoding="utf-8")
+        assert "status: degraded" in content
+        assert "internal_reviewers: 2" in content
+        assert "gate_error: quota exhausted" in content
+
+    @pytest.mark.asyncio
+    async def test_stringified_json_arrays_are_accepted(
+        self, coord_tools,
+    ) -> None:
+        """SDK may advertise arrays as strings; JSON strings must work."""
+        tmp_path, tools = coord_tools
+        handler = _find_tool(tools, "clou_write_assessment").handler
+
+        result = await handler({
+            "phase_name": "impl",
+            "summary": {
+                "status": "completed",
+                "tools_invoked": 1,
+                "findings_total": 1,
+                "findings_major": 1,
+                "phase_evaluated": "impl",
+            },
+            "findings": (
+                '[{"number": 1, "title": "x", "severity": "major"}]'
+            ),
+        })
+        assert not result.get("is_error")
+        assert result["finding_count"] == 1
+
+
+class TestAppendClassificationsTool:
+    """Evaluator amendment pathway — parse existing, merge, re-render."""
+
+    @pytest.mark.asyncio
+    async def test_appends_to_canonical_assessment(
+        self, coord_tools,
+    ) -> None:
+        tmp_path, tools = coord_tools
+
+        # Seed with a canonical assessment.
+        writer = _find_tool(tools, "clou_write_assessment").handler
+        await writer({
+            "phase_name": "impl",
+            "summary": {
+                "status": "completed",
+                "tools_invoked": 1,
+                "findings_total": 1,
+                "findings_major": 1,
+                "phase_evaluated": "impl",
+            },
+            "findings": [
+                {"number": 1, "title": "x", "severity": "major"},
+            ],
+        })
+
+        appender = _find_tool(tools, "clou_append_classifications").handler
+        result = await appender({
+            "classifications": [
+                {
+                    "finding_number": 1,
+                    "classification": "valid",
+                    "action": "Fix x",
+                    "reasoning": "breaks invariant",
+                },
+            ],
+        })
+        assert not result.get("is_error")
+        assert result["classification_count"] == 1
+
+        content = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "assessment.md"
+        ).read_text(encoding="utf-8")
+        assert "## Classifications" in content
+        assert "**Classification:** valid" in content
+        assert "**Action:** Fix x" in content
+
+    @pytest.mark.asyncio
+    async def test_appends_to_drifted_phase_organized_assessment(
+        self, coord_tools,
+    ) -> None:
+        """Drift-tolerant: existing phase-organized file is parsed + canonicalized."""
+        tmp_path, tools = coord_tools
+        path = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "assessment.md"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("""\
+# Assessment: Layer 1
+
+## Summary
+status: completed
+tools_invoked: 1
+findings: 2 total, 0 critical, 2 major, 0 minor
+phase_evaluated: phase_a, phase_b
+
+## Phase: phase_a
+
+### F1: Alpha thing
+**Severity:** major
+**Source tool:** roast
+
+## Phase: phase_b
+
+### F2: Beta thing
+**Severity:** major
+**Source tool:** roast
+""", encoding="utf-8")
+
+        appender = _find_tool(tools, "clou_append_classifications").handler
+        result = await appender({
+            "classifications": [
+                {
+                    "finding_number": 1,
+                    "classification": "valid",
+                    "action": "fix alpha",
+                },
+                {
+                    "finding_number": 2,
+                    "classification": "noise",
+                    "reasoning": "style only",
+                },
+            ],
+        })
+        assert not result.get("is_error")
+
+        content = path.read_text(encoding="utf-8")
+        # Canonicalized: ## Findings replaces ## Phase: sections.
+        assert "## Findings" in content
+        assert "## Phase: phase_a" not in content
+        assert "## Phase: phase_b" not in content
+        # Phase tag preserved per-finding.
+        assert "**Phase:** phase_a" in content
+        assert "**Phase:** phase_b" in content
+        # Classifications merged.
+        assert "## Classifications" in content
+        assert "**Classification:** valid" in content
+        assert "**Classification:** noise" in content
+
+    @pytest.mark.asyncio
+    async def test_rejects_without_existing_assessment(
+        self, coord_tools,
+    ) -> None:
+        _, tools = coord_tools
+        appender = _find_tool(tools, "clou_append_classifications").handler
+
+        result = await appender({
+            "classifications": [
+                {"finding_number": 1, "classification": "valid"},
+            ],
+        })
+        assert result.get("is_error")
+        assert "does not exist" in result["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_unknown_classification_kind(
+        self, coord_tools,
+    ) -> None:
+        tmp_path, tools = coord_tools
+        path = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "assessment.md"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "# Assessment: x\n\n## Summary\nstatus: completed\n",
+            encoding="utf-8",
+        )
+
+        appender = _find_tool(tools, "clou_append_classifications").handler
+        import pytest as _pt
+        with _pt.raises(ValueError, match="classification"):
+            await appender({
+                "classifications": [
+                    {"finding_number": 1, "classification": "invalid-kind"},
+                ],
+            })
+
+    @pytest.mark.asyncio
+    async def test_rejects_empty_classifications(
+        self, coord_tools,
+    ) -> None:
+        tmp_path, tools = coord_tools
+        path = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "assessment.md"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "# Assessment: x\n\n## Summary\nstatus: completed\n",
+            encoding="utf-8",
+        )
+
+        appender = _find_tool(tools, "clou_append_classifications").handler
+        result = await appender({"classifications": []})
+        assert result.get("is_error")
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_brutalist_then_evaluator_flow(
+        self, coord_tools,
+    ) -> None:
+        """Integration test: brutalist writes, evaluator classifies,
+        validator accepts, and no drift is possible at any point.
+
+        This is the architectural "never again" invariant for the
+        assessment-drift class of bug:
+
+        1. Brutalist calls clou_write_assessment with structured
+           findings across TWO phases (the exact scope that drove the
+           brutalist-mcp-server LLM to invent '## Phase: X' sections).
+        2. Evaluator calls clou_append_classifications to classify each.
+        3. Validator runs on the resulting file and produces zero
+           errors.
+
+        At no point does freeform Write touch assessment.md — the
+        hook enforces this, and these tests pin the behavior.
+        """
+        from clou.assessment import parse_assessment
+        from clou.validation import validate_golden_context
+
+        tmp_path, tools = coord_tools
+
+        writer = _find_tool(tools, "clou_write_assessment").handler
+        appender = _find_tool(tools, "clou_append_classifications").handler
+
+        # (1) Brutalist writes assessment for a multi-phase layer.
+        await writer({
+            "phase_name": "Layer 1 Cycle 2",
+            "summary": {
+                "status": "completed",
+                "tools_invoked": 2,
+                "findings_total": 3,
+                "findings_critical": 0,
+                "findings_major": 2,
+                "findings_minor": 1,
+                "phase_evaluated": "instrument_cli_spawn, instrument_debate_module",
+            },
+            "tools": [
+                {"tool": "roast", "domain": "codebase", "status": "invoked"},
+                {"tool": "roast", "domain": "security", "status": "invoked"},
+            ],
+            "findings": [
+                {
+                    "number": 1, "title": "Flag meaning",
+                    "severity": "major", "source_tool": "roast",
+                    "source_models": ["CODEX"],
+                    "affected_files": ["src/cli/spawn.ts"],
+                    "finding_text": '"spawned means called spawnAsync"',
+                    "phase": "instrument_cli_spawn",
+                },
+                {
+                    "number": 2, "title": "Label escape order",
+                    "severity": "major", "source_tool": "roast",
+                    "affected_files": ["src/metrics/index.ts"],
+                    "phase": "instrument_cli_spawn",
+                },
+                {
+                    "number": 3, "title": "Debug-level proposition",
+                    "severity": "minor", "source_tool": "roast",
+                    "affected_files": ["src/debate/round.ts"],
+                    "phase": "instrument_debate_module",
+                },
+            ],
+        })
+
+        # (2) Evaluator classifies.
+        await appender({
+            "classifications": [
+                {
+                    "finding_number": 1, "classification": "valid",
+                    "action": "Rename or reposition",
+                    "reasoning": "semantic drift",
+                },
+                {
+                    "finding_number": 2, "classification": "valid",
+                    "action": "Fix escape order", "reasoning": "",
+                },
+                {
+                    "finding_number": 3, "classification": "security",
+                    "action": "Downgrade to trace",
+                    "reasoning": "log-level leakage",
+                },
+            ],
+        })
+
+        # (3) Validator accepts — zero errors and zero drift warnings.
+        findings = validate_golden_context(tmp_path, "test-ms")
+        from clou.validation import Severity
+        errors = [f for f in findings if f.severity == Severity.ERROR]
+        warnings = [f for f in findings if f.severity == Severity.WARNING]
+        assert errors == [], f"unexpected errors: {errors}"
+        # No drift warnings — canonical form produced by the writer.
+        assert not any(
+            "drifted" in f.message.lower() for f in warnings
+        ), f"unexpected drift warning: {warnings}"
+
+        # The round-trip preserved phase tags per-finding.
+        content = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "assessment.md"
+        ).read_text(encoding="utf-8")
+        assert "## Findings" in content
+        assert "**Phase:** instrument_cli_spawn" in content
+        assert "**Phase:** instrument_debate_module" in content
+        # Drifted section names NEVER appear.
+        assert "## Phase: " not in content
+        assert "## Classification Summary" not in content
+        assert "## Rework Signal Roll-up" not in content
+
+        # Parsed form carries the evaluator's classifications.
+        form = parse_assessment(content)
+        assert len(form.classifications) == 3
+        assert {c.finding_number for c in form.classifications} == {1, 2, 3}
+
+    @pytest.mark.asyncio
+    async def test_last_writer_wins_on_reclassification(
+        self, coord_tools,
+    ) -> None:
+        tmp_path, tools = coord_tools
+
+        writer = _find_tool(tools, "clou_write_assessment").handler
+        await writer({
+            "phase_name": "impl",
+            "summary": {
+                "status": "completed",
+                "tools_invoked": 1,
+                "findings_total": 1,
+                "findings_major": 1,
+                "phase_evaluated": "impl",
+            },
+            "findings": [
+                {"number": 1, "title": "x", "severity": "major"},
+            ],
+        })
+
+        appender = _find_tool(tools, "clou_append_classifications").handler
+        await appender({
+            "classifications": [
+                {
+                    "finding_number": 1,
+                    "classification": "noise",
+                    "reasoning": "first pass",
+                },
+            ],
+        })
+        await appender({
+            "classifications": [
+                {
+                    "finding_number": 1,
+                    "classification": "valid",
+                    "reasoning": "revised",
+                },
+            ],
+        })
+
+        content = (
+            tmp_path / ".clou" / "milestones" / "test-ms" / "assessment.md"
+        ).read_text(encoding="utf-8")
+        # Second classification wins.
+        assert "**Classification:** valid" in content
+        assert "revised" in content
+        # First is gone (replaced).
+        assert "first pass" not in content

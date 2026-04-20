@@ -55,7 +55,12 @@ WRITE_PERMISSIONS: dict[str, list[str]] = {
     ],
     "worker": [
         "milestones/*/phases/*/execution.md",
-        "milestones/*/phases/*/execution-*.md",
+        # execution-*.md is intentionally absent.  Those are
+        # coordinator-generated failure shards, written in-process by
+        # Python (bypassing the hook).  Granting workers permission to
+        # write them was a live drift vector: a worker with stale
+        # briefing could freeform a slug and the hook would allow it,
+        # reintroducing the slug-drift class of bug.
     ],
     "verifier": [
         "milestones/*/phases/verification/execution.md",
@@ -63,22 +68,38 @@ WRITE_PERMISSIONS: dict[str, list[str]] = {
         "milestones/*/handoff.md",
     ],
     "brutalist": [
-        "milestones/*/assessment.md",
+        # assessment.md intentionally absent — writes go through
+        # clou_write_assessment so code owns structure (no freeform
+        # ## Phase: X / ## Classification Summary section drift).
     ],
     "assess-evaluator": [
-        "milestones/*/assessment.md",
+        # assessment.md intentionally absent — classifications go
+        # through clou_append_classifications.  decisions.md stays
+        # freeform (narrative prose, no structural validation).
         "milestones/*/decisions.md",
     ],
 }
 
 _WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit"})
 
-# Heuristic patterns for detecting Bash commands that write to .clou/ paths.
-# These close the gap where shell redirects bypass Write/Edit hook enforcement.
+# Heuristic patterns for detecting Bash commands that mutate .clou/ paths.
+# These close the gap where shell redirects and polyglot interpreters bypass
+# Write/Edit hook enforcement.  Not a sandbox — a motivated caller can still
+# craft a bypass — but defense-in-depth against the common mutation surfaces.
+# The MCP tool clou_remove_artifact is the blessed deletion pathway for
+# supervisors; all other tiers rely on Write/Edit for any .clou/ mutation.
+#
+# ``\.clou\b`` matches ``.clou``, ``.clou/``, ``.clou/foo``, but NOT
+# ``.cloud`` / ``.cloudy`` / etc., so we catch bare-directory operations
+# (``rm -rf .clou``) as well as path-prefixed ones.
 _BASH_CLOU_WRITE_RE = re.compile(
-    r">{1,2}\s*\S*\.clou/"                    # redirect to .clou/
-    r"|\b(?:tee|mv|rm|cp|chmod|touch|install|dd)\b.*\.clou/"  # file-mutating commands
-    r"|\bsed\b.*-i.*\.clou/",                 # sed in-place
+    r">{1,2}\s*\S*\.clou\b"                            # redirect to .clou[...]
+    r"|\b(?:tee|mv|rm|cp|chmod|touch|install|dd|ln|rsync|tar|xargs)\b.*\.clou\b"  # file-mutating + extractors (verb before .clou)
+    r"|\bcd\b.*\.clou\b"                               # cd into .clou (relative mutations evade path-based check)
+    r"|\.clou\b.*\|.*\b(?:xargs|tee)\b"                # .clou ... | xargs/tee (pipeline deletion)
+    r"|\bsed\b.*-i.*\.clou\b"                          # sed in-place
+    r"|\bfind\b.*\.clou\b.*-(?:delete|exec)\b"         # find -delete / find -exec
+    r"|\b(?:python|python3|python2|node|nodejs|perl|ruby|bun|deno)\b.*\.clou\b",  # interpreters
 )
 
 
@@ -544,6 +565,90 @@ def is_cleanup_allowed(relative_path: str) -> bool:
     if "/" in relative_path or "\\" in relative_path:
         return False
     return any(fnmatch.fnmatch(relative_path, pat) for pat in CLEANUP_SCOPE)
+
+
+# ---------------------------------------------------------------------------
+# Supervisor cleanup scope — intermediate artifacts the supervisor may
+# remove via the clou_remove_artifact MCP tool.
+#
+# Distinct from CLEANUP_SCOPE (orchestrator / root-level) and from
+# WRITE_PERMISSIONS (write-auth ≠ delete-auth).  Protocol artifacts —
+# milestone.md, intents.md, requirements.md, compose.py, status.md,
+# handoff.md, decisions.md, phase.md, and root-level golden context —
+# are deliberately out of scope: they encode decisions and history that
+# must remain immutable.
+# ---------------------------------------------------------------------------
+
+SUPERVISOR_CLEANUP_SCOPE: tuple[str, ...] = (
+    "milestones/*/phases/*/execution.md",       # worker execution (default)
+    "milestones/*/phases/*/execution-*.md",     # worker execution (parallel)
+    "milestones/*/phases/*/artifacts/*",        # verifier artifacts
+    "milestones/*/assessment.md",               # brutalist report (supersedable)
+    "milestones/*/escalations/*.md",            # stale escalations
+)
+
+
+def _strict_segment_match(path: str, pattern: str) -> bool:
+    """Left-anchored, segment-aware glob match.
+
+    Unlike :func:`fnmatch.fnmatch`, this treats ``*`` as matching a
+    single path component (no ``/`` crossing).  Unlike
+    ``PurePosixPath.match`` (which is right-anchored and lets prefix
+    components slip in), this is left-anchored: segment counts must
+    be equal, and every segment must match its corresponding pattern
+    segment.
+    """
+    p_parts = path.split("/")
+    pat_parts = pattern.split("/")
+    if len(p_parts) != len(pat_parts):
+        return False
+    return all(
+        fnmatch.fnmatchcase(pp, patp)
+        for pp, patp in zip(p_parts, pat_parts)
+    )
+
+
+def supervisor_cleanup_allowed(relative_path: str) -> bool:
+    """Check if a path is within the supervisor's cleanup scope.
+
+    Args:
+        relative_path: Path relative to ``.clou/`` (e.g.,
+            ``"milestones/foo/phases/bar/execution-baz.md"``).
+
+    Returns:
+        True if the path matches :data:`SUPERVISOR_CLEANUP_SCOPE`.
+
+    Uses :func:`_strict_segment_match` for left-anchored, segment-aware
+    globbing — ``*`` matches a single path component, and prefix
+    components cannot sneak a path into scope.  Example:
+    ``archive/milestones/m1/assessment.md`` does NOT match
+    ``milestones/*/assessment.md`` (prefix ``archive/``);
+    ``milestones/m1/deep/nested/assessment.md`` does NOT match
+    (too many segments).  This keeps the scope tight against future
+    artifact-layout evolution (``.clou/archive/``, etc.).
+
+    Unlike :func:`is_cleanup_allowed`, nested paths are permitted —
+    intermediate artifacts live inside milestone subdirectories.
+    Callers must resolve paths absolutely and confirm ``.clou/``
+    containment before invoking this helper; ``..`` segments and
+    backslash separators are rejected defensively here too.
+    """
+    if not relative_path:
+        return False
+    if "\\" in relative_path:
+        return False
+    parts = relative_path.split("/")
+    if ".." in parts:
+        return False
+    # Reject empty segments (leading /, trailing /, consecutive //).
+    # fnmatch("", "*") is True, so without this an empty segment in a
+    # malformed path slips into scope.
+    if "" in parts:
+        return False
+    return any(
+        _strict_segment_match(relative_path, pat)
+        for pat in SUPERVISOR_CLEANUP_SCOPE
+    )
 
 
 def build_hooks(

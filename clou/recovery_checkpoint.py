@@ -535,7 +535,12 @@ def determine_next_cycle(
                 replan_set.append(
                     f"phases/{checkpoint.current_phase}/execution.md"
                 )
-                # Include execution shards for gather() groups.
+                # Include any coordinator-generated failure shards
+                # (``execution-{slug}.md``).  Post-remolding, these are
+                # the only shard files that should exist — worker success
+                # paths all converge on the canonical ``execution.md``.
+                # Recovery surfaces them so the next ASSESS sees the
+                # failure context.
                 milestone_dir = checkpoint_path.parent.parent
                 phase_dir = milestone_dir / "phases" / checkpoint.current_phase
                 if phase_dir.is_dir():
@@ -565,7 +570,12 @@ def determine_next_cycle(
                         assess_read.append(
                             f"phases/{task_name}/execution.md"
                         )
-                        # Include execution shards for gather() groups.
+                        # Include any coordinator-generated failure shards
+                # (``execution-{slug}.md``).  Post-remolding, these are
+                # the only shard files that should exist — worker success
+                # paths all converge on the canonical ``execution.md``.
+                # Recovery surfaces them so the next ASSESS sees the
+                # failure context.
                         phase_dir = milestone_dir / "phases" / task_name
                         if phase_dir.is_dir():
                             for shard in sorted(phase_dir.glob("execution-*.md")):
@@ -580,7 +590,7 @@ def determine_next_cycle(
                 assess_read.append(
                     f"phases/{checkpoint.current_phase}/execution.md"
                 )
-            # Always glob shards for current phase (fallback covers no-compose case).
+            # Always glob failure shards for current phase (fallback covers no-compose case).
             cur_phase_dir = milestone_dir / "phases" / checkpoint.current_phase
             if cur_phase_dir.is_dir():
                 for shard in sorted(cur_phase_dir.glob("execution-*.md")):

@@ -54,7 +54,12 @@ from clou.harness import (
     load_template,
     read_template_name,
 )
-from clou.hooks import build_hooks, is_cleanup_allowed, to_sdk_hooks
+from clou.hooks import (
+    build_hooks,
+    is_cleanup_allowed,
+    supervisor_cleanup_allowed,
+    to_sdk_hooks,
+)
 from clou.prompts import load_prompt
 from clou.recovery import parse_obsolete_flags, run_lifecycle_pipeline
 from clou.gate import UserGate
@@ -589,6 +594,202 @@ def _build_mcp_server(
         return {"content": [{"type": "text", "text": text}]}
 
     @tool(
+        "clou_remove_artifact",
+        "Remove an intermediate artifact from .clou/. Use for orphaned "
+        "worker execution files, superseded brutalist assessments, "
+        "stale escalations, or obsolete verifier artifacts from aborted "
+        "or superseded runs. Protocol artifacts (milestone.md, "
+        "intents.md, requirements.md, compose.py, phase.md, status.md, "
+        "handoff.md, decisions.md, and root-level golden context) are "
+        "immutable — attempts to remove them are rejected. Every "
+        "removal is recorded (INFO log always; telemetry when the "
+        "telemetry pipeline is healthy).",
+        {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Path relative to .clou/ "
+                        "(e.g., 'milestones/foo/phases/bar/execution.md'). "
+                        "A leading '.clou/' is tolerated but stripped. "
+                        "Must resolve inside .clou/; traversal via .. "
+                        "is rejected."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Rationale for removal (free-form, up to 2048 "
+                        "characters). Recorded to the INFO log and, "
+                        "when available, to telemetry. Required — "
+                        "empty or whitespace-only reasons are rejected."
+                    ),
+                },
+            },
+            "required": ["path", "reason"],
+        },
+    )
+    async def remove_artifact_tool(args: dict[str, Any]) -> dict[str, Any]:
+        # Cap reason at a modest size — free-form but bounded to keep
+        # telemetry/logs from absorbing context-window dumps.
+        _MAX_REASON_LEN = 2048
+
+        path_arg = args.get("path", "")
+        reason = args.get("reason", "")
+
+        if not isinstance(path_arg, str) or not path_arg:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": "path must be a non-empty string",
+                }],
+                "is_error": True,
+            }
+        if not isinstance(reason, str) or not reason.strip():
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        "reason must be a non-empty string — describe "
+                        "why this artifact is being removed"
+                    ),
+                }],
+                "is_error": True,
+            }
+        if len(reason) > _MAX_REASON_LEN:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"reason exceeds {_MAX_REASON_LEN} characters "
+                        f"(got {len(reason)}); summarize the rationale"
+                    ),
+                }],
+                "is_error": True,
+            }
+
+        clou_dir = (project_dir / ".clou").resolve()
+        # Tolerate a leading '.clou/' so the LLM's copy-paste habits don't
+        # cause a false rejection; the canonical form is relative-to-.clou.
+        rel = path_arg
+        if rel.startswith(".clou/"):
+            rel = rel[len(".clou/"):]
+
+        # Check symlink-ness on the REQUESTED path, before resolve() —
+        # Path.resolve() dereferences symlinks, so is_symlink() on the
+        # resolved target is always False and would be dead code here.
+        requested = clou_dir / rel
+        if requested.is_symlink():
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"Refusing to follow symlink: .clou/{rel}"
+                    ),
+                }],
+                "is_error": True,
+            }
+
+        try:
+            target = requested.resolve()
+            relative = target.relative_to(clou_dir)
+        except (ValueError, OSError):
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"Path resolves outside .clou/: {path_arg!r}"
+                    ),
+                }],
+                "is_error": True,
+            }
+
+        rel_str = relative.as_posix()
+
+        if not supervisor_cleanup_allowed(rel_str):
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"Path {rel_str!r} is not in supervisor "
+                        "cleanup scope. Protocol artifacts "
+                        "(milestone.md, intents.md, requirements.md, "
+                        "compose.py, phase.md, status.md, handoff.md, "
+                        "decisions.md, root-level golden context) are "
+                        "immutable."
+                    ),
+                }],
+                "is_error": True,
+            }
+
+        if not target.exists():
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": f"File not found: .clou/{rel_str}",
+                }],
+                "is_error": True,
+            }
+        if not target.is_file():
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"Not a regular file: .clou/{rel_str} "
+                        "(directories are out of scope for V1)"
+                    ),
+                }],
+                "is_error": True,
+            }
+
+        try:
+            size = target.stat().st_size
+            target.unlink()
+        except OSError as exc:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"Failed to remove .clou/{rel_str}: {exc}"
+                    ),
+                }],
+                "is_error": True,
+            }
+
+        # Audit trail is best-effort: log at INFO regardless, attempt
+        # telemetry, and surface a warning if telemetry drops the event
+        # so the failure is at least visible in logs.
+        log.info(
+            "Supervisor removed .clou/%s (%d bytes): %s",
+            rel_str, size, reason,
+        )
+        try:
+            telemetry.event(
+                "supervisor.artifact_removed",
+                path=rel_str,
+                reason=reason,
+                bytes=size,
+            )
+        except Exception:
+            log.warning(
+                "Telemetry emission failed for artifact removal "
+                "(path=%s); log remains the audit of record",
+                rel_str,
+                exc_info=True,
+            )
+
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"Removed .clou/{rel_str} ({size} bytes). "
+                    "Reason recorded."
+                ),
+            }],
+        }
+
+    @tool(
         "ask_user",
         "Ask the user a question. The question text and choices are "
         "displayed by the tool — do NOT write the question in your "
@@ -642,6 +843,7 @@ def _build_mcp_server(
             status_tool,
             init_tool,
             create_milestone_tool,
+            remove_artifact_tool,
             ask_user_tool,
         ],
     )
@@ -737,6 +939,7 @@ async def run_supervisor(
             "mcp__clou__clou_status",
             "mcp__clou__clou_init",
             "mcp__clou__clou_create_milestone",
+            "mcp__clou__clou_remove_artifact",
         ],
     )
 

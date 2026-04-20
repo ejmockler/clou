@@ -89,7 +89,7 @@ from clou.validation import (
     validate_readiness,
     warnings_only,
 )
-from clou.shard import clean_stale_shards
+from clou.shard import clean_stale_shards_for_layer
 from clou import telemetry
 
 log = logging.getLogger("clou")
@@ -347,10 +347,10 @@ def _write_failure_shard(
         msg = f"Invalid phase: {phase!r} (must not contain '..' or '/')"
         raise ValueError(msg)
 
-    from clou.shard import write_shard_path
+    from clou.shard import failure_shard_path
 
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    rel_path = write_shard_path(milestone_dir.name, phase, task_name)
+    rel_path = failure_shard_path(milestone_dir.name, phase, task_name)
     shard_path = milestone_dir / rel_path
 
     impact_str = ", ".join(dependency_impact) if dependency_impact else "none"
@@ -1678,41 +1678,142 @@ async def _run_single_cycle(
     if _effective_timeout <= 0:
         _effective_timeout = float(_DEFAULT_TIMEOUT_SECONDS)
 
-    # Clean stale execution shards before dispatching a gather() group.
-    # Shards from a prior crashed cycle would confuse merge_shards if
-    # left in the phase directory.  Only activates when the DAG has >1
-    # task (potential gather group).
-    if len(_dag_task_names) > 1:
+    # Stale shard cleanup: ONLY at EXECUTE start, ONLY for the active layer.
+    #
+    # Scoping rationale:
+    #   * cycle_type == "EXECUTE" — ASSESS/VERIFY/REPLAN read coordinator-
+    #     generated failure shards (execution-{slug}.md from timeouts/budget
+    #     aborts) as evidence via :mod:`clou.recovery_checkpoint` and
+    #     :mod:`clou.precompose`.  Cleaning before those cycles would erase
+    #     the evidence mid-review.  Cleanup belongs at EXECUTE start,
+    #     immediately before new workers dispatch — by then, anything
+    #     left over from a prior cycle is genuinely stale.
+    #   * Layer scope, not DAG scope — sweeping every phase in the DAG
+    #     on every EXECUTE would erase legitimate failure shards from
+    #     already-completed upstream phases.  The sweep is bounded to
+    #     the co-layer of ``checkpoint.current_phase`` (or the entry
+    #     layer on first dispatch), which matches the set of workers
+    #     about to run.
+    _sanitized_phases: list[str] = []
+    if cycle_type == "EXECUTE" and _dag_task_names:
         try:
-            cp_path_pre = (
-                clou_dir / "milestones" / milestone
-                / "active" / "coordinator.md"
+            from clou.graph import compute_layers as _cl_compute_layers
+
+            _layers = _cl_compute_layers(
+                [{"name": n, "status": "pending"} for n in _dag_task_names],
+                _dag_deps,
             )
-            if cp_path_pre.exists():
-                _phase_for_clean = parse_checkpoint(
-                    cp_path_pre.read_text(encoding="utf-8")
-                ).current_phase
-                if _phase_for_clean:
-                    # F5: Lowercase-normalize and validate against
-                    # _PHASE_RE before passing to clean_stale_shards
-                    # (defense in depth, same pattern as line 924-927).
-                    _phase_for_clean = _phase_for_clean.lower()
-                    if not _PHASE_RE.match(_phase_for_clean):
-                        log.warning(
-                            "Stale shard cleanup skipped: invalid phase %r",
-                            _phase_for_clean,
-                        )
-                    else:
-                        ms_dir_pre = clou_dir / "milestones" / milestone
-                        removed = clean_stale_shards(ms_dir_pre, _phase_for_clean)
-                        if removed:
-                            log.info(
-                                "Cleaned %d stale shard(s) before dispatch: %s",
-                                len(removed),
-                                [str(p) for p in removed],
-                            )
         except Exception:
-            log.debug("Could not clean stale shards", exc_info=True)
+            _layers = []
+            log.debug(
+                "Layer computation failed; skipping stale shard cleanup",
+                exc_info=True,
+            )
+
+        # Determine the active phase from the checkpoint if present.
+        _active_phase: str | None = None
+        _cp_path_pre = (
+            clou_dir / "milestones" / milestone / "active" / "coordinator.md"
+        )
+        if _cp_path_pre.exists():
+            try:
+                _active_phase = parse_checkpoint(
+                    _cp_path_pre.read_text(encoding="utf-8"),
+                ).current_phase or None
+            except Exception:
+                _active_phase = None
+
+        # Pick the layer containing the active phase; fall back to
+        # the entry layer when there's no checkpoint (fresh start).
+        _active_layer: list[str] = []
+        if _layers:
+            if _active_phase:
+                _active_phase_lc = _active_phase.lower()
+                for _layer in _layers:
+                    if any(n.lower() == _active_phase_lc for n in _layer):
+                        _active_layer = list(_layer)
+                        break
+            if not _active_layer:
+                _active_layer = list(_layers[0])
+
+        # Sanitize: lowercase + _PHASE_RE validate each candidate phase.
+        for _name in _active_layer:
+            _normalized = _name.lower()
+            if _PHASE_RE.match(_normalized):
+                _sanitized_phases.append(_normalized)
+            else:
+                log.warning(
+                    "Stale shard cleanup skipped for invalid phase %r",
+                    _name,
+                )
+
+        if _sanitized_phases:
+            try:
+                ms_dir_pre = clou_dir / "milestones" / milestone
+                removed, cleanup_failures = clean_stale_shards_for_layer(
+                    ms_dir_pre, _sanitized_phases,
+                )
+            except Exception:
+                # Catastrophic failure in the helper itself (e.g. invalid
+                # milestone_dir).  Surface as a warning with telemetry —
+                # silent cleanup failure was the root cause of the
+                # slug-drift incident; treat every opacity as a bug.
+                log.warning(
+                    "Stale shard cleanup raised before sweeping",
+                    exc_info=True,
+                )
+                telemetry.event(
+                    "shard.cleanup_error",
+                    milestone=milestone,
+                    scope="helper_raised",
+                )
+            else:
+                total_removed = sum(len(paths) for paths in removed.values())
+                if total_removed:
+                    log.info(
+                        "Cleaned %d stale shard(s) across %d phase(s) "
+                        "before dispatch: %s",
+                        total_removed,
+                        len(removed),
+                        {
+                            phase: [str(p) for p in paths]
+                            for phase, paths in removed.items()
+                        },
+                    )
+                    telemetry.event(
+                        "shard.cleaned_stale",
+                        milestone=milestone,
+                        phase_count=len(removed),
+                        total_removed=total_removed,
+                    )
+                if cleanup_failures:
+                    # Per-file failures are NOT fatal — dispatch
+                    # continues — but they MUST be visible so a
+                    # filesystem permission issue or lingering symlink
+                    # doesn't silently keep orphans alive.
+                    failure_summary = {
+                        phase: [
+                            {"path": str(p), "error": str(exc)}
+                            for p, exc in fails
+                        ]
+                        for phase, fails in cleanup_failures.items()
+                    }
+                    total_failed = sum(
+                        len(fails) for fails in cleanup_failures.values()
+                    )
+                    log.warning(
+                        "Stale shard cleanup: %d shard(s) could not be "
+                        "removed across %d phase(s): %s",
+                        total_failed,
+                        len(cleanup_failures),
+                        failure_summary,
+                    )
+                    telemetry.event(
+                        "shard.cleanup_failed",
+                        milestone=milestone,
+                        phase_count=len(cleanup_failures),
+                        total_failed=total_failed,
+                    )
 
     try:
         async with ClaudeSDKClient(options=options) as coordinator:
@@ -2172,13 +2273,26 @@ async def _run_single_cycle(
                     # current_phase for backward compatibility.
                     _shard_phase = task_name or _fallback_phase
                     if _shard_phase:
-                        _write_failure_shard(
-                            ms_dir, _shard_phase,
-                            task_name, "timeout",
-                            f"Task terminated after {int(_effective_timeout)}s "
-                            f"idle (no coordinator progress)",
-                            impact,
-                        )
+                        # Lowercase-normalize and validate against
+                        # _PHASE_RE before _write_failure_shard
+                        # (same pattern as the budget-abort path at
+                        # line 1987-1998 — keeps the two failure-shard
+                        # sites symmetric on phase-name discipline).
+                        _shard_phase = _shard_phase.lower()
+                        if not _PHASE_RE.match(_shard_phase):
+                            log.warning(
+                                "Failure shard skipped (idle watchdog): "
+                                "invalid phase %r",
+                                _shard_phase,
+                            )
+                        else:
+                            _write_failure_shard(
+                                ms_dir, _shard_phase,
+                                task_name, "timeout",
+                                f"Task terminated after {int(_effective_timeout)}s "
+                                f"idle (no coordinator progress)",
+                                impact,
+                            )
 
                 if classification == "interrupted":
                     return "interrupted"

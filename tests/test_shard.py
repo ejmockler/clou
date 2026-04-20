@@ -1,42 +1,77 @@
-"""Tests for execution state sharding (clou/shard.py) and hook permissions."""
+"""Tests for execution artifact path derivation (clou/shard.py)."""
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
 
-from clou.hooks import WRITE_PERMISSIONS, build_hooks
-import pytest as _pytest_import  # for parametrize; pytest also imported by fixture
+import pytest as _pytest_import
 
+from clou.hooks import WRITE_PERMISSIONS, build_hooks
 from clou.shard import (
     _slugify,
+    canonical_execution_path,
     clean_stale_shards,
-    merge_shards,
-    write_shard_path,
+    clean_stale_shards_for_layer,
+    failure_shard_path,
 )
 
 
 # ---------------------------------------------------------------------------
-# write_shard_path
+# canonical_execution_path — the worker-success canonical path
 # ---------------------------------------------------------------------------
 
 
-def test_write_shard_path_basic() -> None:
-    """Simple task name produces the expected relative path."""
-    result = write_shard_path("17-runtime-safeguards", "shard-infrastructure", "build")
+def test_canonical_execution_path_returns_standard_shape() -> None:
+    """One ``execution.md`` per phase — no slug, no freeform."""
+    assert (
+        canonical_execution_path("set_coverage_thresholds")
+        == "phases/set_coverage_thresholds/execution.md"
+    )
+
+
+def test_canonical_execution_path_preserves_phase_casing() -> None:
+    """Phase names are passed through verbatim — validation is upstream."""
+    assert (
+        canonical_execution_path("Mixed_Case-Phase")
+        == "phases/Mixed_Case-Phase/execution.md"
+    )
+
+
+def test_canonical_execution_path_is_deterministic() -> None:
+    """Same phase name → same path, every time."""
+    a = canonical_execution_path("extend_logger")
+    b = canonical_execution_path("extend_logger")
+    assert a == b
+
+
+# ---------------------------------------------------------------------------
+# failure_shard_path — coordinator-generated failure records only
+# ---------------------------------------------------------------------------
+
+
+def test_failure_shard_path_basic() -> None:
+    """Simple task name produces a deterministic slugified path."""
+    result = failure_shard_path(
+        "17-runtime-safeguards", "shard-infrastructure", "build",
+    )
     assert result == "phases/shard-infrastructure/execution-build.md"
 
 
-def test_write_shard_path_sanitization() -> None:
+def test_failure_shard_path_sanitization() -> None:
     """Special characters, spaces, and mixed case are sanitised."""
-    result = write_shard_path("m1", "p1", "Build Shard Infrastructure!!")
-    assert result == "phases/p1/execution-build-shard-infrastructure.md"
-
-    result2 = write_shard_path("m1", "p1", "task_with_underscores")
-    assert result2 == "phases/p1/execution-task-with-underscores.md"
-
-    result3 = write_shard_path("m1", "p1", "  UPPER--CASE  ")
-    assert result3 == "phases/p1/execution-upper-case.md"
+    assert (
+        failure_shard_path("m1", "p1", "Build Shard Infrastructure!!")
+        == "phases/p1/execution-build-shard-infrastructure.md"
+    )
+    assert (
+        failure_shard_path("m1", "p1", "task_with_underscores")
+        == "phases/p1/execution-task-with-underscores.md"
+    )
+    assert (
+        failure_shard_path("m1", "p1", "  UPPER--CASE  ")
+        == "phases/p1/execution-upper-case.md"
+    )
 
 
 def test_slugify_empty() -> None:
@@ -59,165 +94,14 @@ def test_slugify_numbers_preserved() -> None:
         "@#$%^&*()",  # symbols-only
     ],
 )
-def test_write_shard_path_rejects_empty_slug(bad_name: str) -> None:
+def test_failure_shard_path_rejects_empty_slug(bad_name: str) -> None:
     """Task names that produce empty slugs raise ValueError."""
     with _pytest_import.raises(ValueError, match="empty slug"):
-        write_shard_path("m1", "p1", bad_name)
+        failure_shard_path("m1", "p1", bad_name)
 
 
 # ---------------------------------------------------------------------------
-# merge_shards
-# ---------------------------------------------------------------------------
-
-
-def test_merge_shards_empty(tmp_path: Path) -> None:
-    """No shards returns empty string."""
-    milestone_dir = tmp_path / "milestone"
-    phase_dir = milestone_dir / "phases" / "my-phase"
-    phase_dir.mkdir(parents=True)
-
-    result = merge_shards(milestone_dir, "my-phase")
-    assert result == ""
-
-
-def test_merge_shards_nonexistent_dir(tmp_path: Path) -> None:
-    """Non-existent phase directory returns empty string."""
-    result = merge_shards(tmp_path, "no-such-phase")
-    assert result == ""
-
-
-def test_merge_shards_single(tmp_path: Path) -> None:
-    """Single shard returned as-is with no merge overhead."""
-    milestone_dir = tmp_path / "milestone"
-    phase_dir = milestone_dir / "phases" / "my-phase"
-    phase_dir.mkdir(parents=True)
-
-    content = "## Summary\nstatus: completed\ntasks: 2 total, 2 completed, 0 failed, 0 in_progress\nfailures: none\nblockers: none\n\n### T1: Do something\n**Status:** completed\n"
-    (phase_dir / "execution-alpha.md").write_text(content)
-
-    result = merge_shards(milestone_dir, "my-phase")
-    assert result == content
-
-
-def test_merge_shards_multiple(tmp_path: Path) -> None:
-    """Multiple shards are merged with aggregated summary."""
-    milestone_dir = tmp_path / "milestone"
-    phase_dir = milestone_dir / "phases" / "my-phase"
-    phase_dir.mkdir(parents=True)
-
-    shard_a = (
-        "## Summary\n"
-        "status: completed\n"
-        "tasks: 2 total, 2 completed, 0 failed, 0 in_progress\n"
-        "failures: none\n"
-        "blockers: none\n"
-        "\n### T1: Alpha work\n**Status:** completed\n"
-    )
-    shard_b = (
-        "## Summary\n"
-        "status: completed\n"
-        "tasks: 3 total, 3 completed, 0 failed, 0 in_progress\n"
-        "failures: none\n"
-        "blockers: none\n"
-        "\n### T1: Beta work\n**Status:** completed\n"
-    )
-
-    (phase_dir / "execution-alpha.md").write_text(shard_a)
-    (phase_dir / "execution-beta.md").write_text(shard_b)
-
-    result = merge_shards(milestone_dir, "my-phase")
-
-    # Aggregated summary: 5 total, 5 completed
-    assert "status: completed" in result
-    assert "5 total" in result
-    assert "5 completed" in result
-    assert "0 failed" in result
-    assert "failures: none" in result
-
-    # Both shards present
-    assert "### Shard: alpha" in result
-    assert "### Shard: beta" in result
-
-
-def test_merge_shards_with_failures(tmp_path: Path) -> None:
-    """Merged status is 'failed' when any shard has failures."""
-    milestone_dir = tmp_path / "milestone"
-    phase_dir = milestone_dir / "phases" / "my-phase"
-    phase_dir.mkdir(parents=True)
-
-    shard_ok = (
-        "## Summary\n"
-        "status: completed\n"
-        "tasks: 1 total, 1 completed, 0 failed, 0 in_progress\n"
-        "failures: none\n"
-        "blockers: none\n"
-    )
-    shard_fail = (
-        "## Summary\n"
-        "status: failed\n"
-        "tasks: 2 total, 1 completed, 1 failed, 0 in_progress\n"
-        "failures: T2 crashed\n"
-        "blockers: none\n"
-    )
-
-    (phase_dir / "execution-good.md").write_text(shard_ok)
-    (phase_dir / "execution-bad.md").write_text(shard_fail)
-
-    result = merge_shards(milestone_dir, "my-phase")
-    assert "status: failed" in result
-    assert "1 failed" in result
-    assert "failures: T2 crashed" in result
-
-
-def test_merge_shards_deterministic(tmp_path: Path) -> None:
-    """Same input always produces the same output (alphabetical sort)."""
-    milestone_dir = tmp_path / "milestone"
-    phase_dir = milestone_dir / "phases" / "my-phase"
-    phase_dir.mkdir(parents=True)
-
-    for name in ("charlie", "alpha", "bravo"):
-        content = (
-            "## Summary\n"
-            "status: completed\n"
-            "tasks: 1 total, 1 completed, 0 failed, 0 in_progress\n"
-            "failures: none\n"
-            "blockers: none\n"
-        )
-        (phase_dir / f"execution-{name}.md").write_text(content)
-
-    result1 = merge_shards(milestone_dir, "my-phase")
-    result2 = merge_shards(milestone_dir, "my-phase")
-    assert result1 == result2
-
-    # Verify alphabetical ordering
-    alpha_pos = result1.index("### Shard: alpha")
-    bravo_pos = result1.index("### Shard: bravo")
-    charlie_pos = result1.index("### Shard: charlie")
-    assert alpha_pos < bravo_pos < charlie_pos
-
-
-def test_merge_ignores_regular_execution_md(tmp_path: Path) -> None:
-    """The regular execution.md is not included in shard merge."""
-    milestone_dir = tmp_path / "milestone"
-    phase_dir = milestone_dir / "phases" / "my-phase"
-    phase_dir.mkdir(parents=True)
-
-    (phase_dir / "execution.md").write_text("not a shard\n")
-    (phase_dir / "execution-task.md").write_text(
-        "## Summary\n"
-        "status: completed\n"
-        "tasks: 1 total, 1 completed, 0 failed, 0 in_progress\n"
-        "failures: none\n"
-        "blockers: none\n"
-    )
-
-    result = merge_shards(milestone_dir, "my-phase")
-    # Single shard -- returned as-is; the regular execution.md is not included
-    assert "not a shard" not in result
-
-
-# ---------------------------------------------------------------------------
-# clean_stale_shards
+# clean_stale_shards — single-phase sweep
 # ---------------------------------------------------------------------------
 
 
@@ -269,47 +153,164 @@ def test_clean_stale_shards_empty_dir(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# clean_stale_shards_for_layer — gather-group layer sweep
+# ---------------------------------------------------------------------------
+
+
+def test_clean_stale_shards_for_layer_sweeps_all_phases(tmp_path: Path) -> None:
+    """Every phase in the layer has its stale shards cleaned.
+
+    This pins the bug we're fixing: the prior single-phase cleanup left
+    stale shards in the other phases of a gather() group, amplifying
+    validation failures across cycles.
+    """
+    milestone_dir = tmp_path / "milestone"
+    for phase in ("set_coverage_thresholds", "create_metrics_module", "extend_logger"):
+        pd = milestone_dir / "phases" / phase
+        pd.mkdir(parents=True)
+        (pd / "execution-stale.md").write_text("old\n")
+        (pd / "execution.md").write_text("current\n")
+
+    removed, failed = clean_stale_shards_for_layer(
+        milestone_dir,
+        ["set_coverage_thresholds", "create_metrics_module", "extend_logger"],
+    )
+
+    # Every phase had one stale shard removed, none failed.
+    assert set(removed.keys()) == {
+        "set_coverage_thresholds", "create_metrics_module", "extend_logger",
+    }
+    assert failed == {}
+    for phase, paths in removed.items():
+        assert len(paths) == 1
+    # Canonical execution.md preserved everywhere.
+    for phase in removed:
+        assert (milestone_dir / "phases" / phase / "execution.md").exists()
+
+
+def test_clean_stale_shards_for_layer_omits_clean_phases(tmp_path: Path) -> None:
+    """Phases with nothing to clean are omitted from the result mapping."""
+    milestone_dir = tmp_path / "milestone"
+    # Phase A has a stale shard, phase B is clean, phase C doesn't exist.
+    pd_a = milestone_dir / "phases" / "phase_a"
+    pd_a.mkdir(parents=True)
+    (pd_a / "execution-stale.md").write_text("old\n")
+
+    pd_b = milestone_dir / "phases" / "phase_b"
+    pd_b.mkdir(parents=True)
+    (pd_b / "execution.md").write_text("current\n")
+
+    removed, failed = clean_stale_shards_for_layer(
+        milestone_dir, ["phase_a", "phase_b", "phase_c"],
+    )
+    assert set(removed.keys()) == {"phase_a"}
+    assert len(removed["phase_a"]) == 1
+    assert failed == {}
+
+
+def test_clean_stale_shards_for_layer_empty_layer(tmp_path: Path) -> None:
+    """An empty phase list returns empty mappings, no error."""
+    removed, failed = clean_stale_shards_for_layer(tmp_path, [])
+    assert removed == {}
+    assert failed == {}
+
+
+def test_clean_stale_shards_for_layer_reports_per_file_failures(
+    tmp_path: Path,
+) -> None:
+    """Per-file failures are surfaced without aborting the sweep.
+
+    Pins the invariant that silent cleanup failure was a root cause of
+    the slug-drift incident: one un-unlinkable shard must not prevent
+    others in the same phase (or other phases) from being cleaned, and
+    the failure must be reported to the caller.
+    """
+    milestone_dir = tmp_path / "milestone"
+    phase_a = milestone_dir / "phases" / "phase_a"
+    phase_a.mkdir(parents=True)
+
+    # A real file that cleans normally.
+    good = phase_a / "execution-good.md"
+    good.write_text("good\n")
+
+    # A symlink that cleanup must refuse to follow (defense-in-depth).
+    external = tmp_path / "outside.md"
+    external.write_text("external target\n")
+    link = phase_a / "execution-link.md"
+    link.symlink_to(external)
+
+    removed, failed = clean_stale_shards_for_layer(
+        milestone_dir, ["phase_a"],
+    )
+
+    # The regular shard was removed.
+    assert removed.get("phase_a") == [good]
+    # The symlink was refused and reported as a failure.
+    assert "phase_a" in failed
+    fail_entries = failed["phase_a"]
+    assert len(fail_entries) == 1
+    fail_path, fail_exc = fail_entries[0]
+    assert fail_path == link
+    assert "symlink" in str(fail_exc).lower()
+    # Target file outside .clou/ is untouched.
+    assert external.exists()
+    assert link.is_symlink()
+
+
+# ---------------------------------------------------------------------------
 # Hook permission matching
 # ---------------------------------------------------------------------------
 
 
-def test_hook_permission_shard() -> None:
-    """Worker write permissions match execution-*.md shard files."""
+def test_hook_permission_allows_canonical_execution_md() -> None:
+    """Worker write permissions match the canonical execution.md path."""
     worker_perms = WRITE_PERMISSIONS["worker"]
     import fnmatch
 
-    # Standard execution.md should match
+    # Canonical execution.md is the only worker-writable execution artifact.
     assert any(
         fnmatch.fnmatch("milestones/m1/phases/p1/execution.md", p)
         for p in worker_perms
     )
 
-    # Shard files should match
-    assert any(
-        fnmatch.fnmatch("milestones/m1/phases/p1/execution-build.md", p)
-        for p in worker_perms
-    )
-    assert any(
-        fnmatch.fnmatch(
-            "milestones/m1/phases/p1/execution-build-shard-infrastructure.md", p
+
+def test_hook_permission_denies_sharded_execution_paths() -> None:
+    """Worker permissions must NOT match execution-<slug>.md.
+
+    Those are coordinator-generated failure shards written in-process by
+    Python (bypassing the hook).  Granting workers permission to write
+    them was the live drift vector that caused the slug-drift incident:
+    a worker with stale briefing could freeform a slug and the hook
+    would allow it.  This test pins that the permission is now tight.
+    """
+    worker_perms = WRITE_PERMISSIONS["worker"]
+    import fnmatch
+
+    for bad_path in (
+        "milestones/m1/phases/p1/execution-build.md",
+        "milestones/m1/phases/p1/execution-extend-logger.md",
+        "milestones/m1/phases/p1/execution-extend_logger.md",
+        "milestones/m1/phases/p1/execution-anything-else.md",
+    ):
+        assert not any(fnmatch.fnmatch(bad_path, p) for p in worker_perms), (
+            f"Worker should NOT be able to write {bad_path}"
         )
-        for p in worker_perms
-    )
 
 
-def test_hook_permission_shard_scoped() -> None:
-    """Scoped worker permissions (with milestone) also match shard files."""
+def test_hook_permission_scoped_denies_sharded_paths() -> None:
+    """Scoped worker permissions also reject execution-<slug>.md."""
     from clou.hooks import _scoped_permissions
 
     scoped = _scoped_permissions("worker", "17-runtime-safeguards")
     import fnmatch
 
-    path = "milestones/17-runtime-safeguards/phases/p1/execution-task.md"
-    assert any(fnmatch.fnmatch(path, p) for p in scoped)
+    # Canonical path still allowed.
+    ok_path = "milestones/17-runtime-safeguards/phases/p1/execution.md"
+    assert any(fnmatch.fnmatch(ok_path, p) for p in scoped)
 
-    # Different milestone should NOT match
-    wrong_path = "milestones/other/phases/p1/execution-task.md"
-    assert not any(fnmatch.fnmatch(wrong_path, p) for p in scoped)
+    # Slugged shard path denied even in scope.
+    bad_path = "milestones/17-runtime-safeguards/phases/p1/execution-task.md"
+    assert not any(fnmatch.fnmatch(bad_path, p) for p in scoped)
 
 
 def _run(coro: object) -> dict[str, object]:
@@ -327,8 +328,8 @@ def _is_denied(result: dict[str, object]) -> bool:
     return hso.get("permissionDecision") == "deny"
 
 
-def test_hook_enforcement_allows_shard_write(tmp_path: Path) -> None:
-    """PreToolUse hook allows worker to write to a shard file."""
+def test_hook_enforcement_allows_canonical_execution_md(tmp_path: Path) -> None:
+    """PreToolUse hook allows worker to write to canonical execution.md."""
     project_dir = tmp_path / "project"
     clou_dir = project_dir / ".clou"
     clou_dir.mkdir(parents=True)
@@ -336,12 +337,14 @@ def test_hook_enforcement_allows_shard_write(tmp_path: Path) -> None:
     hooks = build_hooks("coordinator", project_dir, milestone="m1")
     pre_hook = hooks["PreToolUse"][0].hooks[0]
 
-    shard_path = str(clou_dir / "milestones" / "m1" / "phases" / "p1" / "execution-build.md")
+    ok_path = str(
+        clou_dir / "milestones" / "m1" / "phases" / "p1" / "execution.md"
+    )
     result = _run(
         pre_hook(
             {
                 "tool_name": "Write",
-                "tool_input": {"file_path": shard_path},
+                "tool_input": {"file_path": ok_path},
                 "agent_type": "implementer",
             },
             None,
@@ -351,8 +354,11 @@ def test_hook_enforcement_allows_shard_write(tmp_path: Path) -> None:
     assert not _is_denied(result)
 
 
-def test_hook_enforcement_denies_wrong_milestone_shard(tmp_path: Path) -> None:
-    """PreToolUse hook denies worker writing shard to wrong milestone."""
+def test_hook_enforcement_denies_sharded_path_for_worker(tmp_path: Path) -> None:
+    """Worker tool-call writes to execution-<slug>.md are denied at the hook.
+
+    Enforcement at the boundary — the prompt alone cannot stop drift.
+    """
     project_dir = tmp_path / "project"
     clou_dir = project_dir / ".clou"
     clou_dir.mkdir(parents=True)
@@ -360,7 +366,9 @@ def test_hook_enforcement_denies_wrong_milestone_shard(tmp_path: Path) -> None:
     hooks = build_hooks("coordinator", project_dir, milestone="m1")
     pre_hook = hooks["PreToolUse"][0].hooks[0]
 
-    shard_path = str(clou_dir / "milestones" / "other" / "phases" / "p1" / "execution-build.md")
+    shard_path = str(
+        clou_dir / "milestones" / "m1" / "phases" / "p1" / "execution-build.md"
+    )
     result = _run(
         pre_hook(
             {

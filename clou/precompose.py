@@ -163,7 +163,12 @@ def _extract_execution_summary(
         texts.append(content)
         raw_chars += len(content)
 
-    # Execution shards (gather groups)
+    # Coordinator-generated failure shards, if any.  Post-remolding,
+    # worker success paths converge on execution.md; execution-*.md
+    # files are only written in-process by _write_failure_shard when
+    # the coordinator terminates a task (timeout / budget).  Surface
+    # them so ASSESS sees the failure context alongside the canonical
+    # execution.md.
     if phase_dir.is_dir():
         for shard in sorted(phase_dir.glob("execution-*.md")):
             shard_content = _safe_read(shard, boundary)
