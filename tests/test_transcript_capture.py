@@ -22,13 +22,28 @@ def _run(coro: object) -> dict[str, object]:
 
 
 def _get_transcript_hook() -> object:
-    """Return the transcript PostToolUse hook callback for coordinator tier."""
+    """Return the transcript PostToolUse hook callback for coordinator tier.
+
+    There are now multiple ``matcher=None`` PostToolUse hooks (transcript
+    + escalation-announcer + halt-reminder, added by the DB-14/DB-21
+    hooks remolding).  Pick the one whose inner function qualname
+    matches the transcript-hook factory — the ``_make_*_hook`` helpers
+    each name their inner callback with a distinct qualname.
+    """
     hooks = build_hooks("coordinator", Path("/tmp/project"))
-    # Transcript hook is the second PostToolUse entry (matcher=None).
     post_hooks = hooks["PostToolUse"]
-    transcript_cfg = [c for c in post_hooks if c.matcher is None]
-    assert len(transcript_cfg) == 1, "Expected exactly one matcher=None PostToolUse"
-    return transcript_cfg[0].hooks[0]
+    matcher_none = [c for c in post_hooks if c.matcher is None]
+    for cfg in matcher_none:
+        for cb in cfg.hooks:
+            qual = getattr(cb, "__qualname__", "") or ""
+            if "_make_transcript_hook" in qual or "transcript_hook" == getattr(
+                cb, "__name__", ""
+            ):
+                return cb
+    raise AssertionError(
+        f"transcript hook not found among matcher=None PostToolUse "
+        f"hooks: {[getattr(cb, '__qualname__', None) for cfg in matcher_none for cb in cfg.hooks]}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -285,12 +300,29 @@ class TestBuildHooksTranscript:
     def test_coordinator_has_transcript_hook(self) -> None:
         hooks = build_hooks("coordinator", Path("/tmp/project"))
         post_hooks = hooks["PostToolUse"]
-        # Should have 2 PostToolUse entries: artifact validation + transcript.
-        assert len(post_hooks) == 2
-        # First is artifact validation (matcher = "Write|Edit|MultiEdit").
-        assert post_hooks[0].matcher == "Write|Edit|MultiEdit"
-        # Second is transcript capture (matcher = None for all tools).
-        assert post_hooks[1].matcher is None
+        # Expected categories: artifact-validation (matcher=pattern),
+        # transcript capture + passive announcement hooks (matcher=None).
+        # The DB-14/DB-21 hooks remolding added announcement hooks so
+        # the exact count is >= 3; the load-bearing invariants are:
+        #   - at least one matcher="Write|Edit|MultiEdit" entry exists
+        #   - at least one matcher=None entry is the transcript capture
+        matchers = [cfg.matcher for cfg in post_hooks]
+        assert "Write|Edit|MultiEdit" in matchers
+        # The transcript-capture hook sits among the matcher=None entries;
+        # identify it by the inner function qualname so the test survives
+        # future additions of matcher=None announcement hooks.
+        transcript_found = False
+        for cfg in post_hooks:
+            if cfg.matcher is None:
+                for cb in cfg.hooks:
+                    qual = getattr(cb, "__qualname__", "") or ""
+                    if "transcript_hook" in qual:
+                        transcript_found = True
+                        break
+        assert transcript_found, (
+            f"no transcript_hook among matcher=None entries: "
+            f"{[[getattr(cb, '__qualname__', None) for cb in cfg.hooks] for cfg in post_hooks if cfg.matcher is None]}"
+        )
 
 
 # ---------------------------------------------------------------------------

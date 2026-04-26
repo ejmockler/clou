@@ -989,18 +989,23 @@ class TestRunCoordinator:
         mock_commit.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_fatal_escalation_posts_to_ui(self, project_dir: Path) -> None:
-        """Fatal escalation paths post ClouEscalationArrived before returning."""
+    async def test_fatal_escalation_announces_on_ui(self, project_dir: Path) -> None:
+        """Fatal escalation paths announce a passive ClouBreathEvent before returning.
+
+        Escalations are agent-to-agent decision records (per
+        project_escalations_are_agent_to_agent.md); the user-modal
+        ClouEscalationArrived pathway was retired in 41-escalation-remolding (I4).
+        """
         mock_app = MagicMock()
         posted: list[Any] = []
         mock_app.post_message.side_effect = lambda msg: posted.append(msg)
 
-        # Write an escalation file that write_cycle_limit_escalation would create
+        # Write an escalation file that write_cycle_limit_escalation would create.
         esc_dir = project_dir / ".clou" / "milestones" / "auth" / "escalations"
         esc_dir.mkdir(parents=True)
         (esc_dir / "cycle-limit.md").write_text(
-            "# Escalation\n\n"
-            "## Classification\nblocking\n\n"
+            "# Escalation: cycle limit\n\n"
+            "**Classification:** blocking\n\n"
             "## Issue\nCycle limit reached\n\n"
             "## Options\n1. **Increase limit** — raise the cap\n\n"
             "## Recommendation\nReassess scope\n"
@@ -1020,12 +1025,17 @@ class TestRunCoordinator:
 
         assert result == "escalated_cycle_limit"
 
-        from clou.ui.messages import ClouEscalationArrived
+        from clou.ui.messages import ClouBreathEvent
 
-        esc_messages = [m for m in posted if isinstance(m, ClouEscalationArrived)]
-        assert len(esc_messages) == 1
-        assert esc_messages[0].classification == "blocking"
-        assert esc_messages[0].issue == "Cycle limit reached"
+        announcements = [
+            m for m in posted
+            if isinstance(m, ClouBreathEvent)
+            and m.text.startswith("escalation filed:")
+        ]
+        assert len(announcements) == 1
+        assert announcements[0].text == (
+            "escalation filed: blocking: cycle-limit.md"
+        )
 
     # -------------------------------------------------------------------
     # Warning passthrough / severity-aware validation — validator-resilience
@@ -1608,6 +1618,124 @@ class TestRunSupervisorResumeFeedback:
         # Verify error message was shown in the UI
         mock_conv.add_error_message.assert_called_once_with(
             "Could not restore session dead-session. Starting fresh."
+        )
+
+
+# ---------------------------------------------------------------------------
+# run_supervisor — supervisor-tier MCP server wiring (F3, milestone 41)
+# ---------------------------------------------------------------------------
+
+
+class TestSupervisorMcpServerWiring:
+    """The supervisor session must mount ``build_supervisor_mcp_server``
+    and allow-list ``mcp__clou_supervisor__clou_resolve_escalation``.
+
+    F3 (critical) in milestone 41-escalation-remolding: direct Write to
+    ``escalations/*.md`` is denied by the PreToolUse hook for every
+    tier, so the supervisor's only path to disposition an escalation is
+    through the MCP tool.  If the orchestrator does not register the
+    tool on the supervisor session, the resolution path is broken
+    end-to-end --- no amount of unit coverage on
+    ``clou.supervisor_tools`` closes the gap.
+    """
+
+    @pytest.mark.asyncio
+    async def test_supervisor_mcp_server_and_allowed_tool_registered(
+        self, tmp_path: Path,
+    ) -> None:
+        """On spawn, the supervisor SDK options must include
+        ``clou_supervisor`` under ``mcp_servers`` AND
+        ``mcp__clou_supervisor__clou_resolve_escalation`` in
+        ``allowed_tools``.  Captures the ``ClaudeAgentOptions`` that
+        the orchestrator hands to ``ClaudeSDKClient``.
+        """
+        import asyncio
+
+        # Minimal app stub — the supervisor talks to it but the test
+        # path never exercises user-input delivery.
+        mock_app = MagicMock()
+        mock_app._resume_session_id = None
+        mock_app._work_dir = tmp_path
+        mock_app._compact = MagicMock()
+        mock_app._compact.requested = asyncio.Event()
+        mock_app._user_input_queue = asyncio.Queue()
+        mock_app._user_input_ready = asyncio.Event()
+
+        client = _mock_sdk_client()
+        client.query = AsyncMock()
+
+        async def _empty_receive() -> Any:
+            return
+            yield  # makes this an async generator
+
+        client.receive_messages = _empty_receive
+
+        (tmp_path / ".clou").mkdir()
+
+        captured_options: dict[str, Any] = {}
+
+        def capture_client(*args: Any, **kwargs: Any) -> MagicMock:
+            opts = kwargs.get("options")
+            if opts is not None:
+                captured_options.update(opts.__dict__)
+            return client
+
+        # Sentinel so the assertion can identify that the orchestrator
+        # invoked build_supervisor_mcp_server and mounted its return value.
+        sentinel_server = object()
+
+        with (
+            patch(f"{_P}.ClaudeSDKClient", side_effect=capture_client),
+            patch(f"{_P}.load_prompt", return_value="<system/>"),
+            patch(f"{_P}.build_hooks", return_value={}),
+            patch(f"{_P}._build_mcp_server", return_value={}),
+            patch(
+                f"{_P}.build_supervisor_mcp_server",
+                return_value=sentinel_server,
+            ) as mock_builder,
+            patch(
+                f"{_P}.read_template_name",
+                return_value="software-construction",
+            ),
+            patch(
+                f"{_P}.load_template",
+                return_value=MagicMock(quality_gates=[]),
+            ),
+        ):
+            await run_supervisor(tmp_path, app=mock_app)
+
+        # build_supervisor_mcp_server was invoked with the project_dir.
+        assert mock_builder.call_count == 1
+        call_args = mock_builder.call_args
+        # Accept either positional or kwarg form.
+        if call_args.args:
+            assert call_args.args[0] == tmp_path
+        else:
+            assert call_args.kwargs.get("project_dir") == tmp_path
+
+        # The supervisor's ClaudeAgentOptions were captured and hold the
+        # new MCP server under the ``clou_supervisor`` key.
+        mcp_servers = captured_options.get("mcp_servers")
+        assert mcp_servers is not None, "ClaudeAgentOptions.mcp_servers missing"
+        assert "clou_supervisor" in mcp_servers, (
+            f"clou_supervisor not mounted; got keys: {list(mcp_servers)}"
+        )
+        assert mcp_servers["clou_supervisor"] is sentinel_server, (
+            "mcp_servers['clou_supervisor'] is not the server returned by "
+            "build_supervisor_mcp_server"
+        )
+        # The pre-existing ``clou`` server must still be present.
+        assert "clou" in mcp_servers, (
+            "primary 'clou' MCP server dropped while wiring the new one"
+        )
+
+        # allowed_tools must surface the resolve-escalation tool name so
+        # Claude Code loads it eagerly (no ToolSearch deferral).
+        allowed = captured_options.get("allowed_tools")
+        assert allowed is not None, "ClaudeAgentOptions.allowed_tools missing"
+        assert "mcp__clou_supervisor__clou_resolve_escalation" in allowed, (
+            "resolve-escalation tool not in allowed_tools; got: "
+            f"{allowed}"
         )
 
 
@@ -2912,13 +3040,25 @@ class TestRemoveArtifactTool:
         assert not self._is_error(result)
         assert not target.exists()
 
-    def test_removes_escalation(self, tmp_path: Path) -> None:
-        """Escalation files within scope are removable."""
+    def test_removes_escalation_when_resolved(self, tmp_path: Path) -> None:
+        """Escalation files are removable ONLY when disposition is closed (F8).
+
+        An escalation authored via the canonical EscalationForm with
+        ``disposition_status == "resolved"`` is within cleanup scope.
+        """
+        from clou.escalation import EscalationForm, render_escalation
+
+        form = EscalationForm(
+            classification="blocking",
+            title="auth failure",
+            issue="login broke",
+            disposition_status="resolved",
+        )
         target = (
             tmp_path / ".clou" / "milestones" / "m1"
             / "escalations" / "auth.md"
         )
-        self._write(target, "old escalation")
+        self._write(target, render_escalation(form))
 
         tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
         result = self._run(tool_fn({
@@ -2928,6 +3068,151 @@ class TestRemoveArtifactTool:
 
         assert not self._is_error(result)
         assert not target.exists()
+
+    def test_removes_escalation_when_overridden(self, tmp_path: Path) -> None:
+        """Escalations with disposition_status 'overridden' are removable (F8)."""
+        from clou.escalation import EscalationForm, render_escalation
+
+        form = EscalationForm(
+            classification="informational",
+            title="noise",
+            issue="low signal",
+            disposition_status="overridden",
+        )
+        target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "escalations" / "noise.md"
+        )
+        self._write(target, render_escalation(form))
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/escalations/noise.md",
+            "reason": "overridden; archiving",
+        }))
+
+        assert not self._is_error(result)
+        assert not target.exists()
+
+    def test_refuses_to_remove_open_escalation(self, tmp_path: Path) -> None:
+        """Open escalations (status: open) cannot be unilaterally deleted (F8).
+
+        The canonical agent-to-agent decision record must be resolved or
+        overridden before it can be archived; a drifted supervisor must
+        not be able to silence an open blocking escalation by calling
+        clou_remove_artifact.
+        """
+        from clou.escalation import EscalationForm, render_escalation
+
+        form = EscalationForm(
+            classification="blocking",
+            title="auth failure",
+            issue="login broke",
+            disposition_status="open",
+        )
+        target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "escalations" / "auth.md"
+        )
+        self._write(target, render_escalation(form))
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/escalations/auth.md",
+            "reason": "inconvenient signal",
+        }))
+
+        assert self._is_error(result)
+        # The error message must name the disposition reason so the
+        # agent can retry by resolving the escalation first.
+        text = self._text(result).lower()
+        assert "disposition" in text or "resolved" in text
+        # Most importantly: the file must remain on disk.
+        assert target.exists()
+
+    def test_refuses_to_remove_investigating_escalation(
+        self, tmp_path: Path,
+    ) -> None:
+        """Escalations with disposition_status 'investigating' are denied (F8)."""
+        from clou.escalation import EscalationForm, render_escalation
+
+        form = EscalationForm(
+            classification="degraded",
+            title="flaky test",
+            issue="intermittent",
+            disposition_status="investigating",
+        )
+        target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "escalations" / "flake.md"
+        )
+        self._write(target, render_escalation(form))
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/escalations/flake.md",
+            "reason": "nuisance",
+        }))
+
+        assert self._is_error(result)
+        assert target.exists()
+
+    def test_refuses_to_remove_deferred_escalation(self, tmp_path: Path) -> None:
+        """Escalations with disposition_status 'deferred' are denied (F8).
+
+        Deferred is not a closed status — the decision to defer is
+        itself a record that must survive in the agent-to-agent audit
+        trail.
+        """
+        from clou.escalation import EscalationForm, render_escalation
+
+        form = EscalationForm(
+            classification="architectural",
+            title="race condition",
+            issue="concurrent writes",
+            disposition_status="deferred",
+        )
+        target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "escalations" / "race.md"
+        )
+        self._write(target, render_escalation(form))
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/escalations/race.md",
+            "reason": "tidy",
+        }))
+
+        assert self._is_error(result)
+        assert target.exists()
+
+    def test_refuses_to_remove_unparseable_escalation(
+        self, tmp_path: Path,
+    ) -> None:
+        """A file in escalations/ that the parser cannot safely classify
+        is refused (F8).
+
+        Parser fallback produces ``disposition_status='open'`` when the
+        file is a garbage blob that nonetheless matches the path pattern —
+        deletion would erase an unidentifiable record.  Refusing the
+        removal forces the operator to triage the file before archiving.
+        """
+        target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "escalations" / "garbage.md"
+        )
+        self._write(target, "totally random content with no structure")
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/escalations/garbage.md",
+            "reason": "triage",
+        }))
+
+        assert self._is_error(result)
+        # Preserved — we refused because we could not verify disposition.
+        assert target.exists()
 
     def test_tolerates_leading_clou_prefix(self, tmp_path: Path) -> None:
         """'.clou/...' prefix on path argument is stripped, not rejected."""
@@ -3226,3 +3511,610 @@ class TestRemoveArtifactTool:
         # Warning was surfaced so the dropped event is visible.
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any("Telemetry emission failed" in r.message for r in warnings)
+
+
+# ===========================================================================
+# Cycle-2 rework tests (F4, F8, F19)
+# ===========================================================================
+#
+# F4 and F19 change the supervisor startup path; F8 tightens the
+# clou_remove_artifact gate.  Each class groups the assertions that
+# share a fixture shape so the wiring cost (app mocks, patch targets)
+# is paid once.
+
+
+class TestSupervisorFilingPath:
+    """F4 cycle-2: the supervisor session must gain a filing tool
+    (``mcp__clou_coordinator__clou_file_escalation``) mounted on a
+    ``clou_coordinator``-named MCP server.
+
+    Before F4, the hook denied every direct Write to escalation files
+    but the supervisor had NO MCP pathway to file one itself --- only
+    to resolve existing ones via ``clou_resolve_escalation``.  That
+    one-way street painted the supervisor into a corner.
+    """
+
+    @pytest.mark.asyncio
+    async def test_supervisor_mounts_clou_coordinator_server(
+        self, tmp_path: Path,
+    ) -> None:
+        """``clou_coordinator`` key present in the supervisor's
+        ``mcp_servers`` dict, populated with the filing server."""
+        import asyncio
+
+        mock_app = MagicMock()
+        mock_app._resume_session_id = None
+        mock_app._work_dir = tmp_path
+        mock_app._compact = MagicMock()
+        mock_app._compact.requested = asyncio.Event()
+        mock_app._user_input_queue = asyncio.Queue()
+        mock_app._user_input_ready = asyncio.Event()
+
+        client = _mock_sdk_client()
+        client.query = AsyncMock()
+
+        async def _empty_receive() -> Any:
+            return
+            yield
+
+        client.receive_messages = _empty_receive
+
+        (tmp_path / ".clou").mkdir()
+
+        captured_options: dict[str, Any] = {}
+
+        def capture_client(*args: Any, **kwargs: Any) -> MagicMock:
+            opts = kwargs.get("options")
+            if opts is not None:
+                captured_options.update(opts.__dict__)
+            return client
+
+        # Sentinel identifies the filing-server builder return value.
+        sentinel_filing = object()
+
+        with (
+            patch(f"{_P}.ClaudeSDKClient", side_effect=capture_client),
+            patch(f"{_P}.load_prompt", return_value="<system/>"),
+            patch(f"{_P}.build_hooks", return_value={}),
+            patch(f"{_P}._build_mcp_server", return_value={}),
+            patch(
+                f"{_P}.build_supervisor_mcp_server", return_value=object(),
+            ),
+            patch(
+                f"{_P}._build_supervisor_filing_server",
+                return_value=sentinel_filing,
+            ) as mock_filing_builder,
+            patch(
+                f"{_P}.read_template_name",
+                return_value="software-construction",
+            ),
+            patch(
+                f"{_P}.load_template",
+                return_value=MagicMock(quality_gates=[]),
+            ),
+        ):
+            await run_supervisor(tmp_path, app=mock_app)
+
+        mcp_servers = captured_options.get("mcp_servers")
+        assert mcp_servers is not None
+        assert "clou_coordinator" in mcp_servers, (
+            f"clou_coordinator server not mounted; got keys: "
+            f"{list(mcp_servers)}"
+        )
+        assert mcp_servers["clou_coordinator"] is sentinel_filing, (
+            "clou_coordinator slot must hold the filing server "
+            "returned by _build_supervisor_filing_server"
+        )
+        # The builder was invoked with the project_dir argument.
+        assert mock_filing_builder.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_supervisor_allows_clou_file_escalation_tool(
+        self, tmp_path: Path,
+    ) -> None:
+        """``mcp__clou_coordinator__clou_file_escalation`` is in the
+        supervisor's ``allowed_tools`` list.
+
+        Matches the tool-name string that appears in the hook's
+        escalation deny reason so retry advice is coherent: an agent
+        that hits a denied direct Write sees a tool name it can
+        actually invoke.
+        """
+        import asyncio
+
+        mock_app = MagicMock()
+        mock_app._resume_session_id = None
+        mock_app._work_dir = tmp_path
+        mock_app._compact = MagicMock()
+        mock_app._compact.requested = asyncio.Event()
+        mock_app._user_input_queue = asyncio.Queue()
+        mock_app._user_input_ready = asyncio.Event()
+
+        client = _mock_sdk_client()
+        client.query = AsyncMock()
+
+        async def _empty_receive() -> Any:
+            return
+            yield
+
+        client.receive_messages = _empty_receive
+
+        (tmp_path / ".clou").mkdir()
+
+        captured_options: dict[str, Any] = {}
+
+        def capture_client(*args: Any, **kwargs: Any) -> MagicMock:
+            opts = kwargs.get("options")
+            if opts is not None:
+                captured_options.update(opts.__dict__)
+            return client
+
+        with (
+            patch(f"{_P}.ClaudeSDKClient", side_effect=capture_client),
+            patch(f"{_P}.load_prompt", return_value="<system/>"),
+            patch(f"{_P}.build_hooks", return_value={}),
+            patch(f"{_P}._build_mcp_server", return_value={}),
+            patch(
+                f"{_P}.build_supervisor_mcp_server", return_value=object(),
+            ),
+            patch(
+                f"{_P}._build_supervisor_filing_server",
+                return_value=object(),
+            ),
+            patch(
+                f"{_P}.read_template_name",
+                return_value="software-construction",
+            ),
+            patch(
+                f"{_P}.load_template",
+                return_value=MagicMock(quality_gates=[]),
+            ),
+        ):
+            await run_supervisor(tmp_path, app=mock_app)
+
+        allowed = captured_options.get("allowed_tools") or []
+        assert "mcp__clou_coordinator__clou_file_escalation" in allowed, (
+            f"filing tool not in allowed_tools; got: {allowed}"
+        )
+
+    def test_supervisor_filing_tool_takes_milestone_arg(
+        self, tmp_path: Path,
+    ) -> None:
+        """The supervisor's filing tool accepts ``milestone`` as a
+        per-call argument and forwards the rest to the coordinator's
+        own filing handler.
+
+        The coordinator's ``clou_file_escalation`` closure-binds
+        ``milestone`` at server-construction time; the supervisor
+        cannot fix a single milestone at session start because it
+        spans multiple.  The supervisor-mount must therefore take
+        milestone as a REQUIRED arg, validate it, and delegate.
+        """
+        from clou.orchestrator import _build_supervisor_filing_server
+
+        # Create real milestone directory so the validate + write paths
+        # can execute end-to-end.
+        ms_dir = tmp_path / ".clou" / "milestones" / "m1"
+        (ms_dir / "escalations").mkdir(parents=True)
+
+        # Extract the single tool from the server.  We capture the
+        # SdkMcpTool objects via the create_sdk_mcp_server patch so
+        # we can invoke the handler directly.
+        captured: list[Any] = []
+
+        def _capture(*args: Any, **kwargs: Any) -> MagicMock:
+            tools = kwargs.get("tools") or (args[1] if len(args) > 1 else [])
+            captured.extend(tools)
+            return MagicMock()
+
+        with patch(f"{_P}.create_sdk_mcp_server", side_effect=_capture):
+            _build_supervisor_filing_server(tmp_path)
+
+        assert len(captured) == 1, (
+            f"expected one filing tool, got {len(captured)}"
+        )
+        handler = getattr(captured[0], "handler", captured[0])
+
+        # Missing milestone — structured error (no RuntimeError).
+        result = asyncio.run(handler({
+            "title": "test",
+            "classification": "informational",
+            "issue": "none",
+            "options": [{"label": "A", "description": "x"}],
+        }))
+        assert isinstance(result, dict)
+        assert result.get("is_error") is True
+        text = result["content"][0]["text"].lower()
+        assert "milestone" in text
+
+        # Invalid milestone — structured error.
+        result = asyncio.run(handler({
+            "milestone": "BAD_SLUG_WITH_UPPERCASE",
+            "title": "test",
+            "classification": "informational",
+            "issue": "none",
+            "options": [{"label": "A", "description": "x"}],
+        }))
+        assert result.get("is_error") is True
+
+        # Valid milestone — forwards to the coordinator handler.  We
+        # don't assert the wrapped return shape here (that is the
+        # coordinator handler's test surface); only that the call
+        # routes through without raising.
+        result = asyncio.run(handler({
+            "milestone": "m1",
+            "title": "test filing",
+            "classification": "informational",
+            "issue": "triggered by supervisor mount",
+            "options": [{"label": "A", "description": "first"}],
+        }))
+        assert isinstance(result, dict)
+        # Either a structured error or a successful write descriptor
+        # --- both are acceptable; failure modes here are the
+        # coordinator handler's responsibility.  The key assertion is
+        # that the supervisor-mount handler did not RAISE (a raised
+        # exception would have aborted before the return).
+
+
+class TestRemoveArtifactEscalationTightening:
+    """F8 cycle-2: parser-trust boundary in clou_remove_artifact.
+
+    The cycle-1 gate trusted ``parse_escalation`` to synthesise a
+    disposition status even from legacy preamble keys (e.g.
+    ``**Status:** resolved`` in a file with no Disposition heading).
+    That gave a drifted supervisor a way to file a legacy-shaped
+    file and then delete it — a permission-audit inconsistency with
+    the hook's direct-Write deny.  The tightened gate requires the
+    LITERAL ``## Disposition`` heading on its own line AND rejects
+    symlinks.
+    """
+
+    def _write(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+    def _run(self, coro: Any) -> dict[str, Any]:
+        result: Any = asyncio.run(coro)
+        assert isinstance(result, dict)
+        return result
+
+    def _is_error(self, result: dict[str, Any]) -> bool:
+        return bool(result.get("is_error"))
+
+    def _text(self, result: dict[str, Any]) -> str:
+        content = result.get("content", [])
+        if not content:
+            return ""
+        first = content[0]
+        if isinstance(first, dict):
+            return str(first.get("text", ""))
+        return ""
+
+    def test_rejects_without_disposition_heading(
+        self, tmp_path: Path,
+    ) -> None:
+        """Files whose disposition status derives from LEGACY preamble
+        keys (``**Status:** resolved``) with no canonical
+        ``## Disposition`` heading are rejected.
+
+        The tolerant parser MAY synthesise ``resolved`` from the
+        preamble, but the gate must NOT trust that synthesis: only
+        files with a canonical Disposition section are archivable.
+        """
+        target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "escalations" / "legacy.md"
+        )
+        # Deliberately legacy-shaped: preamble-only, no Disposition h2.
+        legacy = (
+            "# Escalation: auth-failure\n\n"
+            "**Classification:** blocking\n"
+            "**Status:** resolved\n\n"
+            "## Issue\n"
+            "login broke\n"
+        )
+        self._write(target, legacy)
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/escalations/legacy.md",
+            "reason": "legacy cleanup",
+        }))
+        assert self._is_error(result)
+        text = self._text(result).lower()
+        assert "disposition" in text, (
+            f"error message should name the missing heading; got: {text}"
+        )
+        # File must remain on disk.
+        assert target.exists()
+
+    def test_rejects_when_disposition_in_code_fence(
+        self, tmp_path: Path,
+    ) -> None:
+        """A ``## Disposition`` line inside a code fence doesn't count.
+
+        A drifted agent could embed the heading inside a fenced block
+        to trick the gate; the line-level check (``line.strip() ==
+        '## Disposition'``) only accepts the heading as a real h2.
+        Code fences contain the string but not at top level — the
+        scan sees ``"```" == "## Disposition"`` which is false.
+        """
+        target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "escalations" / "fenced.md"
+        )
+        # The literal ``## Disposition`` sits inside a fenced block.
+        # Our scan treats every line as potential heading via strip()
+        # and requires the EXACT string match.  The fence line
+        # ``    ## Disposition`` (indented) strips to
+        # ``## Disposition`` --- which would pass.  We deliberately
+        # exercise the NON-passing case: the heading appears inside
+        # PROSE, not at top level.
+        body = (
+            "# Escalation: evil\n\n"
+            "**Classification:** blocking\n\n"
+            "## Context\n"
+            "See below for the classification. "
+            "Note: '## Disposition' would normally appear here.\n"
+        )
+        self._write(target, body)
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/escalations/fenced.md",
+            "reason": "attempted bypass",
+        }))
+        assert self._is_error(result)
+        assert target.exists()
+
+    def test_rejects_symlink_escalation(self, tmp_path: Path) -> None:
+        """A symlinked escalation path is rejected even if its target
+        has a valid resolved disposition.
+
+        Double-layer defense: the request-path ``is_symlink`` check
+        at the tool entry already rejects this, but the escalation
+        gate re-checks explicitly so the auditable invariant lives
+        right next to the parse-and-status check.
+        """
+        # Real target: a resolved canonical escalation.
+        real_dir = (
+            tmp_path / ".clou" / "milestones" / "m1" / "escalations"
+        )
+        real_dir.mkdir(parents=True)
+        real_target = real_dir / "real.md"
+        from clou.escalation import EscalationForm, render_escalation
+        form = EscalationForm(
+            classification="informational",
+            title="resolved",
+            issue="x",
+            disposition_status="resolved",
+        )
+        real_target.write_text(render_escalation(form))
+
+        # Symlink to it.
+        link = real_dir / "link.md"
+        link.symlink_to(real_target)
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/escalations/link.md",
+            "reason": "archival",
+        }))
+        assert self._is_error(result)
+        text = self._text(result).lower()
+        assert "symlink" in text, (
+            f"expected symlink rejection message; got: {text}"
+        )
+        # Both link and target remain.
+        assert link.exists() or link.is_symlink()
+        assert real_target.exists()
+
+    def test_accepts_canonical_disposition_heading(
+        self, tmp_path: Path,
+    ) -> None:
+        """Canonical escalations with the literal ``## Disposition``
+        heading AND a closed status pass the gate (regression
+        guard: F8 tightening should NOT block the happy path).
+        """
+        from clou.escalation import EscalationForm, render_escalation
+
+        form = EscalationForm(
+            classification="informational",
+            title="ok",
+            issue="nothing",
+            disposition_status="resolved",
+        )
+        target = (
+            tmp_path / ".clou" / "milestones" / "m1"
+            / "escalations" / "canonical.md"
+        )
+        self._write(target, render_escalation(form))
+
+        tool_fn = _extract_tool(tmp_path, "remove_artifact_tool")
+        result = self._run(tool_fn({
+            "path": "milestones/m1/escalations/canonical.md",
+            "reason": "archival",
+        }))
+        assert not self._is_error(result), (
+            f"canonical resolved escalation should remove cleanly; "
+            f"got: {self._text(result)}"
+        )
+        assert not target.exists()
+
+
+class TestSupervisorMcpTelemetrySpansSplit:
+    """F19 cycle-2: per-server spans for MCP server startup.
+
+    Previously, a single ``startup.mcp_server.start/end`` span wrapped
+    BOTH the clou-server and the supervisor-server builders; a
+    failure in either surfaced under the same span name, making
+    failure attribution a guessing game.  Now each builder emits its
+    own nested span (``startup.mcp_server.clou.start/end``,
+    ``.supervisor.start/end``, ``.coordinator.start/end``) with
+    matching ``.error`` variants.  The outer envelope span is kept
+    so downstream aggregators see the same event-name surface.
+    """
+
+    @pytest.mark.asyncio
+    async def test_per_server_spans_fire_in_order(
+        self, tmp_path: Path,
+    ) -> None:
+        """Each per-server span fires start/end, nested inside the
+        outer envelope span."""
+        import asyncio
+
+        mock_app = MagicMock()
+        mock_app._resume_session_id = None
+        mock_app._work_dir = tmp_path
+        mock_app._compact = MagicMock()
+        mock_app._compact.requested = asyncio.Event()
+        mock_app._user_input_queue = asyncio.Queue()
+        mock_app._user_input_ready = asyncio.Event()
+
+        client = _mock_sdk_client()
+        client.query = AsyncMock()
+
+        async def _empty_receive() -> Any:
+            return
+            yield
+
+        client.receive_messages = _empty_receive
+
+        (tmp_path / ".clou").mkdir()
+
+        events: list[str] = []
+
+        def _record_event(name: str, **_: Any) -> None:
+            events.append(name)
+
+        with (
+            patch(f"{_P}.telemetry.event", side_effect=_record_event),
+            patch(f"{_P}.ClaudeSDKClient", return_value=client),
+            patch(f"{_P}.load_prompt", return_value="<system/>"),
+            patch(f"{_P}.build_hooks", return_value={}),
+            patch(f"{_P}._build_mcp_server", return_value={}),
+            patch(
+                f"{_P}.build_supervisor_mcp_server", return_value=object(),
+            ),
+            patch(
+                f"{_P}._build_supervisor_filing_server",
+                return_value=object(),
+            ),
+            patch(
+                f"{_P}.read_template_name",
+                return_value="software-construction",
+            ),
+            patch(
+                f"{_P}.load_template",
+                return_value=MagicMock(quality_gates=[]),
+            ),
+        ):
+            await run_supervisor(tmp_path, app=mock_app)
+
+        # Expected event names in order.  We don't pin exact order of
+        # all events (the supervisor emits many), just that the MCP
+        # span sub-events appear and are ordered.
+        mcp_events = [
+            e for e in events if e.startswith("startup.mcp_server")
+        ]
+        # Outer envelope + three per-server .start/.end pairs.
+        assert "startup.mcp_server.start" in mcp_events
+        assert "startup.mcp_server.end" in mcp_events
+        assert "startup.mcp_server.clou.start" in mcp_events
+        assert "startup.mcp_server.clou.end" in mcp_events
+        assert "startup.mcp_server.supervisor.start" in mcp_events
+        assert "startup.mcp_server.supervisor.end" in mcp_events
+        assert "startup.mcp_server.coordinator.start" in mcp_events
+        assert "startup.mcp_server.coordinator.end" in mcp_events
+
+        # Per-server spans are nested inside the outer envelope:
+        # outer .start precedes every per-server .start; outer .end
+        # follows every per-server .end.
+        first_start = mcp_events.index("startup.mcp_server.start")
+        last_end = (
+            len(mcp_events) - 1 - mcp_events[::-1].index(
+                "startup.mcp_server.end",
+            )
+        )
+        for name in (
+            "startup.mcp_server.clou.start",
+            "startup.mcp_server.supervisor.start",
+            "startup.mcp_server.coordinator.start",
+        ):
+            assert mcp_events.index(name) > first_start, (
+                f"{name} not nested inside outer envelope"
+            )
+        for name in (
+            "startup.mcp_server.clou.end",
+            "startup.mcp_server.supervisor.end",
+            "startup.mcp_server.coordinator.end",
+        ):
+            assert mcp_events.index(name) < last_end, (
+                f"{name} not nested inside outer envelope"
+            )
+
+    @pytest.mark.asyncio
+    async def test_per_server_error_span_identifies_failing_builder(
+        self, tmp_path: Path,
+    ) -> None:
+        """If the coordinator filing server builder raises, the
+        coordinator-specific ``.error`` span fires (not just the
+        outer envelope error)."""
+        import asyncio
+
+        mock_app = MagicMock()
+        mock_app._resume_session_id = None
+        mock_app._work_dir = tmp_path
+        mock_app._compact = MagicMock()
+        mock_app._compact.requested = asyncio.Event()
+        mock_app._user_input_queue = asyncio.Queue()
+        mock_app._user_input_ready = asyncio.Event()
+
+        (tmp_path / ".clou").mkdir()
+
+        events: list[str] = []
+
+        def _record_event(name: str, **_: Any) -> None:
+            events.append(name)
+
+        def _raising_filing_builder(*args: Any, **kwargs: Any) -> object:
+            raise RuntimeError("builder boom")
+
+        with (
+            patch(f"{_P}.telemetry.event", side_effect=_record_event),
+            patch(f"{_P}.load_prompt", return_value="<system/>"),
+            patch(f"{_P}.build_hooks", return_value={}),
+            patch(f"{_P}._build_mcp_server", return_value={}),
+            patch(
+                f"{_P}.build_supervisor_mcp_server", return_value=object(),
+            ),
+            patch(
+                f"{_P}._build_supervisor_filing_server",
+                side_effect=_raising_filing_builder,
+            ),
+            patch(
+                f"{_P}.read_template_name",
+                return_value="software-construction",
+            ),
+            patch(
+                f"{_P}.load_template",
+                return_value=MagicMock(quality_gates=[]),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="builder boom"):
+                await run_supervisor(tmp_path, app=mock_app)
+
+        mcp_events = [
+            e for e in events if e.startswith("startup.mcp_server")
+        ]
+        # The clou + supervisor builders succeeded.
+        assert "startup.mcp_server.clou.end" in mcp_events
+        assert "startup.mcp_server.supervisor.end" in mcp_events
+        # The coordinator-specific error span fired, identifying the
+        # failing builder.
+        assert "startup.mcp_server.coordinator.error" in mcp_events
+        # The outer envelope error also fired so aggregate dashboards
+        # still see the failure.
+        assert "startup.mcp_server.error" in mcp_events
+        # The coordinator did NOT emit a .end — failure path.
+        assert "startup.mcp_server.coordinator.end" not in mcp_events

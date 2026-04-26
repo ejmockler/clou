@@ -257,6 +257,45 @@ def _sanitize_md_cell(value: str) -> str:
     return value.replace("|", r"\|").replace("\n", " ")
 
 
+def _render_judgment_section(
+    events: list[dict[str, Any]],
+) -> str:
+    """Render the ``## Judgment / Disagreement`` section (M36 I3).
+
+    ``events`` is the subset of JSONL records matching
+    ``event == "cycle.judgment"`` for the current milestone, each
+    carrying ``cycle``, ``judgment_next_action``,
+    ``orchestrator_next_cycle``, and ``agreement`` keys (per the
+    coordinator's post-ORIENT emission).  When no events are
+    recorded yet, the section still renders with a stub body so the
+    milestone acceptance ("metrics.md shows the disagreement record
+    per cycle") holds for the empty case as well.
+
+    Rows are sorted by ``cycle`` for deterministic output and each
+    cell is sanitised so drifted next-action strings cannot break
+    table boundaries.
+    """
+    lines: list[str] = ["## Judgment / Disagreement", ""]
+    if not events:
+        lines.append("_No judgment events recorded yet._")
+        lines.append("")
+        return "\n".join(lines)
+    lines.append("| Cycle | Judgment | Orchestrator | Agreement |")
+    lines.append("|---|---|---|---|")
+    for ev in sorted(events, key=lambda e: e.get("cycle", 0)):
+        _judgment = _sanitize_md_cell(str(ev.get("judgment_next_action", "")))
+        _orchestrator = _sanitize_md_cell(
+            str(ev.get("orchestrator_next_cycle", "")),
+        )
+        _agreement_str = "yes" if ev.get("agreement") else "no"
+        lines.append(
+            f"| {ev.get('cycle', '?')} | {_judgment} "
+            f"| {_orchestrator} | {_agreement_str} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def write_milestone_summary(
     project_dir: Path,
     milestone: str,
@@ -375,6 +414,24 @@ def write_milestone_summary(
                 f"| {agg['output_tokens']:,} |"
             )
 
+    # -- Judgment / Disagreement (M36 I3) --
+    # Surfaces the coordinator LLM's ORIENT-cycle judgment alongside the
+    # orchestrator's ``determine_next_cycle`` choice so disagreement is
+    # observable in the milestone summary.  Placed after the cycle-level
+    # Phase Summary block (with which it shares the per-cycle observation
+    # grouping) and before Agents so operators scanning metrics.md see
+    # the disagreement signal in the cycle-telemetry cluster rather than
+    # among the agent-execution tables.
+    judgment_events = [
+        r for r in records
+        if r.get("event") == "cycle.judgment"
+        and r.get("milestone") == milestone
+    ]
+    _judgment_section = _render_judgment_section(judgment_events)
+    if _judgment_section:
+        lines.append("")
+        lines.append(_judgment_section.rstrip())
+
     # -- Convergence (T2-G3) --
     convergence_data = [
         (
@@ -396,15 +453,17 @@ def write_milestone_summary(
         for cn, vf, czv in convergence_data:
             lines.append(f"| {cn} | {vf} | {czv} |")
 
-    # -- Agent table (T2-G7: Input/Output columns) --
+    # -- Agent table --
+    # The SDK's TaskUsage provides only total_tokens + tool_uses; there is
+    # no per-agent input/output split, so we render what exists.
     all_task_ids = list(agent_ends) + sorted(orphaned)
     if all_task_ids:
         lines.extend([
             "",
             "## Agents",
             "",
-            "| Description | Cycle | Status | Tokens | Input | Output | Tools |",
-            "|-------------|-------|--------|--------|-------|--------|-------|",
+            "| Description | Cycle | Status | Tokens | Tools |",
+            "|-------------|-------|--------|--------|-------|",
         ])
         for task_id in all_task_ids:
             start = agent_starts.get(task_id, {})
@@ -416,8 +475,6 @@ def write_milestone_summary(
                     f"| {ae.get('cycle_num', '?')} "
                     f"| {ae.get('status', '?')} "
                     f"| {ae.get('total_tokens', 0):,} "
-                    f"| {ae.get('input_tokens', 0):,} "
-                    f"| {ae.get('output_tokens', 0):,} "
                     f"| {ae.get('tool_uses', 0)} |"
                 )
             else:
@@ -426,42 +483,33 @@ def write_milestone_summary(
                     f"| {start.get('cycle_num', '?')} "
                     f"| orphaned "
                     f"| \u2014 "
-                    f"| \u2014 "
-                    f"| \u2014 "
                     f"| \u2014 |"
                 )
 
-    # -- Agent Tiers (T2-G2) --
+    # -- Agent Tiers --
     tier_stats: dict[str, dict[str, int]] = {}
     for task_id in set(agent_starts) | set(agent_ends):
         start = agent_starts.get(task_id, {})
         end = agent_ends.get(task_id, {})
-        tier = start.get("tier") or end.get("tier") or "unknown"
+        tier = start.get("tier") or end.get("tier") or "worker"
         if tier not in tier_stats:
-            tier_stats[tier] = {
-                "count": 0, "tokens": 0,
-                "input_tokens": 0, "output_tokens": 0,
-            }
+            tier_stats[tier] = {"count": 0, "tokens": 0}
         tier_stats[tier]["count"] += 1
         tier_stats[tier]["tokens"] += end.get("total_tokens", 0)
-        tier_stats[tier]["input_tokens"] += end.get("input_tokens", 0)
-        tier_stats[tier]["output_tokens"] += end.get("output_tokens", 0)
 
     if tier_stats:
         lines.extend([
             "",
             "## Agent Tiers",
             "",
-            "| Tier | Count | Tokens | Input | Output |",
-            "|------|-------|--------|-------|--------|",
+            "| Tier | Count | Tokens |",
+            "|------|-------|--------|",
         ])
         for tier, stats in sorted(tier_stats.items()):
             lines.append(
                 f"| {tier} "
                 f"| {stats['count']} "
-                f"| {stats['tokens']:,} "
-                f"| {stats['input_tokens']:,} "
-                f"| {stats['output_tokens']:,} |"
+                f"| {stats['tokens']:,} |"
             )
 
     # -- Topology section --
@@ -654,11 +702,6 @@ def write_milestone_summary(
         if r.get("event") == "read_set.composition"
         and r.get("milestone") == milestone
     ]
-    cog_density = [
-        r for r in records
-        if r.get("event") == "read_set.reference_density"
-        and r.get("milestone") == milestone
-    ]
     cog_span = [
         r for r in records
         if r.get("event") == "cognitive.compositional_span"
@@ -686,10 +729,6 @@ def write_milestone_summary(
                 # Propagate pre_composed from composition event so the
                 # table renders it even when no span event exists.
                 entry["pre_composed"] = True
-    for r in cog_density:
-        cn = r.get("cycle_num")
-        if cn is not None and cn in cog_cycles:
-            cog_cycles[cn]["density"] = r.get("density")
     for r in cog_span:
         cn = r.get("cycle_num")
         ct = r.get("cycle_type", "")
@@ -703,24 +742,22 @@ def write_milestone_summary(
             "",
             "## Cognitive Load",
             "",
-            "| Cycle | Type | Read Set Size | Ref Density | Comp Span | Pre-composed |",
-            "|---|---|---|---|---|---|",
+            "| Cycle | Type | Read Set Size | Comp Span | Pre-composed |",
+            "|---|---|---|---|---|",
         ])
         for cn in sorted(cog_cycles):
             data = cog_cycles[cn]
             file_count = data.get("file_count")
-            density = data.get("density")
             span_val = data.get("span")
             pre_composed = data.get("pre_composed")
             lines.append(
                 f"| {cn} "
                 f"| ASSESS "
                 f"| {file_count if file_count is not None else '-'} "
-                f"| {density if density is not None else '-'} "
                 f"| {span_val if span_val is not None else '-'} "
                 f"| {'yes' if pre_composed else 'no' if pre_composed is not None else '-'} |"
             )
-    elif not cog_composition and not cog_density and not cog_span:
+    elif not cog_composition and not cog_span:
         # No cognitive events at all — skip the section entirely
         pass
     else:
@@ -913,27 +950,6 @@ def write_milestone_summary(
 # ---------------------------------------------------------------------------
 # Cognitive metrics (DB-20 Step 1)
 # ---------------------------------------------------------------------------
-
-
-def compute_reference_density(
-    read_set: list[str],
-    output_text: str,
-) -> dict[str, bool]:
-    """Check which read set files are referenced in output text.
-
-    Uses simple substring matching: for each file in read_set,
-    check if the filename (without path) appears in output_text.
-    Returns ``{filename: referenced_bool}``.
-    """
-    import os
-
-    if not read_set or not output_text:
-        return {f: False for f in read_set} if read_set else {}
-    result: dict[str, bool] = {}
-    for filepath in read_set:
-        basename = os.path.basename(filepath)
-        result[filepath] = basename in output_text
-    return result
 
 
 def parse_test_status(path: Path) -> dict[str, Any] | None:

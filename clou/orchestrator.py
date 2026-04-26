@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
 import re as _re
 import sys
 from pathlib import Path
@@ -55,6 +56,7 @@ from clou.harness import (
     read_template_name,
 )
 from clou.hooks import (
+    _strict_segment_match,
     build_hooks,
     is_cleanup_allowed,
     supervisor_cleanup_allowed,
@@ -63,6 +65,7 @@ from clou.hooks import (
 from clou.prompts import load_prompt
 from clou.recovery import parse_obsolete_flags, run_lifecycle_pipeline
 from clou.gate import UserGate
+from clou.supervisor_tools import build_supervisor_mcp_server
 from clou.tools import clou_create_milestone, clou_init, clou_spawn_coordinator, clou_status
 from clou.ui.bridge import _strip_ansi
 from clou import telemetry
@@ -252,6 +255,26 @@ def _build_milestone_guidance(project_dir: Path, milestone: str, result: str) ->
             f"To retry: modify golden context, then call "
             f"clou_spawn_coordinator. Cycle count resets "
             f"after escalation resolution."
+        )
+    if result == "halted_pending_review":
+        # M49b C1 (closes B5/L3): halted milestones do NOT have a
+        # handoff.md (only COMPLETE writes it).
+        # M49b D5 (closes B7/F2-companion): name the supervisor tool
+        # (clou_dispose_halt) explicitly — it both resolves the
+        # escalation AND rewrites the checkpoint atomically.  The
+        # standard clou_resolve_escalation is refused for engine-gated
+        # classifications (M49b D2) so the supervisor cannot
+        # accidentally take the wrong path.
+        return (
+            f"Coordinator for '{milestone}' halted pending review. "
+            f"Read {ms_dir / 'escalations'} for the trajectory-halt "
+            f"escalation (latest *-trajectory-halt.md), then call "
+            f"clou_dispose_halt(milestone, filename, choice, notes) "
+            f"to resolve.  Choices (from the escalation's ## Options): "
+            f"continue-as-is | re-scope | abandon.  The tool rewrites "
+            f"the checkpoint atomically — no separate clou_write_"
+            f"checkpoint or clou_resolve_escalation call is needed "
+            f"(both would either fail or wedge the milestone)."
         )
     return (
         f"Coordinator for '{milestone}' {result}. "
@@ -597,13 +620,16 @@ def _build_mcp_server(
         "clou_remove_artifact",
         "Remove an intermediate artifact from .clou/. Use for orphaned "
         "worker execution files, superseded brutalist assessments, "
-        "stale escalations, or obsolete verifier artifacts from aborted "
+        "stale escalations (only when disposition status is 'resolved' "
+        "or 'overridden'), or obsolete verifier artifacts from aborted "
         "or superseded runs. Protocol artifacts (milestone.md, "
         "intents.md, requirements.md, compose.py, phase.md, status.md, "
         "handoff.md, decisions.md, and root-level golden context) are "
-        "immutable — attempts to remove them are rejected. Every "
-        "removal is recorded (INFO log always; telemetry when the "
-        "telemetry pipeline is healthy).",
+        "immutable — attempts to remove them are rejected. Open "
+        "escalations (status: open/investigating/deferred) are refused: "
+        "the agent-to-agent decision record must be closed before it "
+        "can be archived. Every removal is recorded (INFO log always; "
+        "telemetry when the telemetry pipeline is healthy).",
         {
             "type": "object",
             "properties": {
@@ -743,6 +769,132 @@ def _build_mcp_server(
                 "is_error": True,
             }
 
+        # Escalation record-integrity gate (F8).  Escalations are the
+        # agent-to-agent decision record (see
+        # project_escalations_are_agent_to_agent.md) — a drifted supervisor
+        # could otherwise unilaterally erase an open ``status: open`` or
+        # ``investigating`` escalation to hide an inconvenient signal.
+        # Cleanup is only permitted once the escalation reaches a closed
+        # disposition (``resolved`` or ``overridden``); open escalations
+        # must be worked to close first.  Parser failures (corrupt file,
+        # legacy layout that doesn't surface ``disposition_status``) are
+        # treated as "not safely removable": the record must remain until
+        # a human or the disposition MCP tool moves it to a known closed
+        # state.
+        if _strict_segment_match(
+            rel_str, "milestones/*/escalations/*.md",
+        ) or _strict_segment_match(
+            rel_str, "milestones/*/escalations/*/*.md",
+        ):
+            from clou.escalation import parse_escalation
+
+            _CLOSED = {"resolved", "overridden"}
+
+            # F8 (cycle 2) — parser-trust boundary tightening.  The
+            # tolerant parse_escalation CAN synthesise a disposition
+            # status from legacy preamble keys (``**Status:** resolved``
+            # or similar) even when the file has no terminal
+            # ``## Disposition`` heading at all.  Giving the supervisor
+            # delete authority in that case means a drifted LLM can
+            # write a LEGACY-shaped file (preamble only, no Disposition
+            # block), then request removal, and bypass the "agent-to-
+            # agent record" invariant.  The structural fix is to REQUIRE
+            # the canonical ``## Disposition`` heading in the raw bytes
+            # — the literal-string check here is a second layer that
+            # the parser's tolerance cannot relax.  We also reject
+            # removal on symlinks even at this gate (belt-and-braces:
+            # ``requested.is_symlink`` above already blocks this, but
+            # escalation paths are the higher-stakes surface, so the
+            # explicit double-check makes the invariant auditable).
+            if target.is_symlink():
+                return {
+                    "content": [{
+                        "type": "text",
+                        "text": (
+                            f"Refusing to remove .clou/{rel_str}: "
+                            "escalation target is a symlink; only "
+                            "regular files may be archived."
+                        ),
+                    }],
+                    "is_error": True,
+                }
+            try:
+                raw_text = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                return {
+                    "content": [{
+                        "type": "text",
+                        "text": (
+                            f"Refusing to remove .clou/{rel_str}: "
+                            f"cannot read file to verify ## Disposition "
+                            f"heading ({exc})."
+                        ),
+                    }],
+                    "is_error": True,
+                }
+            # Scan for the literal ``## Disposition`` heading on its own
+            # line (case-sensitive; the canonical writer emits the
+            # exact form).  We accept any leading/trailing whitespace
+            # on the line but require the heading to appear as a
+            # top-level h2, not inside a code fence or inline.  A
+            # naive ``"## Disposition" in raw_text`` is defeated by
+            # embedded occurrences (e.g. inside a ```` ``` ```` block);
+            # keying on line-start via splitlines() avoids that class.
+            _heading_lines = (
+                line.strip()
+                for line in raw_text.splitlines()
+            )
+            has_disposition_heading = any(
+                line == "## Disposition"
+                for line in _heading_lines
+            )
+            if not has_disposition_heading:
+                return {
+                    "content": [{
+                        "type": "text",
+                        "text": (
+                            f"Refusing to remove .clou/{rel_str}: "
+                            "file has no canonical '## Disposition' "
+                            "heading. Only escalations with a canonical "
+                            "Disposition section whose status is "
+                            "'resolved' or 'overridden' may be archived. "
+                            "Use mcp__clou_supervisor__clou_resolve_escalation "
+                            "to close the escalation first."
+                        ),
+                    }],
+                    "is_error": True,
+                }
+            try:
+                form = parse_escalation(target)
+            except Exception:
+                return {
+                    "content": [{
+                        "type": "text",
+                        "text": (
+                            f"Refusing to remove .clou/{rel_str}: could "
+                            "not parse escalation to verify disposition. "
+                            "Open escalations are the agent-to-agent "
+                            "decision record and must be resolved "
+                            "(status: resolved|overridden) before removal."
+                        ),
+                    }],
+                    "is_error": True,
+                }
+            status = (form.disposition_status or "").strip().lower()
+            if status not in _CLOSED:
+                return {
+                    "content": [{
+                        "type": "text",
+                        "text": (
+                            f"Refusing to remove .clou/{rel_str}: "
+                            f"disposition status is {status or 'open'!r}. "
+                            "Only escalations with status in "
+                            "{'resolved', 'overridden'} may be archived."
+                        ),
+                    }],
+                    "is_error": True,
+                }
+
         try:
             size = target.stat().st_size
             target.unlink()
@@ -850,6 +1002,174 @@ def _build_mcp_server(
 
 
 # ---------------------------------------------------------------------------
+# Supervisor-scoped clou_coordinator filing server (F4)
+# ---------------------------------------------------------------------------
+#
+# Historical context.  The coordinator's ``clou_file_escalation`` tool
+# (``clou.coordinator_tools``) is closure-bound to a single milestone
+# at server-construction time: the coordinator knows which milestone
+# it owns.  The supervisor, by contrast, spans multiple milestones and
+# cannot fix a single milestone at construction time.  Without a
+# filing pathway the supervisor is painted into a corner: direct
+# Write to ``escalations/*.md`` is hook-denied (cycle-1 scope) and
+# the resolution-only tool (``clou_resolve_escalation``) cannot
+# manufacture a new file.  F4 (cycle 2) therefore gives the
+# supervisor a parallel filing tool whose milestone is passed as a
+# REQUIRED arg at call time.  We expose it under the server name
+# ``clou_coordinator`` so the fully-qualified tool name matches the
+# string in the hook's deny reason
+# (``mcp__clou_coordinator__clou_file_escalation``); the supervisor
+# follows the same retry advice as any other tier.
+#
+# Scope boundary.  This mount lives ENTIRELY in orchestrator.py.  The
+# coordinator-session mount of ``clou_coordinator`` (built in
+# ``clou.coordinator.run_coordinator``) uses
+# ``build_coordinator_mcp_server(project_dir, milestone)`` which is
+# unchanged — a coordinator still sees the milestone-scoped tool
+# surface.  Only the supervisor session gets this wrapping.
+
+
+def _build_supervisor_filing_server(project_dir: Path) -> Any:
+    """Build an MCP server exposing ``clou_file_escalation`` with
+    ``milestone`` as a per-call argument (F4).
+
+    The server name is ``clou_coordinator`` so the fully qualified
+    tool name is ``mcp__clou_coordinator__clou_file_escalation`` —
+    the same string that appears in the hook's escalation deny
+    reason.  This keeps the retry advice coherent across tiers: the
+    supervisor sees the same tool name a worker would see and does
+    not need special-case knowledge of a supervisor-only namespace.
+
+    The handler delegates to the coordinator-tools implementation by
+    lazily constructing a per-call filing tool via
+    ``_build_coordinator_tools`` and forwarding the args.  This means
+    ALL validation, slug handling, exclusive-write, and render paths
+    are shared with the coordinator's own filing tool — no parallel
+    implementation to drift.
+    """
+    from clou.coordinator_tools import _build_coordinator_tools
+    from clou.recovery import validate_milestone_name
+
+    @tool(
+        "clou_file_escalation",
+        "File an agent-to-agent escalation (supervisor-tier entry "
+        "point).  Takes a required ``milestone`` argument in addition "
+        "to the fields the coordinator-tier tool accepts; otherwise "
+        "forwards directly to "
+        "``mcp__clou_coordinator__clou_file_escalation`` via the same "
+        "code path (render_escalation + exclusive-write + slug "
+        "suffixing).  Use when a supervisor needs to file a new "
+        "escalation for a milestone whose coordinator session is not "
+        "currently active.  Direct Write to escalations/*.md is "
+        "hook-denied for every tier (DB-21 remolding).",
+        {
+            "type": "object",
+            "properties": {
+                "milestone": {
+                    "type": "string",
+                    "description": (
+                        "Milestone slug (e.g. '41-escalation-remolding'). "
+                        "Must match [a-z0-9][a-z0-9-]*.  The escalation "
+                        "file lands under "
+                        ".clou/milestones/{milestone}/escalations/."
+                    ),
+                },
+                "title": {"type": "string"},
+                "classification": {
+                    "type": "string",
+                    "description": (
+                        "e.g. blocking | degraded | informational | "
+                        "architectural | noise — open set."
+                    ),
+                },
+                "context": {"type": "string"},
+                "issue": {"type": "string"},
+                "evidence": {"type": "string"},
+                "options": {
+                    "type": "array",
+                    "description": (
+                        "List of {label, description} objects.  Must "
+                        "have at least one entry with a non-empty label."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                    },
+                },
+                "recommendation": {"type": "string"},
+                "slug": {
+                    "type": "string",
+                    "description": (
+                        "Optional.  If absent, derived from title."
+                    ),
+                },
+            },
+            "required": [
+                "milestone", "title", "classification", "issue", "options",
+            ],
+        },
+    )
+    async def supervisor_file_escalation_tool(
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        # Extract and validate milestone first --- every other field is
+        # forwarded verbatim to the per-milestone tool handler.
+        milestone = args.get("milestone", "")
+        if not isinstance(milestone, str) or not milestone.strip():
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": "milestone must be a non-empty string",
+                }],
+                "is_error": True,
+            }
+        milestone = milestone.strip()
+        try:
+            validate_milestone_name(milestone)
+        except ValueError as exc:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": f"invalid milestone: {exc}",
+                }],
+                "is_error": True,
+            }
+        # Build the per-milestone tool list lazily and locate the
+        # filing tool.  We match by ``name`` rather than positional
+        # index so additions to ``_build_coordinator_tools`` cannot
+        # silently break this forwarder.
+        per_ms_tools = _build_coordinator_tools(project_dir, milestone)
+        filing = next(
+            (t for t in per_ms_tools if getattr(t, "name", "") == "clou_file_escalation"),
+            None,
+        )
+        if filing is None:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        "clou_file_escalation tool not registered by "
+                        "_build_coordinator_tools — internal wiring error."
+                    ),
+                }],
+                "is_error": True,
+            }
+        # Forward everything except ``milestone`` (the per-call
+        # coordinator tool has the milestone baked into its closure).
+        forwarded = {k: v for k, v in args.items() if k != "milestone"}
+        handler = getattr(filing, "handler", filing)
+        return await handler(forwarded)
+
+    return create_sdk_mcp_server(
+        "clou_coordinator",
+        tools=[supervisor_file_escalation_tool],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Supervisor session
 # ---------------------------------------------------------------------------
 
@@ -881,10 +1201,66 @@ async def run_supervisor(
             telemetry.event("startup.lifecycle_pipeline.error")
             log.warning("Lifecycle pipeline failed", exc_info=True)
 
+    # F19 (cycle 2): split the formerly single ``startup.mcp_server``
+    # span into per-server spans.  Before the split, a failure in any
+    # one of the three MCP server builders
+    # (``clou``, ``clou_supervisor``, ``clou_coordinator``) surfaced
+    # under a shared span name, making failure attribution a guessing
+    # game ("which builder raised?").  Per-server spans let the
+    # telemetry reader see exactly which builder raised the error and
+    # what succeeded before the failure.  We keep the original
+    # ``startup.mcp_server.start/end`` envelope span so existing
+    # downstream dashboards and tests that assert on the aggregate
+    # event continue to work, and nest the per-server spans inside it.
     try:
         telemetry.event("startup.mcp_server.start")
         user_gate = UserGate()
-        clou_server = _build_mcp_server(project_dir, app=app, gate=user_gate)
+        # Primary ``clou`` server: universal tools available to every
+        # agent session (ask_user, clou_status, spawn_coordinator, ...).
+        try:
+            telemetry.event("startup.mcp_server.clou.start")
+            clou_server = _build_mcp_server(
+                project_dir, app=app, gate=user_gate,
+            )
+            telemetry.event("startup.mcp_server.clou.end")
+        except Exception:
+            telemetry.event("startup.mcp_server.clou.error")
+            raise
+        # Supervisor-tier MCP surface: exposes ``clou_resolve_escalation``
+        # so the supervisor can close escalation files through the tool
+        # (direct Write to escalations/*.md is hook-denied for every tier
+        # per the DB-21 remolding, milestone 41).  The server is built in
+        # ``clou.supervisor_tools`` and mounted here alongside the primary
+        # ``clou`` server --- matching the coordinator-tier pattern where
+        # ``build_coordinator_mcp_server`` sits next to the template
+        # servers on the coordinator's ``mcp_servers`` dict.
+        try:
+            telemetry.event("startup.mcp_server.supervisor.start")
+            clou_supervisor_server = build_supervisor_mcp_server(
+                project_dir,
+            )
+            telemetry.event("startup.mcp_server.supervisor.end")
+        except Exception:
+            telemetry.event("startup.mcp_server.supervisor.error")
+            raise
+        # Supervisor-mounted ``clou_coordinator`` filing server (F4).
+        # The coordinator-session mount uses the milestone-scoped
+        # ``build_coordinator_mcp_server``; the supervisor uses this
+        # parallel mount so ``milestone`` becomes a tool arg instead of
+        # a closure-captured constant --- required because the
+        # supervisor spans multiple milestones within one session.  The
+        # tool name ``mcp__clou_coordinator__clou_file_escalation``
+        # matches the hook's deny-reason text so retry advice is
+        # coherent across tiers.
+        try:
+            telemetry.event("startup.mcp_server.coordinator.start")
+            clou_coordinator_server = _build_supervisor_filing_server(
+                project_dir,
+            )
+            telemetry.event("startup.mcp_server.coordinator.end")
+        except Exception:
+            telemetry.event("startup.mcp_server.coordinator.error")
+            raise
         telemetry.event("startup.mcp_server.end")
     except Exception:
         telemetry.event("startup.mcp_server.error")
@@ -901,12 +1277,21 @@ async def run_supervisor(
         telemetry.event("startup.hooks.error")
         raise
 
-    # Supervisor gets clou MCP server only — no quality gate servers.
+    # Supervisor gets the ``clou`` MCP server plus the ``clou_supervisor``
+    # server (escalation disposition) plus the supervisor-mounted
+    # ``clou_coordinator`` filing server (F4).  No quality gate servers.
     # Quality gates are invoked by the brutalist during ASSESS cycles,
     # not by the supervisor.  Keeping the tool set small prevents
     # Claude Code from deferring critical tools like ask_user behind
     # ToolSearch.
-    mcp_dict: dict[str, Any] = {"clou": clou_server}
+    mcp_dict: dict[str, Any] = {
+        "clou": clou_server,
+        "clou_supervisor": clou_supervisor_server,
+        # F4: the supervisor needs filing authority for escalations.
+        # The tool name matches the hook's deny reason so retry advice
+        # is coherent across tiers.
+        "clou_coordinator": clou_coordinator_server,
+    }
 
     # The SDK session's working directory is where the user invoked clou,
     # not necessarily where .clou/ lives (which may be the global workspace).
@@ -940,6 +1325,34 @@ async def run_supervisor(
             "mcp__clou__clou_init",
             "mcp__clou__clou_create_milestone",
             "mcp__clou__clou_remove_artifact",
+            # DB-21 / milestone 41: escalation disposition --- supervisor
+            # closes escalations via MCP because direct Write to
+            # ``escalations/*.md`` is denied by the PreToolUse hook.
+            "mcp__clou_supervisor__clou_resolve_escalation",
+            # M49b B6 / E2: engine-gated escalation disposition —
+            # ``clou_dispose_halt`` is the supervisor's ONLY path out
+            # of HALTED_PENDING_REVIEW because it rewrites both the
+            # escalation AND the milestone checkpoint atomically
+            # (checkpoint-first ordering for crash-safe replay; D1).
+            # ``clou_resolve_escalation`` above refuses engine-gated
+            # classifications (D2), so without THIS allow-list entry a
+            # halted milestone is operationally unrecoverable from the
+            # supervisor session.
+            "mcp__clou_supervisor__clou_dispose_halt",
+            # C3 (zero-escalations): supervisor reads milestone proposals
+            # filed by coordinators for cross-cutting work.  Without
+            # this in allowed_tools, coordinators file proposals that
+            # the supervisor cannot see -- consumer starvation under
+            # the zero-escalations principle.
+            "mcp__clou_supervisor__clou_list_proposals",
+            "mcp__clou_supervisor__clou_dispose_proposal",
+            # F4 (cycle 2): supervisor filing path.  Matches the
+            # hook's deny-reason text so an agent that hits a denied
+            # direct Write has an actionable, resolvable tool name to
+            # retry with.  The supervisor-mounted ``clou_coordinator``
+            # server accepts ``milestone`` as a per-call arg (see
+            # ``_build_supervisor_filing_server``).
+            "mcp__clou_coordinator__clou_file_escalation",
         ],
     )
 
@@ -1292,16 +1705,36 @@ async def run_supervisor(
 
 async def main() -> None:
     """Clou entry point."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
-
     from clou.project import resolve_project_dir_or_exit
 
     work_dir = Path.cwd()
     project_dir = resolve_project_dir_or_exit()
     clou_dir = project_dir / ".clou"
+
+    # Configure logging with both stderr and a rotating file handler.
+    # Textual's ``_PrintCapture`` swallows stderr — without a file
+    # destination, ``log.exception`` tracebacks die with the app.
+    # The file handler keeps post-mortem evidence (e.g. coordinator-
+    # cycle crashes, brutalist agent failures) on disk under
+    # ``.clou/logs/clou.log``.
+    logs_dir = clou_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.handlers.RotatingFileHandler(
+        logs_dir / "clou.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(name)s %(levelname)s %(message)s",
+        ),
+    )
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        handlers=[logging.StreamHandler(), file_handler],
+    )
 
     if not clou_dir.exists():
         await clou_init(project_dir, project_dir.name, "")

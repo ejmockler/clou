@@ -135,7 +135,13 @@ template = HarnessTemplate(
             "milestones/*/milestone.md",
             "milestones/*/intents.md",
             "milestones/*/requirements.md",
-            "milestones/*/escalations/*.md",
+            # escalations/*.md intentionally absent — writes go through
+            # mcp__clou_coordinator__clou_file_escalation so code owns
+            # the EscalationForm schema (DB-21 remolding).  Direct
+            # Write is hook-denied.
+            # judgments/*.md intentionally absent — writes go through
+            # mcp__clou_coordinator__clou_write_judgment so code owns the
+            # JudgmentForm schema. Direct Write is hook-denied (DB-14).
             "active/supervisor.md",
         ],
         "coordinator": [
@@ -143,29 +149,47 @@ template = HarnessTemplate(
             # status.md and active/coordinator.md are protocol artifacts —
             # written via MCP tools, not direct Write.
             "milestones/*/decisions.md",
-            "milestones/*/escalations/*.md",
+            # escalations/*.md intentionally absent — writes go through
+            # mcp__clou_coordinator__clou_file_escalation so code owns
+            # the EscalationForm schema (DB-21 remolding).  Direct
+            # Write is hook-denied.
+            # judgments/*.md intentionally absent — writes go through
+            # mcp__clou_coordinator__clou_write_judgment so code owns the
+            # JudgmentForm schema. Direct Write is hook-denied (DB-14).
             "milestones/*/phases/*/phase.md",
         ],
         "worker": [
             "milestones/*/phases/*/execution.md",
             # execution-*.md intentionally absent — those are
             # coordinator-generated failure shards written in-process.
+            # judgments/*.md intentionally absent — writes go through
+            # mcp__clou_coordinator__clou_write_judgment so code owns the
+            # JudgmentForm schema. Direct Write is hook-denied (DB-14).
         ],
         "verifier": [
             "milestones/*/phases/verification/execution.md",
             "milestones/*/phases/verification/artifacts/*",
             "milestones/*/handoff.md",
+            # judgments/*.md intentionally absent — writes go through
+            # mcp__clou_coordinator__clou_write_judgment so code owns the
+            # JudgmentForm schema. Direct Write is hook-denied (DB-14).
         ],
         "brutalist": [
             # assessment.md intentionally absent — writes go through
             # clou_write_assessment so code owns the structure and
             # drift (e.g. ad-hoc "## Phase: X" sections) is impossible.
+            # judgments/*.md intentionally absent — writes go through
+            # mcp__clou_coordinator__clou_write_judgment so code owns the
+            # JudgmentForm schema. Direct Write is hook-denied (DB-14).
         ],
         "assess-evaluator": [
             # assessment.md intentionally absent — classifications go
             # through clou_append_classifications.  decisions.md remains
             # freeform because it's prose-per-cycle without a validator
             # structure expectation.
+            # judgments/*.md intentionally absent — writes go through
+            # mcp__clou_coordinator__clou_write_judgment so code owns the
+            # JudgmentForm schema. Direct Write is hook-denied (DB-14).
             "milestones/*/decisions.md",
         ],
     },

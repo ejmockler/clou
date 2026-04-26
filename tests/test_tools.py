@@ -109,6 +109,332 @@ def test_status_ignores_milestone_without_escalation_dir(
     assert result == "No status information available."
 
 
+# F30 — parse disposition and filter by status.  Resolved/overridden
+# escalations are historical decision records; surfacing them as "Open
+# Escalations" drowns the supervisor in false urgency.  The filter
+# keeps open / investigating / deferred visible and hides resolved /
+# overridden.  Parse failures surface with "(parse-error)" so drift
+# is visible, matching the passive breath-event policy from F29.
+
+
+_CANONICAL_ESC = (
+    "# Escalation: blocker\n\n"
+    "**Classification:** blocking\n"
+    "**Filed:** 2026-04-21\n\n"
+    "## Context\nctx\n\n"
+    "## Issue\niss\n\n"
+    "## Evidence\nev\n\n"
+    "## Options\n1. **A** --- one\n2. **B** --- two\n\n"
+    "## Recommendation\nrec\n\n"
+    "## Disposition\nstatus: {status}\n"
+)
+
+
+def test_status_surfaces_open_escalation(tmp_path: Path) -> None:
+    """F30: a canonical open escalation is listed."""
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+    (esc_dir / "open.md").write_text(_CANONICAL_ESC.format(status="open"))
+
+    result = asyncio.run(clou_status(tmp_path))
+    assert "## Open Escalations" in result
+    assert "m01-auth/open.md" in result
+
+
+def test_status_hides_resolved_escalation(tmp_path: Path) -> None:
+    """F30: resolved escalations are historical, not operational."""
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+    (esc_dir / "resolved.md").write_text(
+        _CANONICAL_ESC.format(status="resolved")
+    )
+
+    result = asyncio.run(clou_status(tmp_path))
+    # Either there's no Open Escalations section, or the resolved file
+    # is not in it.
+    assert "m01-auth/resolved.md" not in result
+
+
+def test_status_hides_overridden_escalation(tmp_path: Path) -> None:
+    """F30: overridden escalations are also historical."""
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+    (esc_dir / "overridden.md").write_text(
+        _CANONICAL_ESC.format(status="overridden")
+    )
+
+    result = asyncio.run(clou_status(tmp_path))
+    assert "m01-auth/overridden.md" not in result
+
+
+def test_status_surfaces_investigating_and_deferred(tmp_path: Path) -> None:
+    """F30: investigating and deferred remain visible."""
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+    (esc_dir / "investigating.md").write_text(
+        _CANONICAL_ESC.format(status="investigating")
+    )
+    (esc_dir / "deferred.md").write_text(
+        _CANONICAL_ESC.format(status="deferred")
+    )
+
+    result = asyncio.run(clou_status(tmp_path))
+    assert "## Open Escalations" in result
+    assert "m01-auth/investigating.md" in result
+    assert "m01-auth/deferred.md" in result
+
+
+def test_status_mixes_open_hidden_and_visible(tmp_path: Path) -> None:
+    """F30: resolved is hidden while open escalations surface."""
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+    (esc_dir / "open.md").write_text(_CANONICAL_ESC.format(status="open"))
+    (esc_dir / "resolved.md").write_text(
+        _CANONICAL_ESC.format(status="resolved")
+    )
+
+    result = asyncio.run(clou_status(tmp_path))
+    assert "m01-auth/open.md" in result
+    assert "m01-auth/resolved.md" not in result
+
+
+def test_status_parser_exception_propagates(tmp_path: Path) -> None:
+    """F13 (cycle 2): parser regressions must NOT hide behind a broad
+    ``except`` at DEBUG level — the cycle-1 F30 handling caught every
+    ``Exception`` and logged at ``debug``, so a systematic parser
+    regression would have landed silently in CI.  The cycle-2 contract
+    narrows the catch to the read stage only; if
+    :func:`clou.escalation.parse_escalation` raises (which violates its
+    contract — the parser MUST NOT raise), the exception propagates so
+    operators see the drift immediately.
+    """
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+
+    target = esc_dir / "drifted.md"
+    target.write_text("literally anything; we patch parse_escalation")
+
+    from unittest.mock import patch
+
+    with patch(
+        "clou.escalation.parse_escalation",
+        side_effect=RuntimeError("synthetic parse failure"),
+    ):
+        with pytest.raises(RuntimeError, match="synthetic parse failure"):
+            asyncio.run(clou_status(tmp_path))
+
+
+def test_status_default_status_is_open(tmp_path: Path) -> None:
+    """F30: absent disposition defaults to open — the coordinator has
+    not yet filled in a resolution and the supervisor needs to see it.
+    """
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+    # No ## Disposition section at all.
+    (esc_dir / "fresh.md").write_text(
+        "# Escalation: fresh\n\n"
+        "**Classification:** blocking\n\n"
+        "## Issue\nx\n\n"
+        "## Options\n1. **A** --- a\n"
+    )
+
+    result = asyncio.run(clou_status(tmp_path))
+    assert "m01-auth/fresh.md" in result
+
+
+# ---------------------------------------------------------------------------
+# F13 / F21 (cycle 2) — clou_status hardening
+# ---------------------------------------------------------------------------
+
+
+def test_status_surfaces_unknown_disposition_with_marker(
+    tmp_path: Path,
+) -> None:
+    """F21 partial: a file whose raw disposition token is outside
+    ``VALID_DISPOSITION_STATUSES`` (e.g. ``status: closed``) must
+    surface with ``(unknown: <raw>)`` — NOT be silently hidden.
+    Tolerance on read must not become suppression on display.
+    """
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+    (esc_dir / "closed.md").write_text(
+        _CANONICAL_ESC.format(status="closed")
+    )
+
+    result = asyncio.run(clou_status(tmp_path))
+    assert "m01-auth/closed.md" in result, (
+        "unknown-disposition files must NOT disappear from status"
+    )
+    assert "(unknown: closed)" in result, (
+        "the raw drifted token must be visible so operators can "
+        "chase it down"
+    )
+
+
+def test_status_unknown_status_not_treated_as_open(tmp_path: Path) -> None:
+    """F21: unknown statuses get their own marker — they must not
+    count as ``open`` AND they must not be silently hidden as
+    ``resolved``.  The marker line is the only place they appear.
+    """
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+    (esc_dir / "legacy.md").write_text(
+        _CANONICAL_ESC.format(status="pending")
+    )
+    # Also add a real open file so we can prove the unknown one is
+    # NOT filed under the default open bucket.
+    (esc_dir / "open.md").write_text(_CANONICAL_ESC.format(status="open"))
+
+    result = asyncio.run(clou_status(tmp_path))
+    # The unknown file is surfaced with its marker.
+    assert "m01-auth/legacy.md (unknown: pending)" in result
+    # The open file is surfaced without a marker (it's genuinely open).
+    lines = result.splitlines()
+    open_lines = [
+        line for line in lines
+        if "m01-auth/open.md" in line and "(unknown" not in line
+    ]
+    assert open_lines, "genuine open file must still surface"
+
+
+def test_status_read_error_narrow_exception(tmp_path: Path) -> None:
+    """F13: OSError / UnicodeDecodeError from the READ stage are
+    caught and surfaced with ``(read-error)`` — but the catch does NOT
+    widen to other exceptions.  Prior to cycle 2 the handler was
+    ``except Exception`` at DEBUG, hiding real regressions.
+    """
+    from unittest.mock import patch
+
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+    (esc_dir / "unreadable.md").write_text("whatever")
+
+    # Patch the bounded reader to raise OSError — the listing still
+    # completes and surfaces the file with a read-error marker.
+    with patch(
+        "clou.tools._read_escalation_bounded",
+        side_effect=OSError("permission denied"),
+    ):
+        result = asyncio.run(clou_status(tmp_path))
+
+    assert "m01-auth/unreadable.md" in result
+    assert "(read-error)" in result
+
+
+def test_status_read_error_unicode_decode_caught(tmp_path: Path) -> None:
+    """F13: UnicodeDecodeError on read is narrow-caught; listing
+    survives with a ``(read-error)`` marker."""
+    from unittest.mock import patch
+
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+    (esc_dir / "bad-encoding.md").write_text("whatever")
+
+    with patch(
+        "clou.tools._read_escalation_bounded",
+        side_effect=UnicodeDecodeError(
+            "utf-8", b"\xff\xfe", 0, 1, "invalid start byte",
+        ),
+    ):
+        result = asyncio.run(clou_status(tmp_path))
+
+    assert "m01-auth/bad-encoding.md" in result
+    assert "(read-error)" in result
+
+
+def test_status_runtime_error_from_read_propagates(tmp_path: Path) -> None:
+    """F13: narrow catch means a RuntimeError from the read stage
+    propagates — the handler only swallows OSError and
+    UnicodeDecodeError.  Any other exception must surface.
+    """
+    from unittest.mock import patch
+
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+    (esc_dir / "anything.md").write_text("content")
+
+    with patch(
+        "clou.tools._read_escalation_bounded",
+        side_effect=RuntimeError("unexpected"),
+    ):
+        with pytest.raises(RuntimeError, match="unexpected"):
+            asyncio.run(clou_status(tmp_path))
+
+
+def test_status_truncates_oversized_files(tmp_path: Path) -> None:
+    """F13: oversized escalation files are truncated before parsing,
+    so a single 10MB log accidentally committed as an escalation
+    cannot stall ``clou_status``.  We assert by checking that the
+    read helper respects the byte cap.
+    """
+    from clou.tools import _ESCALATION_MAX_BYTES, _read_escalation_bounded
+
+    clou_dir = tmp_path / ".clou"
+    esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+    esc_dir.mkdir(parents=True)
+
+    # Write a 100 KiB file — well above the 64 KiB cap.
+    oversized = esc_dir / "huge.md"
+    huge_content = "# Escalation: big\n\n" + ("a" * 100_000)
+    oversized.write_text(huge_content)
+    assert oversized.stat().st_size > _ESCALATION_MAX_BYTES
+
+    content = _read_escalation_bounded(oversized)
+    assert len(content) <= _ESCALATION_MAX_BYTES, (
+        "read helper must truncate to _ESCALATION_MAX_BYTES"
+    )
+    # End-to-end: clou_status still returns cleanly; the file surfaces
+    # in the listing.
+    result = asyncio.run(clou_status(tmp_path))
+    assert "m01-auth/huge.md" in result
+
+
+def test_status_caps_listing_with_and_more_suffix(tmp_path: Path) -> None:
+    """F13: per-milestone listing caps at MAX_ESCALATIONS_PER_STATUS.
+    Excess entries collapse to a single ``...and N more`` suffix so
+    drift remains visible (the count is surfaced) but the work stays
+    bounded.
+    """
+    # Stub the cap to a small number for test speed.
+    import clou.tools as tools
+
+    original_cap = tools.MAX_ESCALATIONS_PER_STATUS
+    try:
+        tools.MAX_ESCALATIONS_PER_STATUS = 3
+
+        clou_dir = tmp_path / ".clou"
+        esc_dir = clou_dir / "milestones" / "m01-auth" / "escalations"
+        esc_dir.mkdir(parents=True)
+
+        # Create 5 open escalations — 2 more than the cap.
+        for i in range(5):
+            (esc_dir / f"open-{i:03d}.md").write_text(
+                _CANONICAL_ESC.format(status="open")
+            )
+
+        result = asyncio.run(clou_status(tmp_path))
+
+        # The cap was 3; the remaining 2 collapse to a suffix.
+        assert "...and 2 more" in result, (
+            "excess entries must collapse to a single '...and N more' "
+            "line; got listing:\n" + result
+        )
+    finally:
+        tools.MAX_ESCALATIONS_PER_STATUS = original_cap
+
+
 # ---------------------------------------------------------------------------
 # clou_init
 # ---------------------------------------------------------------------------
@@ -174,7 +500,7 @@ def test_init_does_not_overwrite(tmp_path: Path) -> None:
 
 
 def test_init_copies_prompt_files(tmp_path: Path) -> None:
-    """Init copies all 14 bundled prompt files to .clou/prompts/."""
+    """Init copies all bundled prompt files to .clou/prompts/."""
     from clou.prompts import _BUNDLED_PROMPTS
 
     asyncio.run(clou_init(tmp_path, "MyProject", "A cool project"))
@@ -187,7 +513,9 @@ def test_init_copies_prompt_files(tmp_path: Path) -> None:
         for f in _BUNDLED_PROMPTS.iterdir()
         if f.is_file() and f.name != "__init__.py"
     )
-    assert len(expected) == 17
+    # 17 pre-M36 prompts + 1 coordinator-orient.md prompt added in
+    # M36 = 18 bundled prompts.
+    assert len(expected) == 18
     assert copied == expected
 
 

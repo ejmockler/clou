@@ -1100,10 +1100,10 @@ class TestSectionOrdering:
 class TestCognitiveLoadSection:
     """## Cognitive Load section renders from cognitive telemetry events."""
 
-    def test_cognitive_load_section_renders_all_three_events(
+    def test_cognitive_load_section_renders_composition_and_span(
         self, tmp_path: Path,
     ) -> None:
-        """All three event types produce a complete Cognitive Load table row."""
+        """Composition + span produce a complete Cognitive Load table row."""
         old = telemetry._log
         try:
             init("test-cog-full", tmp_path)
@@ -1117,10 +1117,6 @@ class TestCognitiveLoadSection:
                 files=["assess_summary.md", "decisions.md"],
             )
             event(
-                "read_set.reference_density", milestone="m1", cycle_num=3,
-                density=0.85, referenced_count=2, total_count=2,
-            )
-            event(
                 "cognitive.compositional_span", milestone="m1", cycle_num=3,
                 cycle_type="ASSESS", span=2,
                 chain=["compose.py", "execution.md"], pre_composed=True,
@@ -1131,12 +1127,11 @@ class TestCognitiveLoadSection:
                 tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
             ).read_text()
             assert "## Cognitive Load" in content
-            assert "| Cycle | Type | Read Set Size | Ref Density | Comp Span | Pre-composed |" in content
+            assert "| Cycle | Type | Read Set Size | Comp Span | Pre-composed |" in content
             # Row for cycle 3
             assert "| 3 " in content
             assert "ASSESS" in content
             assert "| 2 " in content
-            assert "| 0.85 " in content
             assert "| yes |" in content
         finally:
             telemetry._log = old
@@ -1157,10 +1152,6 @@ class TestCognitiveLoadSection:
                 cycle_type="ASSESS", file_count=4,
                 files=["a.md", "b.md", "c.md", "d.md"],
             )
-            event(
-                "read_set.reference_density", milestone="m1", cycle_num=5,
-                density=0.75, referenced_count=3, total_count=4,
-            )
             # No cognitive.compositional_span event
             write_milestone_summary(tmp_path, "m1", "completed")
 
@@ -1170,7 +1161,6 @@ class TestCognitiveLoadSection:
             assert "## Cognitive Load" in content
             assert "| 5 " in content
             assert "| 4 " in content
-            assert "| 0.75 " in content
             # Span and pre_composed should show dashes
             assert "| - |" in content
         finally:
@@ -1910,3 +1900,235 @@ class TestPatternInfluenceIntegration:
                 assert "3" in line, f"cycle 3 missing from referenced row: {line!r}"
         finally:
             telemetry._log = old
+
+
+# ---------------------------------------------------------------------------
+# Judgment / Disagreement section in metrics.md (M36 I3)
+# ---------------------------------------------------------------------------
+
+
+class TestJudgmentDisagreementSection:
+    """## Judgment / Disagreement section renders cycle.judgment events."""
+
+    def test_agreement_event_renders_yes(self, tmp_path: Path) -> None:
+        """An agreement=True event emits a row with ``yes`` in the column."""
+        from clou.telemetry import _render_judgment_section
+
+        old = telemetry._log
+        try:
+            init("test-judgment-agree", tmp_path)
+            event(
+                "cycle.judgment", milestone="m1", cycle=1,
+                judgment_next_action="PLAN",
+                orchestrator_next_cycle="PLAN", agreement=True,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Judgment / Disagreement" in content
+            assert "| Cycle | Judgment | Orchestrator | Agreement |" in content
+            assert "| 1 | PLAN | PLAN | yes |" in content
+        finally:
+            telemetry._log = old
+
+    def test_disagreement_event_renders_no(self, tmp_path: Path) -> None:
+        """An agreement=False event emits a row with ``no``."""
+        old = telemetry._log
+        try:
+            init("test-judgment-disagree", tmp_path)
+            event(
+                "cycle.judgment", milestone="m1", cycle=2,
+                judgment_next_action="EXECUTE",
+                orchestrator_next_cycle="ASSESS", agreement=False,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Judgment / Disagreement" in content
+            assert "| 2 | EXECUTE | ASSESS | no |" in content
+        finally:
+            telemetry._log = old
+
+    def test_multiple_cycles_sorted(self, tmp_path: Path) -> None:
+        """Events for cycles 3, 1, 2 render as rows 1, 2, 3."""
+        old = telemetry._log
+        try:
+            init("test-judgment-sort", tmp_path)
+            event(
+                "cycle.judgment", milestone="m1", cycle=3,
+                judgment_next_action="VERIFY",
+                orchestrator_next_cycle="VERIFY", agreement=True,
+            )
+            event(
+                "cycle.judgment", milestone="m1", cycle=1,
+                judgment_next_action="PLAN",
+                orchestrator_next_cycle="PLAN", agreement=True,
+            )
+            event(
+                "cycle.judgment", milestone="m1", cycle=2,
+                judgment_next_action="EXECUTE",
+                orchestrator_next_cycle="EXECUTE", agreement=True,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Judgment / Disagreement" in content
+            # Extract just the judgment section
+            start = content.index("## Judgment / Disagreement")
+            section = content[start:]
+            # Cut at the next ## section (if any)
+            _next = section.find("\n## ", 1)
+            if _next > 0:
+                section = section[:_next]
+            pos_1 = section.index("| 1 | PLAN")
+            pos_2 = section.index("| 2 | EXECUTE")
+            pos_3 = section.index("| 3 | VERIFY")
+            assert pos_1 < pos_2 < pos_3, (
+                f"expected cycle rows sorted 1,2,3 but got "
+                f"pos_1={pos_1} pos_2={pos_2} pos_3={pos_3}"
+            )
+        finally:
+            telemetry._log = old
+
+    def test_empty_events_renders_stub(self, tmp_path: Path) -> None:
+        """No cycle.judgment events still produce the section with stub body."""
+        old = telemetry._log
+        try:
+            init("test-judgment-empty", tmp_path)
+            # No events at all for this milestone.
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Judgment / Disagreement" in content
+            assert "_No judgment events recorded yet._" in content
+        finally:
+            telemetry._log = old
+
+    def test_foreign_milestone_events_ignored(self, tmp_path: Path) -> None:
+        """cycle.judgment events for a different milestone do NOT appear."""
+        old = telemetry._log
+        try:
+            init("test-judgment-scope", tmp_path)
+            event(
+                "cycle.judgment", milestone="other", cycle=1,
+                judgment_next_action="PLAN",
+                orchestrator_next_cycle="PLAN", agreement=True,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            # Section header still appears (empty-state stub).
+            assert "## Judgment / Disagreement" in content
+            # ...but the foreign milestone's event must NOT leak in.
+            assert "_No judgment events recorded yet._" in content
+        finally:
+            telemetry._log = old
+
+    def test_malformed_cells_sanitised(self, tmp_path: Path) -> None:
+        """Pipe / newline in next_action does not break the table."""
+        old = telemetry._log
+        try:
+            init("test-judgment-sanitise", tmp_path)
+            event(
+                "cycle.judgment", milestone="m1", cycle=4,
+                judgment_next_action="PLAN|boom",
+                orchestrator_next_cycle="PLAN", agreement=False,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            assert "## Judgment / Disagreement" in content
+            # The unescaped pipe must NOT appear in a data cell — the
+            # renderer escapes it so the table still has 5 pipes per row.
+            row = [
+                ln for ln in content.splitlines()
+                if ln.startswith("| 4 |")
+            ]
+            assert row, "cycle 4 row missing"
+            # Count unescaped pipes (literal "|" not preceded by "\").
+            import re as _re
+            unescaped_pipes = len(_re.findall(r"(?<!\\)\|", row[0]))
+            assert unescaped_pipes == 5, (
+                f"expected 5 unescaped pipes in sanitised row, "
+                f"got {unescaped_pipes}: {row[0]!r}"
+            )
+        finally:
+            telemetry._log = old
+
+    def test_section_placement_after_phase_summary(
+        self, tmp_path: Path,
+    ) -> None:
+        """Judgment section appears after Phase Summary, before Agents."""
+        old = telemetry._log
+        try:
+            init("test-judgment-placement", tmp_path)
+            # Emit a cycle so Phase Summary / Cycles render.
+            with span(
+                "cycle", milestone="m1", cycle_num=1, cycle_type="ORIENT",
+                phase="",
+            ) as c:
+                c["outcome"] = "ORIENT"
+                c["input_tokens"] = 100
+                c["output_tokens"] = 50
+            # Emit an agent so the Agents section renders.
+            event(
+                "agent.start", milestone="m1", cycle_num=1,
+                task_id="t1", description="worker",
+            )
+            event(
+                "agent.end", milestone="m1", cycle_num=1,
+                task_id="t1", status="completed", total_tokens=500, tool_uses=4,
+            )
+            event(
+                "cycle.judgment", milestone="m1", cycle=1,
+                judgment_next_action="PLAN",
+                orchestrator_next_cycle="PLAN", agreement=True,
+            )
+            write_milestone_summary(tmp_path, "m1", "completed")
+            content = (
+                tmp_path / ".clou" / "milestones" / "m1" / "metrics.md"
+            ).read_text()
+            # All three sections present.
+            assert "## Cycles" in content
+            assert "## Judgment / Disagreement" in content
+            assert "## Agents" in content
+            # Ordering: Cycles first, then Judgment, then Agents.
+            pos_cycles = content.index("## Cycles")
+            pos_judgment = content.index("## Judgment / Disagreement")
+            pos_agents = content.index("## Agents")
+            assert pos_cycles < pos_judgment < pos_agents, (
+                f"expected Cycles < Judgment < Agents but got "
+                f"pos_cycles={pos_cycles} pos_judgment={pos_judgment} "
+                f"pos_agents={pos_agents}"
+            )
+        finally:
+            telemetry._log = old
+
+    def test_render_section_helper_direct(self) -> None:
+        """_render_judgment_section handles empty and populated inputs."""
+        from clou.telemetry import _render_judgment_section
+
+        empty_out = _render_judgment_section([])
+        assert "## Judgment / Disagreement" in empty_out
+        assert "_No judgment events recorded yet._" in empty_out
+
+        populated = _render_judgment_section([
+            {
+                "cycle": 2, "judgment_next_action": "EXECUTE",
+                "orchestrator_next_cycle": "ASSESS", "agreement": False,
+            },
+            {
+                "cycle": 1, "judgment_next_action": "PLAN",
+                "orchestrator_next_cycle": "PLAN", "agreement": True,
+            },
+        ])
+        assert "| 1 | PLAN | PLAN | yes |" in populated
+        assert "| 2 | EXECUTE | ASSESS | no |" in populated
+        # Cycle 1 row appears before cycle 2 row.
+        assert populated.index("| 1 | PLAN") < populated.index("| 2 | EXECUTE")
