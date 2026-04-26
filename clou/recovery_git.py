@@ -18,6 +18,44 @@ from clou.recovery_checkpoint import _validate_milestone
 
 _log = logging.getLogger(__name__)
 
+#: Max wall-clock any git subprocess may run before the coordinator
+#: treats it as hung.  All ``communicate()`` calls in this module are
+#: wrapped via :func:`_communicate_or_timeout`; a hang raises
+#: ``RuntimeError`` (and kills the subprocess) rather than blocking
+#: ``run_coordinator`` forever.  Tests (``test_git_revert_timeout``,
+#: ``test_git_commit_phase_timeout``) pin the value to 30 — the
+#: monkeypatch on ``asyncio.wait_for`` shortens this to 0.05 so they
+#: don't actually wait 30s; the 30 sentinel is the match key.
+_GIT_SUBPROCESS_TIMEOUT: float = 30
+
+
+async def _communicate_or_timeout(
+    proc: asyncio.subprocess.Process,
+    *,
+    operation: str,
+    timeout: float = _GIT_SUBPROCESS_TIMEOUT,
+) -> tuple[bytes, bytes]:
+    """Await ``proc.communicate()`` with a hard timeout.
+
+    On hang: kill the subprocess and raise ``RuntimeError`` so the
+    caller (ultimately ``run_coordinator``) does not wedge on a stuck
+    git process.  *operation* is embedded in the error message so
+    operators can identify which git invocation timed out (e.g.
+    ``"git revert"`` vs ``"git commit phase (add)"``).
+
+    The message shape is ``"{operation} timed out after {timeout}s"``
+    so regex matches in tests (``"git revert timed out"``,
+    ``"timed out"``) remain stable across call sites.
+    """
+    try:
+        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        proc.kill()
+        raise RuntimeError(
+            f"{operation} timed out after {timeout}s"
+        ) from None
+
+
 #: Patterns excluded from selective staging (DB-15 D4).
 _STAGING_EXCLUDE_PATTERNS: tuple[str, ...] = (
     ".clou/telemetry/*",
@@ -53,12 +91,9 @@ async def git_commit_phase(project_dir: Path, milestone: str, phase: str) -> Non
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    try:
-        stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise RuntimeError("git diff --name-only timed out after 30s") from None
+    stdout_bytes, _ = await _communicate_or_timeout(
+        proc, operation="git commit phase (diff scan)",
+    )
 
     # Also get untracked files.
     proc2 = await asyncio.create_subprocess_exec(
@@ -67,12 +102,9 @@ async def git_commit_phase(project_dir: Path, milestone: str, phase: str) -> Non
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    try:
-        stdout2_bytes, _ = await asyncio.wait_for(proc2.communicate(), timeout=30)
-    except TimeoutError:
-        proc2.kill()
-        await proc2.communicate()
-        raise RuntimeError("git ls-files timed out after 30s") from None
+    stdout2_bytes, _ = await _communicate_or_timeout(
+        proc2, operation="git commit phase (ls-files)",
+    )
 
     changed = set(stdout_bytes.decode(errors="replace").splitlines())
     changed |= set(stdout2_bytes.decode(errors="replace").splitlines())
@@ -97,12 +129,9 @@ async def git_commit_phase(project_dir: Path, milestone: str, phase: str) -> Non
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    try:
-        _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise RuntimeError("git add timed out after 30s") from None
+    _, stderr_bytes = await _communicate_or_timeout(
+        proc, operation="git commit phase (add)",
+    )
     if proc.returncode != 0:
         stderr_text = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
         msg = f"git add failed (exit {proc.returncode}): {stderr_text.strip()}"
@@ -115,12 +144,9 @@ async def git_commit_phase(project_dir: Path, milestone: str, phase: str) -> Non
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    try:
-        await asyncio.wait_for(proc.communicate(), timeout=30)
-    except TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise RuntimeError("git diff timed out after 30s") from None
+    await _communicate_or_timeout(
+        proc, operation="git commit phase (diff cached)",
+    )
 
     if proc.returncode == 0:
         # No changes staged -- nothing to commit
@@ -134,12 +160,9 @@ async def git_commit_phase(project_dir: Path, milestone: str, phase: str) -> Non
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    try:
-        _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise RuntimeError("git commit timed out after 30s") from None
+    _, stderr_bytes = await _communicate_or_timeout(
+        proc, operation="git commit phase (commit)",
+    )
     if proc.returncode != 0:
         stderr_text = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
         msg = f"git commit failed (exit {proc.returncode}): {stderr_text.strip()}"
@@ -194,12 +217,9 @@ async def git_revert_golden_context(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    try:
-        _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise RuntimeError("git revert timed out after 30s") from None
+    _, stderr_bytes = await _communicate_or_timeout(
+        proc, operation="git revert",
+    )
     if proc.returncode != 0:
         stderr_text = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
         msg = f"git revert failed (exit {proc.returncode}): {stderr_text.strip()}"
@@ -219,12 +239,9 @@ async def git_revert_golden_context(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        try:
-            await asyncio.wait_for(proc2.communicate(), timeout=30)
-        except TimeoutError:
-            proc2.kill()
-            await proc2.communicate()
-            raise RuntimeError("git clean timed out after 30s") from None
+        await _communicate_or_timeout(
+            proc2, operation="git revert (clean)",
+        )
         # git clean exit code 0 = success; non-zero is unexpected but not fatal
         # for the revert operation, so we log but don't raise.
         if proc2.returncode != 0:
@@ -294,12 +311,9 @@ async def archive_milestone_episodic(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    try:
-        _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise RuntimeError("git rm timed out after 30s") from None
+    _, stderr_bytes = await _communicate_or_timeout(
+        proc, operation="git archive (rm)",
+    )
 
     if proc.returncode != 0:
         stderr_text = stderr_bytes.decode(errors="replace") if stderr_bytes else ""

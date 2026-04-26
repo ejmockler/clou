@@ -639,14 +639,20 @@ def _extract_key_phrases(description: str, *, min_words: int = 3) -> list[str]:
 def _extract_cycle_section(decisions_content: str, cycle_num: int) -> str | None:
     """Return content under ``## Cycle {cycle_num}`` from *decisions_content*.
 
-    Splits the decisions text by ``## Cycle `` headings and returns the
+    Splits the decisions text by ``## Cycle`` headings and returns the
     body of the section whose number matches *cycle_num*.  Returns
     ``None`` when no matching section exists.
+
+    Robust to coordinator LLM formatting variance: the split and match
+    both tolerate arbitrary whitespace between ``##`` and ``Cycle``,
+    and are case-insensitive so ``## cycle 3`` or ``##  Cycle  3``
+    still parse correctly.  Trailing text on the heading line (e.g.,
+    ``## Cycle 3 — Assessment``) is preserved in the returned section.
     """
-    # Split on ``## Cycle `` boundaries, keeping the heading text.
-    parts = re.split(r"(?=^## Cycle )", decisions_content, flags=re.MULTILINE)
+    flags = re.MULTILINE | re.IGNORECASE
+    parts = re.split(r"(?=^##\s+Cycle\s+)", decisions_content, flags=flags)
     for part in parts:
-        m = re.match(r"^## Cycle\s+(\d+)", part)
+        m = re.match(r"^##\s+Cycle\s+(\d+)", part, flags=re.IGNORECASE)
         if m and int(m.group(1)) == cycle_num:
             return part
     return None

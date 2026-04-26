@@ -393,13 +393,17 @@ class TestCoordinatorAssessPrompt:
         assert "golden context" in text.lower()
 
     def test_prompt_preserves_decision_routing(self) -> None:
-        """R8: ASSESS decision routing (steps 6-9) must NOT change."""
+        """R8: ASSESS decision routing (steps 6-9) must NOT change.
+
+        M50 I1: routing copy uses ``EXECUTE_REWORK`` (structured
+        token) in place of the legacy ``EXECUTE (rework)`` form.
+        """
         prompt_path = (
             Path(__file__).parent.parent / "clou" / "_prompts" / "coordinator-assess.md"
         )
         text = prompt_path.read_text(encoding="utf-8")
         # Core decision routing steps unchanged.
-        assert "next_step: EXECUTE (rework)" in text
+        assert "next_step: EXECUTE_REWORK" in text
         assert "next_step: VERIFY" in text
         assert "next_step: EXECUTE" in text
         assert "Write checkpoint" in text
@@ -631,8 +635,25 @@ class TestCoordinatorPrecompositionIntegration:
         mock_precompose = MagicMock(return_value=summary_path)
 
         # Mock _run_single_cycle to write a COMPLETE checkpoint and return.
+        #
+        # M36: ORIENT always runs first.  The session-start rewrite
+        # stashed the original ``next_step=ASSESS`` in the typed
+        # ``pre_orient_next_step`` field (F2 rework); after
+        # _run_single_cycle returns for ORIENT, the checkpoint still
+        # reads ``next_step=ORIENT, pre_orient_next_step=ASSESS``.
+        # The orchestrator's ORIENT-exit restoration block at the top
+        # of the NEXT iteration rewrites ``next_step=ASSESS`` and
+        # clears the stash (F1 rework) — so this fake only needs to
+        # behave as the ORIENT agent would: write its judgment and
+        # leave the checkpoint untouched. The ASSESS branch then
+        # fires on the iteration after that.
         async def _fake_cycle(project_dir, milestone, cycle_type, prompt,
                               **kwargs):
+            if cycle_type == "ORIENT":
+                # Real ORIENT agents do NOT mutate the checkpoint.
+                # The orchestrator's restoration block handles the
+                # transition on the next iteration.
+                return "ok"
             cp_path.write_text(
                 "cycle: 5\nstep: ASSESS\nnext_step: VERIFY\n"
                 "current_phase: build_feature\n"
@@ -661,10 +682,21 @@ class TestCoordinatorPrecompositionIntegration:
         assert call_args[0][1] == "build_feature"  # phase_name
 
         # Verify build_cycle_prompt received the precomposed read set
-        # (not the raw 5+ files).
-        assert len(captured_read_sets) >= 1
-        assess_read_set = captured_read_sets[0]
-        assert "active/assess_summary.md" in assess_read_set
+        # (not the raw 5+ files).  M36: the first captured read_set is
+        # ORIENT's observational set; the ASSESS cycle runs after that
+        # and is the target of precomposition.  Locate the precomposed
+        # read_set by content (more robust than positional indexing
+        # now that the loop may continue past ASSESS).
+        assert len(captured_read_sets) >= 2
+        assess_candidates = [
+            rs for rs in captured_read_sets
+            if "active/assess_summary.md" in rs
+        ]
+        assert assess_candidates, (
+            f"No captured read_set contained the precomposed summary; "
+            f"captured={captured_read_sets!r}"
+        )
+        assess_read_set = assess_candidates[0]
         assert "requirements.md" in assess_read_set
         # Should be <=3 files (summary + requirements + maybe filtered memory).
         assert len(assess_read_set) <= 3
@@ -704,8 +736,16 @@ class TestCoordinatorPrecompositionIntegration:
         )
 
         # _run_single_cycle writes a VERIFY checkpoint so the loop exits.
+        # M36: ORIENT runs first; the real ORIENT agent doesn't touch
+        # the checkpoint. The orchestrator's ORIENT-exit restoration
+        # block (F1 rework) handles the ORIENT→ASSESS transition on
+        # the next iteration using the typed ``pre_orient_next_step``
+        # field (F2 rework). The precompose failure path fires on the
+        # ASSESS cycle that follows.
         async def _fake_cycle(project_dir, milestone, cycle_type, prompt,
                               **kwargs):
+            if cycle_type == "ORIENT":
+                return "ok"
             cp_path.write_text(
                 "cycle: 5\nstep: ASSESS\nnext_step: VERIFY\n"
                 "current_phase: build_feature\n"
@@ -764,8 +804,14 @@ class TestCoordinatorPrecompositionIntegration:
             side_effect=RuntimeError("simulated failure"),
         )
 
+        # M36: ORIENT runs first; real ORIENT agents don't touch the
+        # checkpoint. The orchestrator's restoration block handles the
+        # ORIENT→ASSESS transition via the typed pre_orient_next_step
+        # field (F1/F2 rework).
         async def _fake_cycle(project_dir, milestone, cycle_type, prompt,
                               **kwargs):
+            if cycle_type == "ORIENT":
+                return "ok"
             cp_path.write_text(
                 "cycle: 5\nstep: ASSESS\nnext_step: VERIFY\n"
                 "current_phase: build_feature\n"

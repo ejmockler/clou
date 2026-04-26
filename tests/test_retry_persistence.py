@@ -25,11 +25,15 @@ class TestRetryCounterRoundTrip:
     """Retry counters survive render_checkpoint -> parse_checkpoint."""
 
     def test_all_counters_round_trip(self) -> None:
-        """All four retry counters survive serialization and parsing."""
+        """All four retry counters survive serialization and parsing.
+
+        M50 I1: ``EXECUTE_REWORK`` replaces the punctuated legacy
+        ``EXECUTE (rework)`` token in the round-trip vocabulary.
+        """
         content = render_checkpoint(
             cycle=3,
             step="ASSESS",
-            next_step="EXECUTE (rework)",
+            next_step="EXECUTE_REWORK",
             current_phase="implementation",
             phases_completed=1,
             phases_total=3,
@@ -47,7 +51,7 @@ class TestRetryCounterRoundTrip:
         # Core fields unaffected.
         assert cp.cycle == 3
         assert cp.step == "ASSESS"
-        assert cp.next_step == "EXECUTE (rework)"
+        assert cp.next_step == "EXECUTE_REWORK"
         assert cp.current_phase == "implementation"
         assert cp.phases_completed == 1
         assert cp.phases_total == 3

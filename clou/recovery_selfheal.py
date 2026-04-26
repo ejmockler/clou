@@ -68,8 +68,11 @@ def _normalise_checkpoint(content: str) -> tuple[str, list[str]]:
     fixes: list[str] = []
 
     # Parse existing fields to detect what's present.
+    # M36 F2: match parse_checkpoint's ``[ \t]*`` + ``.*`` regex so an
+    # empty value line like ``current_phase: \n`` doesn't greedily
+    # swallow the next line and skew key detection.
     fields: dict[str, str] = {}
-    for match in re.finditer(r"(?m)^(\w[\w_]*):\s*(.+)$", content):
+    for match in re.finditer(r"(?m)^(\w[\w_]*):[ \t]*(.*)$", content):
         fields[match.group(1)] = match.group(2).strip()
 
     # Bail if required keys are missing -- nothing safe to normalise.
@@ -79,6 +82,11 @@ def _normalise_checkpoint(content: str) -> tuple[str, list[str]]:
         return content, fixes
 
     # Parse (handles aliases, defaults) then re-render (canonical format).
+    # M36 F4 (round-4): pass ALL 15 render_checkpoint fields.  Previously
+    # cycle_outcome, valid_findings, and consecutive_zero_valid were
+    # silently defaulted on normalisation, wiping ASSESS convergence
+    # state and halt-pending-review markers.  This is the same
+    # wipe-class pattern as F2 applied to sibling convergence fields.
     cp = parse_checkpoint(content)
     new_content = render_checkpoint(
         cycle=cp.cycle,
@@ -91,6 +99,18 @@ def _normalise_checkpoint(content: str) -> tuple[str, list[str]]:
         readiness_retries=cp.readiness_retries,
         crash_retries=cp.crash_retries,
         staleness_count=cp.staleness_count,
+        cycle_outcome=cp.cycle_outcome,
+        valid_findings=cp.valid_findings,
+        consecutive_zero_valid=cp.consecutive_zero_valid,
+        # M36 I1 (F2 rework): preserve ORIENT stash across self-heal
+        # so normalisation doesn't wipe the restoration signal.
+        pre_orient_next_step=cp.pre_orient_next_step,
+        # M49b B6: same wipe-class concern for halt stash.
+        pre_halt_next_step=cp.pre_halt_next_step,
+        # M52 F38: same wipe-class — self-heal must not erase the
+        # gate verdict.  Inheriting also keeps the strict-gating
+        # guarantee (advance still requires a non-None verdict).
+        last_acceptance_verdict=cp.last_acceptance_verdict,
     )
 
     if new_content != content:

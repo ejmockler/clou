@@ -10,8 +10,6 @@ from clou.ui.app import ClouApp
 from clou.ui.messages import (
     ClouCoordinatorComplete,
     ClouCoordinatorSpawned,
-    ClouEscalationArrived,
-    ClouEscalationResolved,
     ClouHandoff,
     ClouMetrics,
     ClouRateLimit,
@@ -23,16 +21,6 @@ from clou.ui.widgets.breath import BreathWidget
 from clou.ui.widgets.handoff import HandoffWidget
 from clou.ui.widgets.conversation import ConversationWidget
 from clou.ui.widgets.status_bar import ClouStatusBar
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-_ESCALATION_PATH = Path("/tmp/test-escalation.md")
-_ESCALATION_OPTIONS: list[dict[str, object]] = [
-    {"label": "Retry", "description": "Try again"},
-    {"label": "Skip", "description": "Skip this step"},
-]
 
 
 # ---------------------------------------------------------------------------
@@ -143,41 +131,18 @@ class TestBreathToDialogue:
 
 class TestBreathToDecision:
     @pytest.mark.asyncio
-    async def test_escalation_triggers_decision_mode(self) -> None:
+    async def test_transition_mode_enters_decision(self) -> None:
         async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
             # Enter breath mode first.
             pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
             await pilot.pause()
 
-            # Post escalation.
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=_ESCALATION_PATH,
-                    classification="blocking",
-                    issue="Need credentials",
-                    options=_ESCALATION_OPTIONS,
-                )
-            )
+            # Drive BREATH -> DECISION directly (escalations no longer trigger
+            # DECISION; brutalist / validation still do via transition_mode).
+            assert app.transition_mode(Mode.DECISION) is True
             await pilot.pause()
             assert pilot.app.mode is Mode.DECISION
-
-    @pytest.mark.asyncio
-    async def test_escalation_modal_pushed(self) -> None:
-        async with ClouApp().run_test() as pilot:
-            pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
-            await pilot.pause()
-
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=_ESCALATION_PATH,
-                    classification="warning",
-                    issue="Rate limit approaching",
-                    options=_ESCALATION_OPTIONS,
-                )
-            )
-            await pilot.pause()
-            # The screen stack should have more than one screen.
-            assert len(pilot.app.screen_stack) > 1
 
     @pytest.mark.asyncio
     async def test_breath_machine_holding(self) -> None:
@@ -186,14 +151,7 @@ class TestBreathToDecision:
             pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
             await pilot.pause()
 
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=_ESCALATION_PATH,
-                    classification="warning",
-                    issue="Issue",
-                    options=_ESCALATION_OPTIONS,
-                )
-            )
+            app.transition_mode(Mode.DECISION)
             await pilot.pause()
             assert app._breath_machine.state is BreathState.HOLDING
 
@@ -205,31 +163,20 @@ class TestBreathToDecision:
 
 class TestDecisionToBreath:
     @pytest.mark.asyncio
-    async def test_escalation_resolved_returns_to_breath(self) -> None:
+    async def test_decision_to_breath_transition(self) -> None:
         async with ClouApp().run_test() as pilot:
+            app: ClouApp = pilot.app  # type: ignore[assignment]
             # DIALOGUE -> BREATH.
             pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
             await pilot.pause()
 
             # BREATH -> DECISION.
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=_ESCALATION_PATH,
-                    classification="warning",
-                    issue="Issue",
-                    options=_ESCALATION_OPTIONS,
-                )
-            )
+            assert app.transition_mode(Mode.DECISION) is True
             await pilot.pause()
             assert pilot.app.mode is Mode.DECISION
 
             # DECISION -> BREATH.
-            pilot.app.post_message(
-                ClouEscalationResolved(
-                    path=_ESCALATION_PATH,
-                    disposition="Retry",
-                )
-            )
+            assert app.transition_mode(Mode.BREATH) is True
             await pilot.pause()
             assert pilot.app.mode is Mode.BREATH
             assert "breath" in pilot.app.classes
@@ -452,21 +399,13 @@ class TestDialogueToDecision:
             assert "dialogue" not in pilot.app.classes
 
     @pytest.mark.asyncio
-    async def test_escalation_from_dialogue_pushes_modal(self) -> None:
+    async def test_dialogue_to_decision_direct(self) -> None:
         async with ClouApp().run_test(size=(0, 0)) as pilot:
-            # Post escalation directly from DIALOGUE (no BREATH first).
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=_ESCALATION_PATH,
-                    classification="blocking",
-                    issue="Need credentials",
-                    options=_ESCALATION_OPTIONS,
-                )
-            )
+            app: ClouApp = pilot.app  # type: ignore[assignment]
+            # Transition DIALOGUE -> DECISION directly.
+            assert app.transition_mode(Mode.DECISION) is True
             await pilot.pause()
             assert pilot.app.mode is Mode.DECISION
-            # Escalation modal should be pushed.
-            assert len(pilot.app.screen_stack) > 1
 
 
 # ---------------------------------------------------------------------------
@@ -504,14 +443,7 @@ class TestDecisionToDialogue:
             assert app._animation_timer is not None
 
             # BREATH -> DECISION (timer still running).
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=_ESCALATION_PATH,
-                    classification="warning",
-                    issue="Issue",
-                    options=_ESCALATION_OPTIONS,
-                )
-            )
+            assert app.transition_mode(Mode.DECISION) is True
             await pilot.pause()
             assert app.mode is Mode.DECISION
 
@@ -532,24 +464,12 @@ class TestDecisionToDialogue:
             assert app._animation_timer is None
 
             # DIALOGUE -> DECISION.
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=_ESCALATION_PATH,
-                    classification="info",
-                    issue="Test",
-                    options=_ESCALATION_OPTIONS,
-                )
-            )
+            assert app.transition_mode(Mode.DECISION) is True
             await pilot.pause()
             assert app.mode is Mode.DECISION
 
             # DECISION -> DIALOGUE (no timer was ever started).
-            pilot.app.post_message(
-                ClouEscalationResolved(
-                    path=_ESCALATION_PATH,
-                    disposition="Retry",
-                )
-            )
+            assert app.transition_mode(Mode.DIALOGUE) is True
             await pilot.pause()
             assert app.mode is Mode.DIALOGUE
             assert app._animation_timer is None
@@ -574,14 +494,7 @@ class TestDecisionToHandoff:
             assert app._animation_timer is not None
 
             # BREATH -> DECISION.
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=_ESCALATION_PATH,
-                    classification="warning",
-                    issue="Issue",
-                    options=_ESCALATION_OPTIONS,
-                )
-            )
+            assert app.transition_mode(Mode.DECISION) is True
             await pilot.pause()
             assert app.mode is Mode.DECISION
             assert app._animation_timer is not None  # still running
@@ -604,7 +517,7 @@ class TestDecisionToHandoff:
 
 class TestHandoffToDecision:
     @pytest.mark.asyncio
-    async def test_escalation_during_handoff_transitions_to_decision(self) -> None:
+    async def test_handoff_to_decision_transition(self) -> None:
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
 
@@ -617,22 +530,13 @@ class TestHandoffToDecision:
             await pilot.pause()
             assert app.mode is Mode.HANDOFF
 
-            # Escalation during HANDOFF -> DECISION.
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=_ESCALATION_PATH,
-                    classification="blocking",
-                    issue="Need credentials",
-                    options=_ESCALATION_OPTIONS,
-                )
-            )
+            # HANDOFF -> DECISION (e.g. brutalist finding / validation).
+            assert app.transition_mode(Mode.DECISION) is True
             await pilot.pause()
             assert app.mode is Mode.DECISION
-            # Escalation modal should be pushed.
-            assert len(pilot.app.screen_stack) > 1
 
     @pytest.mark.asyncio
-    async def test_escalation_resolved_returns_to_handoff(self) -> None:
+    async def test_decision_returns_to_handoff(self) -> None:
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
 
@@ -646,24 +550,12 @@ class TestHandoffToDecision:
             assert app.mode is Mode.HANDOFF
 
             # HANDOFF -> DECISION.
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=_ESCALATION_PATH,
-                    classification="warning",
-                    issue="Issue",
-                    options=_ESCALATION_OPTIONS,
-                )
-            )
+            assert app.transition_mode(Mode.DECISION) is True
             await pilot.pause()
             assert app.mode is Mode.DECISION
 
             # DECISION -> HANDOFF (resolved returns to pre-decision mode).
-            pilot.app.post_message(
-                ClouEscalationResolved(
-                    path=_ESCALATION_PATH,
-                    disposition="Retry",
-                )
-            )
+            assert app.transition_mode(Mode.HANDOFF) is True
             await pilot.pause()
             assert app.mode is Mode.HANDOFF
 
@@ -936,53 +828,6 @@ class TestActionClear:
 
 
 # ---------------------------------------------------------------------------
-# Escalation queued when already in DECISION
-# ---------------------------------------------------------------------------
-
-
-class TestEscalationQueueInDecision:
-    @pytest.mark.asyncio
-    async def test_escalation_queued_when_already_in_decision(self, tmp_path: Path) -> None:
-        """ClouEscalationArrived during DECISION mode is queued for later."""
-        async with ClouApp(project_dir=tmp_path).run_test() as pilot:
-            app: ClouApp = pilot.app  # type: ignore[assignment]
-
-            # Get into DECISION mode via a first escalation.
-            esc_dir = tmp_path / ".clou" / "escalations"
-            esc_dir.mkdir(parents=True)
-            esc_file1 = esc_dir / "first.md"
-            esc_file1.write_text("# First\n")
-
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=esc_file1,
-                    classification="blocking",
-                    issue="First issue",
-                    options=[{"label": "Fix", "description": "Fix it"}],
-                )
-            )
-            await pilot.pause()
-            assert app.mode is Mode.DECISION
-
-            # Now send a second escalation while still in DECISION.
-            esc_file2 = esc_dir / "second.md"
-            esc_file2.write_text("# Second\n")
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=esc_file2,
-                    classification="error",
-                    issue="Second issue",
-                    options=[{"label": "Retry", "description": "Try again"}],
-                )
-            )
-            await pilot.pause()
-
-            # Should still be in DECISION, with second escalation queued.
-            assert app.mode is Mode.DECISION
-            assert len(app._escalation_queue) == 1
-
-
-# ---------------------------------------------------------------------------
 # _format_costs content assertion
 # ---------------------------------------------------------------------------
 
@@ -1180,57 +1025,6 @@ class TestReleasingAnimationTick:
 
             assert app._breath_machine.state is BreathState.IDLE
             assert app._animation_timer is None
-
-
-# ---------------------------------------------------------------------------
-# push_screen guard — double escalation produces only one modal
-# ---------------------------------------------------------------------------
-
-
-class TestPushScreenGuard:
-    @pytest.mark.asyncio
-    async def test_double_escalation_produces_one_modal(self, tmp_path: Path) -> None:
-        """Pushing two escalations in quick succession produces only one modal."""
-        async with ClouApp(project_dir=tmp_path).run_test() as pilot:
-            app: ClouApp = pilot.app  # type: ignore[assignment]
-
-            esc_dir = tmp_path / ".clou" / "escalations"
-            esc_dir.mkdir(parents=True)
-            esc1 = esc_dir / "esc1.md"
-            esc1.write_text("# First\n")
-
-            # First escalation — enters DECISION and pushes modal.
-            app.post_message(
-                ClouEscalationArrived(
-                    path=esc1,
-                    classification="warning",
-                    issue="Issue 1",
-                    options=[{"label": "Fix", "description": "Fix it"}],
-                )
-            )
-            await pilot.pause()
-            assert app.mode is Mode.DECISION
-
-            from clou.ui.widgets.escalation import EscalationModal
-
-            modal_count = sum(
-                1 for s in app.screen_stack if isinstance(s, EscalationModal)
-            )
-            assert modal_count == 1
-
-            # Manually try to push another escalation via _push_pending_escalation.
-            app._pending_escalation = (
-                esc1, "error", "Issue 2",
-                [{"label": "Retry", "description": "Try again"}],
-            )
-            app._push_pending_escalation()
-            await pilot.pause()
-
-            # Guard should prevent a second modal.
-            modal_count = sum(
-                1 for s in app.screen_stack if isinstance(s, EscalationModal)
-            )
-            assert modal_count == 1
 
 
 # ---------------------------------------------------------------------------

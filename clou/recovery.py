@@ -14,11 +14,15 @@ Import from this module for the public API.
 from clou.recovery_checkpoint import (  # noqa: F401
     Checkpoint,
     ConvergenceState,
+    ORIENT_PROTOCOL,
     _MEMORY_TYPE_FILTERS,
+    _VALID_NEXT_STEPS,
     _filter_memory_for_cycle,
     _safe_int,
     assess_convergence,
     determine_next_cycle,
+    is_execute_family,
+    is_rework_requested,
     parse_checkpoint,
     read_cycle_count,
     read_cycle_outcome,
@@ -50,10 +54,12 @@ from clou.recovery_consolidation import (  # noqa: F401
     run_lifecycle_pipeline,
 )
 from clou.recovery_errors import (  # noqa: F401
+    DEFAULT_HOLD_COOLDOWN,
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_COOLDOWN,
     ErrorKind,
     classify_error,
+    compute_hold_wait,
 )
 from clou.recovery_escalation import (  # noqa: F401
     write_agent_crash_escalation,

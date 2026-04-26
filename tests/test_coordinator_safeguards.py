@@ -27,7 +27,6 @@ from claude_agent_sdk import (
 
 from clou.coordinator import (
     _compute_abort_set,
-    _DEFAULT_TIMEOUT_SECONDS,
     _run_single_cycle,
     _write_failure_shard,
     classify_timeout,
@@ -522,8 +521,11 @@ async def execute():
         # The expensive task should be stopped.
         client.stop_task.assert_called_once_with("tid-exp")
 
-        # A failure shard should be written.
-        shard_dir = ms_dir / "phases" / "build-phase"
+        # A failure shard should be written under the TASK's phase
+        # directory (workers write shards under phases/{function_name}/),
+        # not the coordinator's current_phase (which is used only as
+        # a fallback when task_name is unavailable).
+        shard_dir = ms_dir / "phases" / "expensive_task"
         shards = list(shard_dir.glob("execution-*.md"))
         assert len(shards) == 1
         content = shards[0].read_text()
@@ -633,23 +635,31 @@ async def execute():
         # The slow task should be stopped.
         client.stop_task.assert_called_once_with("tid-slow")
 
-        # A failure shard should be written with timeout type.
-        shard_dir = ms_dir / "phases" / "build-phase"
+        # A failure shard should be written under the TASK's phase
+        # directory (workers write shards under phases/{function_name}/),
+        # not the coordinator's current_phase (which is used only as
+        # a fallback when task_name is unavailable).
+        shard_dir = ms_dir / "phases" / "slow_task"
         shards = list(shard_dir.glob("execution-*.md"))
         assert len(shards) == 1
         content = shards[0].read_text()
         assert "timeout" in content
 
     @pytest.mark.asyncio
+    @pytest.mark.skip(
+        reason=(
+            "Tests a removed semantic: per-task idle timeout without "
+            "progress messages.  The idle watchdog is now suppressed "
+            "(reschedule to +86400s) while any task is active to avoid "
+            "kneecapping legitimate long-running work (brutalist panels, "
+            "test runs).  Per-task enforcement still fires on progress "
+            "messages (see test_timeout_stops_task).  If hung-task "
+            "detection is re-needed, add a liveness-probe mechanism "
+            "distinct from the idle watchdog."
+        ),
+    )
     async def test_asyncio_timeout_fires_on_hung_task(self, project_dir: Path) -> None:
-        """Idle watchdog fires when a task hangs with no progress messages.
-
-        This tests the idle watchdog that catches tasks that suppress
-        telemetry entirely -- the progress-based check in the elif branch
-        would never trigger for such tasks.  The watchdog is rescheduled
-        on every coordinator message, so a genuinely idle stream is
-        required to trip it.
-        """
+        """Idle watchdog fires when a task hangs with no progress messages."""
         ms_dir = project_dir / ".clou" / "milestones" / "ms"
         ms_dir.mkdir(parents=True)
         (ms_dir / "compose.py").write_text('''
@@ -1304,6 +1314,211 @@ class TestClassifyTimeout:
 # ---------------------------------------------------------------------------
 
 
+class TestNoImplicitTimeout:
+    """F9: Tasks without declared @resource_bounds(timeout_seconds=...)
+    must not be terminated by any implicit default.  Prior code enforced
+    a 600s default; the observed orphan rate was 24% of agent starts,
+    almost entirely long-running test runners hitting the default.  Now
+    per-task enforcement runs only when the DAG author explicitly opts in.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_prompt_io(self) -> Any:
+        with (
+            patch(f"{_PC}.load_prompt", return_value="<system/>"),
+            patch(f"{_PC}._build_agents", return_value={}),
+            patch(f"{_PC}.build_hooks", return_value={"PreToolUse": []}),
+        ):
+            yield
+
+    @pytest.fixture
+    def project_dir(self, tmp_path: Path) -> Path:
+        clou_dir = tmp_path / ".clou"
+        clou_dir.mkdir()
+        return tmp_path
+
+    @pytest.mark.asyncio
+    async def test_undeclared_task_runs_past_old_default(
+        self, project_dir: Path,
+    ) -> None:
+        """Task with NO @resource_bounds is not killed even at very long
+        simulated elapsed time.  The pre-fix default would have fired
+        at 600s; we verify the task completes normally at 10000s."""
+        ms_dir = project_dir / ".clou" / "milestones" / "ms"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "compose.py").write_text('''
+class R: ...
+
+def resource_bounds(tokens=None, timeout_seconds=None):
+    def decorator(func):
+        return func
+    return decorator
+
+async def no_bounds_task() -> R:
+    """No resource_bounds — should never time out."""
+
+async def execute():
+    r = await no_bounds_task()
+''', encoding="utf-8")
+
+        active_dir = ms_dir / "active"
+        active_dir.mkdir()
+        (active_dir / "coordinator.md").write_text(
+            "cycle: 1\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: build-phase\nphases_completed: 0\nphases_total: 1\n"
+        )
+
+        messages = [
+            _make_task_started("tid-nobounds", "no_bounds_task"),
+            # Progress arrives AFTER a simulated 10000s elapsed.  Pre-fix
+            # code would have terminated at 600s; now it must not fire.
+            _make_task_progress("tid-nobounds", total_tokens=500),
+            _make_task_notification(
+                "tid-nobounds", "completed", "done",
+            ),
+            _make_result(usage={"input_tokens": 100}),
+        ]
+        client = _mock_sdk_client(messages)
+
+        import time
+        _calls = 0
+
+        def _fake_monotonic() -> float:
+            nonlocal _calls
+            _calls += 1
+            if _calls <= 4:
+                return 0.0
+            return 10_000.0
+
+        with (
+            patch(f"{_PC}.ClaudeSDKClient", return_value=client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="ASSESS"),
+            patch("time.monotonic", side_effect=_fake_monotonic),
+        ):
+            await _run_single_cycle(
+                project_dir, "ms", "EXECUTE", "do work",
+            )
+
+        # stop_task must NOT have been called — the task ran to
+        # completion even at 10000s simulated elapsed.
+        client.stop_task.assert_not_called()
+        # No failure shard should exist.
+        shard_dir = ms_dir / "phases" / "no_bounds_task"
+        shards = list(shard_dir.glob("execution-*.md")) if shard_dir.exists() else []
+        assert len(shards) == 0
+
+
+class TestSyntheticAgentEndOnStopTask:
+    """F1: When coordinator.stop_task is called, the SDK does not fire
+    TaskNotificationMessage for the killed task.  We must emit a
+    synthetic agent.end event with the abort reason so the span log
+    doesn't orphan the agent.start."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_prompt_io(self) -> Any:
+        with (
+            patch(f"{_PC}.load_prompt", return_value="<system/>"),
+            patch(f"{_PC}._build_agents", return_value={}),
+            patch(f"{_PC}.build_hooks", return_value={"PreToolUse": []}),
+        ):
+            yield
+
+    @pytest.fixture
+    def project_dir(self, tmp_path: Path) -> Path:
+        clou_dir = tmp_path / ".clou"
+        clou_dir.mkdir()
+        return tmp_path
+
+    @pytest.mark.asyncio
+    async def test_timeout_emits_synthetic_agent_end(
+        self, project_dir: Path,
+    ) -> None:
+        """Per-task timeout violation records a synthetic agent.end
+        with status='timeout' so the agent.start is not orphaned."""
+        ms_dir = project_dir / ".clou" / "milestones" / "ms"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "compose.py").write_text('''
+class R: ...
+
+def resource_bounds(tokens=None, timeout_seconds=None):
+    def decorator(func):
+        return func
+    return decorator
+
+@resource_bounds(timeout_seconds=10)
+async def slow_task() -> R:
+    """Takes too long."""
+
+async def execute():
+    r = await slow_task()
+''', encoding="utf-8")
+
+        active_dir = ms_dir / "active"
+        active_dir.mkdir()
+        (active_dir / "coordinator.md").write_text(
+            "cycle: 1\nstep: EXECUTE\nnext_step: ASSESS\n"
+            "current_phase: build-phase\nphases_completed: 0\nphases_total: 1\n"
+        )
+
+        messages = [
+            _make_task_started("tid-slow", "slow_task"),
+            _make_task_progress("tid-slow", total_tokens=500),
+            _make_result(usage={"input_tokens": 100}),
+        ]
+        client = _mock_sdk_client(messages)
+
+        import time
+        _calls = 0
+
+        def _fake_monotonic() -> float:
+            nonlocal _calls
+            _calls += 1
+            if _calls <= 4:
+                return 0.0
+            return 15.0
+
+        emitted: list[dict[str, Any]] = []
+
+        def _capture_event(name: str, **attrs: Any) -> None:
+            emitted.append({"event": name, **attrs})
+
+        with (
+            patch(f"{_PC}.ClaudeSDKClient", return_value=client),
+            patch(f"{_PC}.read_cycle_outcome", return_value="ASSESS"),
+            patch("time.monotonic", side_effect=_fake_monotonic),
+            patch(f"{_PC}.telemetry.event", side_effect=_capture_event),
+        ):
+            await _run_single_cycle(
+                project_dir, "ms", "EXECUTE", "do work",
+            )
+
+        # Assert synthetic agent.end fired with the abort status.
+        agent_ends = [
+            e for e in emitted
+            if e["event"] == "agent.end" and e.get("task_id") == "tid-slow"
+        ]
+        assert len(agent_ends) >= 1, (
+            f"Expected synthetic agent.end for aborted task; "
+            f"got events: {[e['event'] for e in emitted]}"
+        )
+        assert agent_ends[0]["status"] == "timeout"
+        # No input_tokens/output_tokens fields should appear (F4a).
+        assert "input_tokens" not in agent_ends[0]
+        assert "output_tokens" not in agent_ends[0]
+
+
+@pytest.mark.skip(
+    reason=(
+        "These tests assumed the idle watchdog fires within the declared "
+        "task timeout even while an agent is active.  Current semantics "
+        "suppress the watchdog (reschedule to +86400s) whenever any task "
+        "is in _active_task_ids — the intentional tradeoff from removing "
+        "the implicit 600s default to avoid kneecapping brutalist panels "
+        "and test runs.  classify_timeout is still exercised via the "
+        "unit tests in TestClassifyTimeout above.  Re-enable if a "
+        "liveness-probe feature is introduced."
+    ),
+)
 class TestTimeoutClassificationIntegration:
     """Integration: idle watchdog fires with recent progress -> interrupted."""
 
@@ -1641,9 +1856,9 @@ class TestGateTelemetry:
     async def test_assess_rework_emits_gate_decision(
         self, project_dir: Path,
     ) -> None:
-        """ASSESS -> EXECUTE (rework) emits assess/rework gate decision."""
+        """ASSESS -> EXECUTE_REWORK emits assess/rework gate decision (M50 I1: structured token)."""
         self._write_checkpoint(
-            project_dir, "ms", "ASSESS", "EXECUTE (rework)",
+            project_dir, "ms", "ASSESS", "EXECUTE_REWORK",
         )
 
         telemetry_events: list[tuple[str, dict[str, Any]]] = []
@@ -1738,9 +1953,9 @@ class TestGateTelemetry:
     async def test_verify_rework_emits_gate_decision(
         self, project_dir: Path,
     ) -> None:
-        """VERIFY -> EXECUTE (rework) emits verify/rework gate decision."""
+        """VERIFY -> EXECUTE_REWORK emits verify/rework gate decision (M50 I1: structured token)."""
         self._write_checkpoint(
-            project_dir, "ms", "VERIFY", "EXECUTE (rework)",
+            project_dir, "ms", "VERIFY", "EXECUTE_REWORK",
         )
 
         telemetry_events: list[tuple[str, dict[str, Any]]] = []
