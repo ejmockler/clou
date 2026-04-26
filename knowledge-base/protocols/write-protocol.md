@@ -86,6 +86,12 @@ Escalation files are created by the coordinator but contain a Disposition sectio
 - Everything above `## Disposition` is coordinator-owned
 - The `## Disposition` section is supervisor-owned
 
+Both sides route through MCP tools, not direct Write (DB-21 remolding, milestone 41):
+- **Coordinator creation:** `mcp__clou_coordinator__clou_file_escalation` — accepts `EscalationForm` fields and writes canonical markdown via `render_escalation`.
+- **Supervisor disposition:** `mcp__clou_supervisor__clou_resolve_escalation` — parses the file, splices in a new `## Disposition` block (byte-for-byte preserving the legacy body above that heading for R7), and writes atomically.
+
+Direct Write/Edit/MultiEdit to `milestones/*/escalations/*.md` is denied by the PreToolUse hook for every tier — the deny message names the appropriate MCP tool.
+
 ## Enforcement
 
 Ownership enforcement operates at two levels:

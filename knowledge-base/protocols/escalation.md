@@ -2,19 +2,21 @@
 
 ## Principle
 
-Escalations are engineered artifacts, not cries for help. Every escalation includes analysis, options with tradeoffs, and a recommendation. The coordinator does the work of framing decisions. The supervisor makes the call.
+Escalations are **agent-to-agent** engineered artifacts, not cries for help and not user-facing decision cards. Every escalation includes analysis, options with tradeoffs, and a recommendation. The coordinator frames the decision; the supervisor makes the call. User-facing decisions flow through a different channel (`ask_user_mcp`). See `memory/project_escalations_are_agent_to_agent.md`.
 
-## Schema
+## Canonical Schema
+
+Escalations are written **only** via the MCP tool `mcp__clou_coordinator__clou_file_escalation` (coordinator-tier) or the in-process recovery paths in `clou/recovery_escalation.py` (system-authored). Direct `Write`/`Edit`/`MultiEdit` to `milestones/*/escalations/*.md` is denied by the PreToolUse hook — the tool is the only write path.
+
+The canonical format on disk matches what `clou/escalation.py:render_escalation` emits and what `clou/escalation.py:parse_escalation` expects. The authoritative schema lives in `clou/escalation.py:EscalationForm` (frozen dataclass); the bullet list below tracks that module, not the reverse.
 
 Each escalation is a file at `milestones/<milestone-name>/escalations/<timestamp>-<slug>.md`:
 
 ```markdown
 # Escalation: <title>
 
-## Classification
-type: [ambiguity | conflict | scope_change | blocked | authority_exceeded | credential_request | agent_team_crash | infrastructure_failure | validation_failure]
-severity: [blocking | degraded | advisory]
-cycle: <coordinator cycle number>
+**Classification:** <blocking | degraded | informational | architectural | …>
+**Filed:** <YYYY-MM-DD>
 
 ## Context
 <What the coordinator was doing when this arose. Which phase, which task,
@@ -29,19 +31,37 @@ what the conflict, ambiguity, or blocker is.>
 whatever prompted this escalation. Concrete, not interpretive.>
 
 ## Options
-1. <Option A>: <tradeoffs — what you gain, what you lose, what it costs>
-2. <Option B>: <tradeoffs>
-3. <Option C — coordinator's recommendation>: <tradeoffs>
+1. **Option A label** --- tradeoffs — what you gain, what you lose, what costs.
+2. **Option B label** --- tradeoffs.
+3. **Option C label (coordinator's recommendation)** --- tradeoffs.
 
 ## Recommendation
 <What the coordinator would do if it had the authority, and why.
 References to requirements, project.md, or prior decisions that support this.>
 
 ## Disposition
-status: [open | resolved | overridden]
+status: [open | investigating | deferred | resolved | overridden]
 resolved_by: [supervisor | coordinator_timeout]
 resolution: <what was decided and why>
 ```
+
+### Field notes
+
+- **Classification** is a *single-line preamble string* (`**Classification:** <value>`), not a `## Classification` section. The `EscalationForm.classification` field accepts an open set of strings; the tuple `clou.escalation.VALID_CLASSIFICATIONS = ("blocking", "degraded", "informational", "architectural", "trajectory_halt")` is advisory, not enforced. Callers MUST NOT branch on `classification == "blocking"` for routing; use explicit status fields (`disposition_status`) for control flow.
+  - **Narrow exception (M49b):** the `clou.escalation.ENGINE_GATED_CLASSIFICATIONS` frozenset whitelists classifications that engine control flow IS permitted to branch on. Membership is code-written in the MCP tool handler (not LLM-authored), so it's immune to the drift the general "don't-branch" contract guards against. Currently contains `{"trajectory_halt"}` — the engine's pre-dispatch halt gate reads this constant rather than a hardcoded string literal, so additional engine-gated classifications join the frozenset rather than needing new typed fields on `EscalationForm`.
+- **Filed** is a date string in the preamble, not a section.
+- **Options** are numbered `1. **Label** --- description` items in `## Options`. The parser also tolerates legacy layouts (`### Option A: Label`, `### (a) Label`) but new authorship must use the bold-numbered form.
+- **Disposition** is the only multi-key section. The `status` key is the authoritative control signal: `open` / `investigating` / `deferred` keep the escalation visible via `clou_status`, while `resolved` / `overridden` retire it to historical record.
+
+### Legacy tolerance
+
+The parser (`parse_escalation`) additionally accepts older in-tree layouts so files dated before 41-escalation-remolding continue to populate fields without mass rewrite:
+
+- `## Analysis` / `## Problem` / `## Finding` fall back to `issue` / `evidence`.
+- `## Severity` (body) falls back to `classification` (remember: open-set string, not enum).
+- `## Fix` / `## Target content` fall back to `recommendation`.
+
+**New escalations** should use the canonical layout; legacy layouts exist for read-only compatibility and are not re-emitted by `render_escalation`.
 
 ## Classification Types
 
@@ -131,6 +151,18 @@ The supervisor checks for open escalations at the top of its loop:
    - Acknowledge awareness
    - Flag for review if the pattern seems concerning
 
+## Engine-Gated Escalations (M49b)
+
+A subset of classifications — currently `{trajectory_halt}`, defined by `clou.escalation.ENGINE_GATED_CLASSIFICATIONS` — trigger the coordinator's pre-dispatch halt gate. When such an escalation has an open disposition, the engine refuses to run any cycle for that milestone until the disposition reaches a terminal status.
+
+**Wedge semantics (deliberate).** "Open" for the engine gate means *any* status in `OPEN_DISPOSITION_STATUSES = (open, investigating, deferred)`. `deferred` is included on purpose: bypassing it would let the engine dispatch a halt the supervisor explicitly parked. There is no "park this halt without freezing the milestone" affordance — engine-gated halts are meant to be answered, not shelved.
+
+**Supervisor UX contract.** Because the wedge is real and the engine offers no defer-and-continue path, the supervisor's disposition flow for engine-gated classifications MUST always terminate in `resolved` or `overridden` before the supervisor exits the disposition loop. Intermediate states (`investigating`, `deferred`) are valid mid-flow but invalid as final dispositions for this class. The supervisor UX should not present a "save and exit" affordance for engine-gated escalations until the disposition is terminal.
+
+**Operator escape hatch.** If an operator needs the engine to resume despite an open engine-gated halt (e.g. for debugging), the path is: rewrite the disposition file to `resolved` with a resolution note explaining the override AND rewrite the checkpoint's `next_step` away from `HALTED`. Both edits are required — the engine gate would otherwise re-fire on the next iteration, and `determine_next_cycle` raises `RuntimeError` (M49b C1) on `next_step=HALTED` to prevent silent coercion.
+
+**Adding a new engine-gated classification.** Code-write the literal in the relevant MCP tool handler (so it's immune to LLM drift), add it to `ENGINE_GATED_CLASSIFICATIONS`, and ensure its supervisor disposition path also terminates in `resolved`/`overridden`. The `tests/test_halted_checkpoint.py::test_no_classification_routing_branch_outside_allowlist` AST scan enforces that callers do not branch on the literal directly.
+
 ## Escalation Flow
 
 ```
@@ -138,7 +170,18 @@ Coordinator encounters issue
     ↓
 Coordinator analyzes: within delegated authority?
     ├─ Yes → decide, log in decisions.md (no escalation)
-    └─ No → write escalation file
+    └─ No:
+        ├─ Cross-cutting (belongs to future milestone)?
+        │     → file proposal via `clou_propose_milestone` (default,
+        │       Stream C / zero-escalations)
+        │       ↓
+        │   Supervisor reads via `clou_list_proposals` on orient
+        │       ↓
+        │   Supervisor accepts (→ `clou_create_milestone`), rejects,
+        │   or defers via `clou_dispose_proposal`
+        │
+        └─ True in-milestone blocker needing human decision?
+              → write escalation file (fallback, not default)
               ↓
          Supervisor detects open escalation
               ↓

@@ -85,7 +85,7 @@ The coordinator is NOT a dispatcher. It does not simply assign work and collect 
         Foundations §9). Re-decomposition updates compose.py and is
         re-validated by the orchestrator via AST parsing.
       - noise findings → logged as dismissed in decisions.md (no action)
-      - architectural findings → file escalation
+      - architectural findings → default: file milestone proposal via `clou_propose_milestone` (cross-cutting work for a future milestone, supervisor dispositions); exception: file escalation via `clou_file_escalation` only for in-milestone blockers needing human decision. See Stream C / zero-escalations rule.
       - security findings → always rework, never dismiss
    d. Write active/coordinator.md checkpoint
 
@@ -136,6 +136,45 @@ Before dispatching any work, the coordinator:
 5. **Writes phase narratives** — `phase.md` for each phase provides narrative scope and context for agent teams
 
 This planning phase is distinct from execution. The coordinator does not start writing code until it has a validated composition. The composition is a written artifact (`compose.py`) that can be reviewed, validated by the orchestrator, and that survives session restarts.
+
+## Phase Acceptance Gate (M52)
+
+Phase advancement is authoritatively decided by the engine, not the
+LLM (DB-22).  At the start of every ASSESS cycle, before the LLM
+ASSESS prompt fires, the engine runs `check_phase_acceptance` over
+the current phase's `execution.md`.  The gate parses the typed
+artifact declared in `phase.md`'s `## Deliverable\ntype: <name>`
+section, validates it against the type's schema, and produces one
+of:
+
+- `Advance(phase, content_sha, artifact_type)` — the deliverable is
+  present, validates, and lives at the correct location.
+- `GateDeadlock(phase, reason, detail)` — one of:
+  `missing_artifact_type`, `schema_mismatch`, `id_mismatch`,
+  `location_forgery`, `parse_error`, `unregistered_type`.
+
+The verdict is persisted into the checkpoint envelope's
+`last_acceptance_verdict` field
+(`<phase>|<decision>|<content_sha>` wire format, or `none`).  The
+LLM then reads the verdict from cycle context and routes:
+
+- `Advance` → may call `clou_write_checkpoint` with
+  `phases_completed += 1` (the tool itself enforces the verdict-gate:
+  decision must be Advance, verdict.phase must equal
+  prev_cp.current_phase, increment must be exactly +1).
+- `GateDeadlock` → recoverable cases route to `EXECUTE_REWORK`;
+  structural cases (declared type wrong, worker can't produce typed
+  output) route to `clou_halt_trajectory`.
+
+Legacy phase.md files without a typed deliverable take a one-shot
+F41 bootstrap grace, allowing one advance with a
+`migration.last_acceptance_verdict` telemetry event.
+
+The verdict gate makes M50/M51-class anti-convergence structurally
+impossible: same content yields the same verdict, every cycle.  The
+LLM cannot self-judge past a deadlocked phase; cross-phase off-by-one
+is refused; re-emit during rework requires a fresh gate evaluation
+because the verdict is bound to a specific content_sha (F35).
 
 ## Coordinator's Relationship with the Quality Gate
 

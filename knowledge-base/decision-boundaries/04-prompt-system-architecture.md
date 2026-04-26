@@ -191,7 +191,9 @@ Protocol files use XML structure, front-load critical content (attention sinks a
 
 <objective>
 Evaluate phase execution results against requirements and compose.py criteria.
-Determine: rework needed, phase complete, or escalation required.
+Determine: rework needed, phase advanceable (per the engine's gate verdict), or
+escalation required.  M52: phase completion is judged by the engine's
+phase-acceptance gate (DB-22), not by self-assessment.
 </objective>
 
 <procedure>
@@ -202,10 +204,15 @@ Determine: rework needed, phase complete, or escalation required.
    findings warrant action.
 5. For each finding: accept (rework), override (log in decisions.md
    with reasoning), or escalate.
-6. Write assessment to active/coordinator.md:
-   - If rework needed: set next_step to "EXECUTE (rework)"
-   - If phase complete: advance phase status, set next_step
-   - If all phases complete: set next_step to "VERIFY"
+6. Read the engine's phase-acceptance verdict from cycle context
+   (`prev_cp.last_acceptance_verdict`). Routing keys on the verdict:
+   - `Advance` + more phases remain: increment `phases_completed` via
+     `clou_write_checkpoint` (which enforces single-increment +
+     verdict-phase match), set next_step to EXECUTE.
+   - `Advance` + all phases complete: set next_step to VERIFY.
+   - `GateDeadlock` (recoverable): set next_step to EXECUTE_REWORK.
+   - `GateDeadlock` (structural): file `clou_halt_trajectory`.
+   - Rework needed for valid findings: set next_step to EXECUTE_REWORK.
 7. Write all judgments to decisions.md.
 </procedure>
 

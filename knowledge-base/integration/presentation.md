@@ -31,6 +31,8 @@ Textual App (owns event loop)
     │                   ├── TaskStartedMsg    → post ClouAgentSpawned
     │                   ├── TaskProgressMsg   → post ClouAgentProgress
     │                   ├── TaskNotificationMsg → post ClouAgentComplete
+    │                   ├── (new escalation file) → post ClouBreathEvent
+    │                   │      "escalation filed: {classification}: {name}"
     │                   └── ResultMessage     → post ClouCycleComplete
     │
     │           posts ClouCoordinatorComplete (BREATH → HANDOFF/DIALOGUE)
@@ -39,9 +41,10 @@ Textual App (owns event loop)
     ├── Conversation Widget (RichLog + streaming overlay)
     ├── Breath Widget (curated status lines)
     ├── Status Bar (custom Static, docked bottom)
-    ├── Input Widget (TextArea for multi-line)
-    └── Escalation Watcher (filesystem polling or hook)
+    └── Input Widget (TextArea for multi-line)
 ```
+
+**No escalation modal.** Escalations are agent-to-agent decision records (see `memory/project_escalations_are_agent_to_agent.md` and `knowledge-base/protocols/escalation.md`). New escalation files surface as **passive breath events** — a single status line, no modal, no mode transition, no user-visible decision affordance. User-facing decisions use `ask_user_mcp`, which is a separate channel.
 
 **Why this works:** The supervisor `ClaudeSDKClient` runs as an async `@work` worker on the Textual event loop. Async workers can directly post messages to the app. When the supervisor calls `clou_spawn_coordinator`, the SDK routes to the in-process MCP tool handler, which runs the coordinator loop — still on the same event loop. The coordinator creates its own `ClaudeSDKClient` instances (separate subprocesses, separate sessions), but iterating their messages happens in the same async context. All `post_message()` calls are on the same event loop. No threads. No `call_from_thread()`. No synchronization.
 
@@ -80,12 +83,13 @@ Textual App (owns event loop)
 | Event | Clou Message | Mode Transition |
 |-------|-------------|----------------|
 | MCP tool `clou_spawn_coordinator` called | `ClouCoordinatorSpawned(milestone)` | DIALOGUE → BREATH |
-| Escalation file written to golden context | `ClouEscalationArrived(path)` | BREATH → DECISION |
-| User resolves escalation | `ClouEscalationResolved(disposition)` | DECISION → BREATH |
+| Escalation file written to golden context | `ClouBreathEvent(text="escalation filed: …")` | *(none — passive)* |
 | Coordinator returns "completed" | `ClouCoordinatorComplete(milestone, "completed")` | BREATH → HANDOFF |
 | Coordinator returns "escalated_*" | `ClouCoordinatorComplete(milestone, "escalated")` | BREATH → DIALOGUE |
 | User dismisses handoff | `ClouHandoffDismissed()` | HANDOFF → DIALOGUE |
 | User types during breath mode | `ClouUserInterrupt(text)` | BREATH → DIALOGUE (status line keeps breath metrics) |
+
+DECISION mode survives this retirement — brutalist findings, validation failures, and any future agent-authored prompts still use it. Only the escalation-arrival pathway is closed.
 
 ## Clou Message Types
 
@@ -218,23 +222,12 @@ class ClouCoordinatorComplete(Message):
 
 
 # --- Escalation messages ---
-
-class ClouEscalationArrived(Message):
-    """Escalation requires user decision."""
-    def __init__(self, path: Path, classification: str,
-                 issue: str, options: list[dict]) -> None:
-        self.path = path
-        self.classification = classification
-        self.issue = issue
-        self.options = options
-        super().__init__()
-
-class ClouEscalationResolved(Message):
-    """User resolved an escalation."""
-    def __init__(self, path: Path, disposition: str) -> None:
-        self.path = path
-        self.disposition = disposition
-        super().__init__()
+#
+# Escalations surface as ``ClouBreathEvent`` (see above) — a single
+# status line per newly filed file. There is no ``ClouEscalationArrived``
+# or ``ClouEscalationResolved`` message and no modal pathway.  See
+# ``knowledge-base/protocols/escalation.md`` and
+# ``memory/project_escalations_are_agent_to_agent.md``.
 
 
 # --- Handoff messages ---
@@ -503,45 +496,60 @@ For the streaming markdown rendering, use McGugan's block-finalization approach:
 3. Render finalized blocks into the RichLog (immutable, never re-rendered)
 4. Keep only the tail block in the Static (the only mutable element)
 
-## Escalation Detection
+## Escalation Detection (Passive Notification)
 
-Escalations are written to `.clou/milestones/<name>/escalations/<timestamp>-<slug>.md` by the coordinator. The bridge needs to detect new escalation files.
+Escalations are written to `.clou/milestones/<name>/escalations/<timestamp>-<slug>.md` **only** by the sanctioned writer paths:
 
-**Option A: Hook-based.** Register a `PostToolUse` hook on the coordinator's `Write` tool that fires when the path matches `escalations/*.md`. The hook posts `ClouEscalationArrived` directly.
+- The MCP tool `mcp__clou_coordinator__clou_file_escalation` (coordinator authorship).
+- `clou/recovery_escalation.py` (system-authored: cycle-limit, agent-crash, validation-failure, staleness).
+
+Direct `Write`/`Edit`/`MultiEdit` from agents is denied by the PreToolUse hook. See `knowledge-base/protocols/escalation.md` for schema and `clou/escalation.py` for the canonical form.
+
+Passive detection lives in the coordinator loop (`clou/coordinator.py`, `_announce_new_escalations`). The notifier:
+
+1. Diffs the escalations directory against `.clou/milestones/{milestone}/active/seen-escalations.txt`. (C2: the seen file is per-milestone to close a cross-coordinator race under parallel dispatch; the legacy global path `.clou/active/seen-escalations.txt` is read once on migration, then abandoned.)
+2. Parses each newly seen file via `clou.escalation.parse_escalation`.
+3. Posts a `ClouBreathEvent(text="escalation filed: {classification}: {filename}", cycle_type="", phase=None)` per new file.
+4. Parse failures emit a distinct `"escalation filed (parse-error): {filename}"` event so drift is visible at the status line.
+5. `seen` bookkeeping is committed only after a successful post; a transient UI failure or `_app is None` defers the mark so the announcement is never silently lost.
 
 ```python
-# In build_hooks("coordinator", ...)
-async def detect_escalation(input_data, tool_use_id, context):
-    file_path = input_data.get("tool_input", {}).get("file_path", "")
-    if "/escalations/" in file_path and file_path.endswith(".md"):
-        escalation = parse_escalation(Path(file_path))
-        app.post_message(ClouEscalationArrived(
-            path=Path(file_path),
-            classification=escalation.classification,
-            issue=escalation.issue,
-            options=escalation.options,
-        ))
-    return {}
+# In clou/coordinator.py (conceptual; see the real helper)
+
+def _announce_new_escalations() -> None:
+    _app = get_active_app()
+    if _app is None:
+        return  # defer mark-seen until UI attaches
+    for esc_file in sorted(esc_dir.glob("*.md")):
+        if esc_file.name in seen_escalations:
+            continue
+        try:
+            form = parse_escalation(esc_file)
+            text = f"escalation filed: {form.classification}: {esc_file.name}"
+        except Exception:
+            text = f"escalation filed (parse-error): {esc_file.name}"
+        try:
+            _app.post_message(
+                ClouBreathEvent(text=text, cycle_type="", phase=None),
+            )
+        except Exception:
+            continue  # retry on next cycle
+        seen_escalations.add(esc_file.name)
+    # single write after the loop, not per-file
+    seen_path.write_text("\n".join(sorted(seen_escalations)) + "\n")
 ```
 
-**Option B: Filesystem polling.** A `set_interval` timer checks for new files in the escalations directory. Simpler but less immediate.
+## Escalation Resolution (Agent-to-Agent)
 
-**Option A is better** — hooks fire synchronously with the write, zero latency.
+Resolution is **agent-to-agent** — the supervisor reads the `## Disposition` section and updates `status` via the supervisor-tier resolution tool (not via a modal). There is no user-facing DECISION-mode transition for escalation arrival:
 
-## Escalation Resolution Flow
+1. A new escalation file appears.
+2. The passive notifier posts a single breath event.
+3. The supervisor, on its next turn, reads `clou_status` (which filters to `open`/`investigating`/`deferred` per F30) and decides which escalation to tackle.
+4. The supervisor invokes the resolution MCP tool to rewrite the `## Disposition` section. Other sections are preserved byte-for-byte.
+5. The coordinator reads the disposition on its next cycle and, where applicable, resets cycle counters (DB-15 D5).
 
-When `ClouEscalationArrived` fires:
-
-1. App transitions mode to DECISION
-2. Escalation card renders as a `ModalScreen` (blocks input to breath)
-3. User reads the escalation: classification, context, options, recommendation
-4. User selects an option (keyboard navigation)
-5. The disposition is written to the escalation file (the `Disposition` section)
-6. `ClouEscalationResolved` is posted
-7. App transitions back to BREATH
-8. The coordinator reads the disposition on its next cycle
-
-**The coordinator must be designed to check for resolved escalations.** Since escalations are written to golden context, the coordinator's PLAN/EXECUTE/ASSESS protocols should read the escalations directory and check for dispositions.
+If the user needs to participate in the decision (credentials, outside-terminal action), the supervisor calls `ask_user_mcp` — a separate channel with explicit user surface.
 
 ## Status Bar
 
@@ -724,7 +732,7 @@ When the user types and presses Enter:
 
 - **Dialogue mode:** Input goes to the supervisor session via `supervisor.query(text)`.
 - **Breath mode:** Typing triggers BREATH → DIALOGUE transition. The breath metrics compress to the status bar. The input goes to the supervisor (which is blocked on the MCP tool — the user may be talking to the orchestrator directly, or their input will queue until the supervisor session resumes).
-- **Decision mode:** Input is captured by the escalation modal. Enter selects the focused option.
+- **Decision mode:** Reserved for non-escalation decision cards (brutalist findings, validation failures). Input handling is specific to each card.
 - **Handoff mode:** Input goes to the supervisor (which has resumed after the coordinator returned).
 
 ```python
@@ -751,7 +759,7 @@ async def on_input_submitted(self, event: Input.Submitted) -> None:
             await self._supervisor.query(text)
 
         case Mode.DECISION:
-            pass  # Handled by escalation modal
+            pass  # Handled by the active decision card (e.g. brutalist findings)
 ```
 
 ## File Structure
@@ -759,19 +767,22 @@ async def on_input_submitted(self, event: Input.Submitted) -> None:
 ```
 clou/
 ├── orchestrator.py          # Session lifecycle (calls bridge internally)
+├── coordinator.py           # Cycle engine; _announce_new_escalations lives here
+├── escalation.py            # EscalationForm, render_escalation, parse_escalation
 ├── graph.py                 # Compose.py validation (exists)
 ├── ui/
 │   ├── app.py               # ClouApp — Textual App, mode state machine,
 │   │                        #   supervisor worker, MCP tool handlers
 │   ├── clou.tcss            # Visual language as CSS
 │   ├── theme.py             # Color palette, semantic tokens
-│   ├── messages.py          # All ClouMessage types (above)
+│   ├── messages.py          # All ClouMessage types (above); no
+│   │                        #   ClouEscalationArrived / Resolved
 │   ├── bridge.py            # extract_coordinator_status, extract_stream_text,
-│   │                        #   parse_escalation, format helpers
+│   │                        #   format helpers (parse_escalation lives in
+│   │                        #   clou.escalation, not here)
 │   ├── widgets/
 │   │   ├── conversation.py  # Two-layer: RichLog + streaming Static
 │   │   ├── breath.py        # Curated status line display
-│   │   ├── escalation.py    # ModalScreen for structured decisions
 │   │   ├── handoff.py       # Markdown walk-through renderer
 │   │   ├── status_bar.py    # Reactive metrics bar (custom Static)
 │   │   ├── dag.py           # Compose.py dependency graph (on-demand)
@@ -789,7 +800,7 @@ clou/
 | SDK and Textual share event loop | Async `@work` worker runs SDK client; both on Textual's loop |
 | Supervisor blocks during coordinator | MCP tool handler runs coordinator inline; bridge switches routing |
 | RichLog can't stream tokens | Two-layer surface: RichLog (history) + Static (streaming tail) |
-| Escalation detection | PostToolUse hook on coordinator's Write tool |
+| Escalation detection | Passive filesystem diff in `_announce_new_escalations`; posts `ClouBreathEvent` per new file |
 | Mode transitions | Reactive `mode` attribute → CSS class toggle + `styles.animate()` |
 | Breath event curation | `extract_coordinator_status()` filters coordinator messages |
 | Footer can't show metrics | Custom `ClouStatusBar` widget (docked Static with reactives) |
@@ -801,7 +812,7 @@ clou/
 
 2. **Coordinator `include_partial_messages`?** Probably not — we don't want to stream coordinator reasoning to the user. We want curated breath events. But `TaskProgressMessage` arrives without this flag, which is what we need for agent team visibility.
 
-3. **Escalation while supervisor is blocked.** The supervisor session is waiting for the MCP tool result. The user resolves the escalation by writing to golden context. The coordinator reads the disposition on its next cycle. But the supervisor can't be asked to do anything until the coordinator returns. Is this acceptable? If the escalation is "service credentials needed," the user may need to do work outside the terminal (set up Stripe, etc.) and then signal readiness. The current flow handles this: the disposition is written to the file, the coordinator checks it.
+3. **Escalation while supervisor is blocked.** Escalations are agent-to-agent (see `knowledge-base/protocols/escalation.md`); they do not interrupt the supervisor's session. The supervisor picks up open escalations between coordinator runs via `clou_status` (F30 filters to actionable statuses). When user action is genuinely required (credentials, outside-terminal setup), the coordinator uses `ask_user_mcp` instead — a distinct channel with explicit user surface.
 
 4. **Multiple coordinators (future).** The current design serializes coordinators. If we later parallelize them, the bridge needs to route breath events from multiple coordinators. The message types already include `milestone` for disambiguation. The status bar would need to show multiple milestones.
 

@@ -7,7 +7,7 @@
 
 ## Decision
 
-**Brutalists are structurally separated from assessment judgment. Brutalists run as read-only critics that cannot edit code. The assessor reads brutalist output and classifies each finding as valid (fix needed), noise (dismiss), or architectural (escalate). Valid findings route to EXECUTE rework. Architectural findings escalate to the supervisor. The convergence trajectory (bugs → edge cases → test gaps → stop) is the assessor's stopping criterion.**
+**Brutalists are structurally separated from assessment judgment. Brutalists run as read-only critics that cannot edit code. The assessor reads brutalist output and classifies each finding as valid (fix needed), noise (dismiss), or architectural (route to a milestone proposal by default, or an in-milestone escalation as the rare exception). Valid findings route to EXECUTE rework. Architectural findings default to a milestone proposal filed by the coordinator via `clou_propose_milestone` — the supervisor dispositions proposals (accept → crystallize via `clou_create_milestone`, reject, or defer). True in-milestone blockers that require a human decision still route through `clou_file_escalation`, but escalations are the fallback, not the default (zero-escalations principle). The convergence trajectory (bugs → edge cases → test gaps → stop) is the assessor's stopping criterion.**
 
 ## The Separation
 
@@ -82,7 +82,7 @@ Two dispatches per ASSESS cycle instead of one. The additional dispatch cost is 
 |---|---|---|
 | **valid** | Create rework task in next EXECUTE | Finding is correct, in scope, fix is proportionate to milestone requirements |
 | **noise** | Document dismissal in decisions.md | Finding is out of scope, stylistic, or fix cost exceeds value for this milestone |
-| **architectural** | Write escalation file | Finding is valid but beyond coordinator's delegated authority |
+| **architectural** | File milestone proposal via `clou_propose_milestone` (default) OR escalation via `clou_file_escalation` (in-milestone blocker only) | Finding is valid but beyond current milestone scope |
 | **security** | Always accept as valid | Security findings from roast_security are never classified as noise |
 
 Multi-source agreement strengthens classification: if roast_codebase AND roast_architecture flag the same issue, it's more likely valid than noise.
