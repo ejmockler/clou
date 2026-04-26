@@ -18,6 +18,7 @@ from clou.ui.widgets.breath import (
 from clou.ui.widgets.task_graph import (
     _FOCUS_BOOST,
     _TEXT_DIM_L,
+    _TEXT_PENDING_L,
     TaskGraphWidget,
     _expansion_luminance,
 )
@@ -306,7 +307,7 @@ class TestFocusedRowLuminanceBoost:
         )
 
     def test_focus_boost_uses_correct_luminance(self) -> None:
-        """Focused row name chars use _TEXT_DIM_L + _FOCUS_BOOST."""
+        """Focused row name chars use _TEXT_PENDING_L + _FOCUS_BOOST for pending."""
         w = _make_sized_widget()
         model = _make_model()
         w.update_model(model)
@@ -321,9 +322,9 @@ class TestFocusedRowLuminanceBoost:
         assert task_y is not None
 
         strip = w.render_line(task_y)
-        # Name region char at index 4.
-        seg = strip._segments[4]
-        expected_rgb = luminance_to_rgb(_TEXT_DIM_L + _FOCUS_BOOST)
+        # Name region char at index 3 (pending has no icon, 3-space indent).
+        seg = strip._segments[3]
+        expected_rgb = luminance_to_rgb(_TEXT_PENDING_L + _FOCUS_BOOST)
         er, eg, eb = expected_rgb
         expected_hex = f"#{er:02x}{eg:02x}{eb:02x}"
         actual_style = str(seg.style).lower()
@@ -349,17 +350,19 @@ class TestFocusedRowLuminanceBoost:
         assert task_y is not None
 
         strip = w.render_line(task_y)
-        seg = strip._segments[4]
-        expected_rgb = luminance_to_rgb(_TEXT_DIM_L)  # no boost
+        # Pending: index 3 is first name char (3-space indent, no icon).
+        seg = strip._segments[3]
+        expected_rgb = luminance_to_rgb(_TEXT_PENDING_L)  # no boost
         er, eg, eb = expected_rgb
         expected_hex = f"#{er:02x}{eg:02x}{eb:02x}"
         actual_style = str(seg.style).lower()
         assert expected_hex in actual_style
 
-    def test_icon_also_gets_boost(self) -> None:
-        """The status icon on a focused row also gets the luminance boost."""
+    def test_focused_active_row_icon_differs(self) -> None:
+        """Active task icon gets luminance boost when focused."""
         w = _make_sized_widget()
         model = _make_model()
+        model.activate_task("build_model", "agent-1")
         w.update_model(model)
 
         # Find the task row index for build_model.
@@ -371,18 +374,18 @@ class TestFocusedRowLuminanceBoost:
                 break
         assert task_y is not None
 
-        # Unfocused icon.
+        # Unfocused.
         w._focused_index = -1
         strip_unfocused = w.render_line(task_y)
         icon_style_unfocused = str(strip_unfocused._segments[2].style)
 
-        # Focused icon.
+        # Focused.
         w._focused_index = 0
         strip_focused = w.render_line(task_y)
         icon_style_focused = str(strip_focused._segments[2].style)
 
         assert icon_style_focused != icon_style_unfocused, (
-            "Focused icon should differ from unfocused"
+            "Focused active icon should differ from unfocused"
         )
 
 

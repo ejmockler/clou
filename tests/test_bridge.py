@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from clou.ui.bridge import (
@@ -10,7 +9,6 @@ from clou.ui.bridge import (
     _strip_ansi,
     extract_coordinator_status,
     extract_stream_text,
-    parse_escalation,
     route_coordinator_message,
     route_supervisor_message,
 )
@@ -199,66 +197,6 @@ class TestExtractStreamText:
 
     def test_empty_event(self) -> None:
         assert extract_stream_text({}) is None
-
-
-# ---------------------------------------------------------------------------
-# parse_escalation
-# ---------------------------------------------------------------------------
-
-
-class TestParseEscalation:
-    def test_parses_full_escalation(self, tmp_path: Path) -> None:
-        md = tmp_path / "escalation.md"
-        md.write_text(
-            "## Classification\ncredentials\n\n"
-            "## Issue\nNeed Stripe API key to proceed.\n\n"
-            "## Options\n"
-            "1. **Provide key** : User supplies the key via env var\n"
-            "2. **Skip** : Defer payment integration\n\n"
-            "## Recommendation\nOption 1 is preferred.\n",
-            encoding="utf-8",
-        )
-        result = parse_escalation(md)
-        assert result["classification"] == "credentials"
-        assert "Stripe" in result["issue"]
-        assert len(result["options"]) == 2
-        assert result["options"][0]["label"] == "Provide key"
-        assert result["options"][1]["label"] == "Skip"
-        assert "Option 1" in result["recommendation"]
-
-    def test_parses_system_generated_escalation(self, tmp_path: Path) -> None:
-        """System-generated escalations use plain numbered options (no bold)."""
-        md = tmp_path / "escalation.md"
-        md.write_text(
-            "# Escalation: Cycle Limit Reached\n\n"
-            "**Classification:** blocking\n"
-            "**Filed:** 2026-03-23T12:00:00+00:00\n\n"
-            "## Context\nThe coordinator has completed 20 cycles.\n\n"
-            "## Issue\nCycle count (20) has reached the 20-cycle limit.\n\n"
-            "## Evidence\ncycle_count=20\n\n"
-            "## Options\n"
-            "1. Increase the cycle limit and continue execution\n"
-            "2. Reassess the milestone scope and break it into smaller milestones\n"
-            "3. Manually intervene to unblock progress\n\n"
-            "## Recommendation\nReassess the milestone scope.\n\n"
-            "## Disposition\nstatus: open\n",
-            encoding="utf-8",
-        )
-        result = parse_escalation(md)
-        assert result["classification"] == "blocking"
-        assert "20-cycle limit" in result["issue"]
-        assert len(result["options"]) == 3
-        assert result["options"][0]["label"] == "Increase the cycle limit and continue execution"
-        assert result["options"][2]["label"] == "Manually intervene to unblock progress"
-
-    def test_missing_sections_return_empty(self, tmp_path: Path) -> None:
-        md = tmp_path / "empty.md"
-        md.write_text("# No sections here\nJust text.", encoding="utf-8")
-        result = parse_escalation(md)
-        assert result["classification"] == ""
-        assert result["issue"] == ""
-        assert result["options"] == []
-        assert result["recommendation"] == ""
 
 
 # ---------------------------------------------------------------------------

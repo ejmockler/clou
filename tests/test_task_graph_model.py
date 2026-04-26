@@ -403,3 +403,25 @@ class TestAddToolCallOutputSummary:
         invocations = model.task_states["build_model"].tool_invocations
         assert invocations[0].output_summary == "contents of a.py"
         assert invocations[1].output_summary == ""
+
+
+# ---------------------------------------------------------------------------
+# T10: spawn_cycle field
+# ---------------------------------------------------------------------------
+
+
+class TestSpawnCycleField:
+    """TaskState.spawn_cycle tags agents with their originating cycle."""
+
+    def test_default_spawn_cycle_empty(self) -> None:
+        state = TaskState()
+        assert state.spawn_cycle == ""
+
+    def test_spawn_cycle_set(self) -> None:
+        state = TaskState(status="active", spawn_cycle="ASSESS")
+        assert state.spawn_cycle == "ASSESS"
+
+    def test_dag_tasks_default_spawn_cycle(self) -> None:
+        model = _make_model()
+        for state in model.task_states.values():
+            assert state.spawn_cycle == ""

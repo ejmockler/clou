@@ -455,12 +455,11 @@ async def _cmd_compact(app: ClouApp, args: str) -> None:
 
     render_command_output(app, Text("  compacting...", style=f"italic {_DIM_HEX}"))
 
-    # Wait for completion (with timeout).
-    try:
-        await asyncio.wait_for(app._compact.complete.wait(), timeout=120.0)
-    except TimeoutError:
-        _render_error(app, "compaction timed out — supervisor may be unresponsive")
-        return
+    # Wait for completion.  No timeout — compaction involves a full
+    # supervisor LLM pass and can legitimately take several minutes on
+    # large transcripts.  If the supervisor is genuinely stuck, the user
+    # can Ctrl-C; adding a ceiling would kneecap legitimate long runs.
+    await app._compact.complete.wait()
 
     # Show confirmation.
     count = app._compact.count

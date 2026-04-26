@@ -15,8 +15,6 @@ from clou.ui.messages import (
     ClouCoordinatorSpawned,
     ClouCycleComplete,
     ClouDagUpdate,
-    ClouEscalationArrived,
-    ClouEscalationResolved,
     ClouHandoff,
     ClouMetrics,
     ClouRateLimit,
@@ -68,8 +66,6 @@ ALL_MESSAGE_CLASSES = [
     ClouCycleComplete,
     ClouCoordinatorComplete,
     ClouDagUpdate,
-    ClouEscalationArrived,
-    ClouEscalationResolved,
     ClouHandoff,
     ClouMetrics,
 ]
@@ -236,48 +232,6 @@ class TestClouCoordinatorComplete:
         msg = ClouCoordinatorComplete(milestone="m1", result="completed")
         assert msg.milestone == "m1"
         assert msg.result == "completed"
-
-
-# ---------------------------------------------------------------------------
-# Escalation messages
-# ---------------------------------------------------------------------------
-
-
-class TestClouEscalationArrived:
-    def test_construction_and_attrs(self) -> None:
-        p = Path("/tmp/escalation.md")
-        options: list[dict[str, object]] = [
-            {"label": "approve", "value": "yes"},
-            {"label": "reject", "value": "no"},
-        ]
-        msg = ClouEscalationArrived(
-            path=p, classification="credentials", issue="need key", options=options
-        )
-        assert msg.path == p
-        assert msg.classification == "credentials"
-        assert msg.issue == "need key"
-        assert msg.options == options
-
-    def test_accepts_path_str_str_list_dict(self) -> None:
-        """Verify the documented signature: Path, str, str, list[dict]."""
-        msg = ClouEscalationArrived(
-            path=Path("."),
-            classification="c",
-            issue="i",
-            options=[{"a": "b"}],
-        )
-        assert isinstance(msg.path, Path)
-        assert isinstance(msg.classification, str)
-        assert isinstance(msg.issue, str)
-        assert isinstance(msg.options, list)
-
-
-class TestClouEscalationResolved:
-    def test_construction_and_attrs(self) -> None:
-        p = Path("/tmp/escalation.md")
-        msg = ClouEscalationResolved(path=p, disposition="approved")
-        assert msg.path == p
-        assert msg.disposition == "approved"
 
 
 # ---------------------------------------------------------------------------

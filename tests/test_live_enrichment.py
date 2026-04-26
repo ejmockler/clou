@@ -79,12 +79,24 @@ def _run(coro: object) -> dict[str, object]:
 
 
 def _get_transcript_hook() -> object:
-    """Return the transcript PostToolUse hook callback for coordinator tier."""
+    """Return the transcript PostToolUse hook callback for coordinator tier.
+
+    Multiple ``matcher=None`` PostToolUse hooks exist (transcript +
+    escalation-announcer + halt-reminder, added by the DB-14/DB-21
+    hooks remolding).  Identify the transcript hook by its inner
+    function qualname produced by ``_make_transcript_hook``.
+    """
     hooks = build_hooks("coordinator", Path("/tmp/project"))
     post_hooks = hooks["PostToolUse"]
-    transcript_cfg = [c for c in post_hooks if c.matcher is None]
-    assert len(transcript_cfg) == 1
-    return transcript_cfg[0].hooks[0]
+    for cfg in post_hooks:
+        if cfg.matcher is None:
+            for cb in cfg.hooks:
+                qual = getattr(cb, "__qualname__", "") or ""
+                if "transcript_hook" in qual:
+                    return cb
+    raise AssertionError(
+        "transcript_hook not found among matcher=None PostToolUse hooks"
+    )
 
 
 # ---------------------------------------------------------------------------

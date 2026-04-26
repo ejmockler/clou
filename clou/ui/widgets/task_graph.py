@@ -10,6 +10,7 @@ Public API:
 
 from __future__ import annotations
 
+import re
 import time
 from collections import Counter
 from typing import ClassVar
@@ -22,9 +23,10 @@ from textual.reactive import reactive
 from textual.strip import Strip
 from textual.widget import Widget
 
+from clou.recovery_checkpoint import is_execute_family
 from clou.ui.messages import ClouToolCallRecorded, RequestAgentDetail
 from clou.ui.task_graph import TaskGraphModel
-from clou.ui.theme import PALETTE, OklchColor, breath_modulate
+from clou.ui.theme import PALETTE, OklchColor, _CYCLE_COLOR_MAP, breath_modulate
 from clou.ui.widgets.breath import (
     _ARRIVAL_DURATION,
     _LINGER_DURATION,
@@ -38,9 +40,9 @@ from clou.ui.widgets.breath import (
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Status icons mapped to task status strings.
+#: Status icons mapped to task status strings.  Pending has no icon --
+#: absence of icon communicates "not started".
 STATUS_ICONS: dict[str, str] = {
-    "pending": "\u25cb",   # ○
     "active": "\u25c9",    # ◉
     "complete": "\u2713",  # ✓
     "failed": "\u2717",    # ✗
@@ -57,8 +59,11 @@ _STATUS_PALETTE: dict[str, str] = {
 #: Column widths for task row layout.
 ICON_COL_WIDTH: int = 3        # icon + space + space
 TASK_NAME_MAX: int = 40        # left-aligned, truncated
-TOOL_COUNT_WIDTH: int = 11     # " [nn tools]" or blank
-LAST_TOOL_MIN: int = 1         # at least 1 char for last_tool
+
+#: Per-layer indentation step (chars).  Layer 0 = base indent (2),
+#: layer 1 = base + LAYER_INDENT, etc.
+_BASE_INDENT: int = 2
+_LAYER_INDENT: int = 2
 
 #: Neutral text hue/chroma (from palette: text-dim).
 _TEXT_HUE: float = 250.0
@@ -67,11 +72,17 @@ _TEXT_CHROMA: float = 0.008
 #: Luminance for non-active task names.
 _TEXT_DIM_L: float = 0.60
 
+#: Luminance for pending tasks -- significantly dimmer.
+_TEXT_PENDING_L: float = 0.40
+
 #: Luminance for muted elements (tool count, last tool, headers).
 _TEXT_MUTED_L: float = 0.45
 
 #: Luminance boost for focused row.
 _FOCUS_BOOST: float = 0.15
+
+#: Regex to strip hex hash suffixes from agent names (e.g. ":a120b4a37b227f381").
+_HASH_SUFFIX_RE = re.compile(r":[0-9a-f]{7,}$")
 
 #: Category display order for categorized activity summary.
 _CAT_ORDER: list[str] = ["reads", "writes", "shell", "searches", "other"]
@@ -81,11 +92,11 @@ _CAT_ORDER: list[str] = ["reads", "writes", "shell", "searches", "other"]
 # ---------------------------------------------------------------------------
 
 # Each entry in _row_map is (row_type, data):
-#   ("edge", layer_index)              -- dependency edge between layers
+#   ("phase_label", cycle_type)        -- cycle phase header (e.g. "ASSESS")
 #   ("task", task_name)                -- a task row
 #   ("tool_groups", task_name)         -- categorized tool activity summary
 #   ("summary", task_name)             -- drill-down summary line
-#   ("spacer", None)                   -- blank line between groups
+#   ("spacer", None)                   -- blank line between sections
 _RowEntry = tuple[str, object]
 
 # ---------------------------------------------------------------------------
@@ -166,6 +177,9 @@ class TaskGraphWidget(Widget):
     #: Whether shimmer is active (any task is in "active" status).
     shimmer_active: reactive[bool] = reactive(False)
 
+    #: Current coordinator cycle type (PLAN/EXECUTE/ASSESS/VERIFY).
+    cycle_type: reactive[str] = reactive("")
+
     #: Palette tokens used by this widget (for test introspection).
     PALETTE_TOKENS_USED: ClassVar[frozenset[str]] = frozenset(
         _STATUS_PALETTE.values()
@@ -195,6 +209,9 @@ class TaskGraphWidget(Widget):
         #: Spawns received before the DAG model exists.
         self._pending_spawns: list[tuple[str, str]] = []  # (task_id, description)
 
+        #: Layer depth per task name (0-based).  Unmapped agents get 0.
+        self._task_layer_depth: dict[str, int] = {}
+
     # -- sizing --------------------------------------------------------------
 
     def get_content_height(self, container, viewport, width: int) -> int:
@@ -211,7 +228,9 @@ class TaskGraphWidget(Widget):
         self._expanded.clear()
         self._expansion_states.clear()
         self._pending_spawns.clear()
+        self._task_layer_depth.clear()
         self.shimmer_active = False
+        self.cycle_type = ""
         self.refresh(layout=True)
 
     def update_model(self, model: TaskGraphModel) -> None:
@@ -235,6 +254,11 @@ class TaskGraphWidget(Widget):
         """Trigger a repaint whenever the breath phase changes."""
         self._frame_time = time.monotonic()
         self.refresh()
+
+    def watch_cycle_type(self, value: str) -> None:
+        """Rebuild row map when cycle type changes (layout order depends on phase)."""
+        self._rebuild_row_map()
+        self.refresh(layout=True)
 
     # -- message handlers ----------------------------------------------------
 
@@ -369,40 +393,73 @@ class TaskGraphWidget(Widget):
     def _rebuild_row_map(self) -> None:
         """Compute the flat list of row entries from the model's layers.
 
-        Renders tasks with dependency edge connectors between layers
-        instead of phase headers.  Includes drill-down rows for expanded
-        tasks and unmapped agents below the main graph.
+        Layout is phase-aware:
+        - During EXECUTE (or no cycle info): DAG tasks first, unmapped secondary
+        - During PLAN/ASSESS/VERIFY: unmapped agents first, DAG as dim context
+
+        A phase label row appears when ``cycle_type`` is set.
         """
         rows: list[_RowEntry] = []
+        depth_map: dict[str, int] = {}
+
         if self._model is None:
             self._row_map = rows
+            self._task_layer_depth = depth_map
             return
 
+        # Build DAG task rows (with indentation depth).
+        dag_rows: list[_RowEntry] = []
         for layer_idx, layer in enumerate(self._model.layers):
             if not layer:
-                continue  # Skip empty layers.
-            if layer_idx > 0 and rows:
-                # Edge connector between layers shows dependency flow.
-                rows.append(("edge", layer_idx))
+                continue
             for task_name in layer:
-                rows.append(("task", task_name))
-                # If expanded, add grouped summary + optional completion.
-                if task_name in self._expanded and self._model is not None:
+                depth_map[task_name] = layer_idx
+                dag_rows.append(("task", task_name))
+                if task_name in self._expanded:
                     state = self._model.task_states.get(task_name)
                     if state is not None:
                         if state.tool_invocations:
-                            rows.append(("tool_groups", task_name))
+                            dag_rows.append(("tool_groups", task_name))
                         if state.summary:
-                            rows.append(("summary", task_name))
+                            dag_rows.append(("summary", task_name))
 
-        # Unmapped agents: work that doesn't match compose.py tasks.
-        if self._model.unmapped_agents:
-            if rows:
-                rows.append(("spacer", None))
-            for agent_name in self._model.unmapped_agents:
-                rows.append(("task", agent_name))
+        # Build unmapped agent rows.
+        unmapped_rows: list[_RowEntry] = []
+        for agent_name in self._model.unmapped_agents:
+            depth_map[agent_name] = 0
+            unmapped_rows.append(("task", agent_name))
+
+        # Compose layout based on current phase.
+        # M50 I1 cycle-4 rework (F1/F15/F25): route through
+        # :func:`is_execute_family` instead of an inline tuple.  The
+        # inline form is a drift surface — adding a new EXECUTE-family
+        # token (e.g. ``EXECUTE_AUGMENT`` in a later milestone) would
+        # silently mis-layout until someone updates every enumerated
+        # site.  The helper centralises the family definition.  Empty
+        # ``cycle_type`` returns False (helper's own contract), so the
+        # redundant non-empty guard is not needed here.
+        is_execute = is_execute_family(self.cycle_type)
+
+        if self.cycle_type:
+            rows.append(("phase_label", self.cycle_type))
+
+        if is_execute or not self.cycle_type:
+            # EXECUTE or unknown: DAG is the activity, unmapped is secondary.
+            rows.extend(dag_rows)
+            if unmapped_rows:
+                if dag_rows:
+                    rows.append(("spacer", None))
+                rows.extend(unmapped_rows)
+        else:
+            # PLAN/ASSESS/VERIFY: unmapped agents are the activity, DAG is context.
+            rows.extend(unmapped_rows)
+            if dag_rows:
+                if unmapped_rows:
+                    rows.append(("spacer", None))
+                rows.extend(dag_rows)
 
         self._row_map = rows
+        self._task_layer_depth = depth_map
 
     # -- rendering -----------------------------------------------------------
 
@@ -421,8 +478,8 @@ class TaskGraphWidget(Widget):
         if row_type == "spacer":
             return Strip([Segment(" " * width, Style())], width)
 
-        if row_type == "edge":
-            return self._render_edge(width, data)  # type: ignore[arg-type]
+        if row_type == "phase_label":
+            return self._render_phase_label(width, str(data))
 
         if row_type == "task":
             task_name = str(data)
@@ -445,78 +502,42 @@ class TaskGraphWidget(Widget):
         focused_name = self._focused_task_name()
         return focused_name == task_name
 
-    def _render_edge(self, width: int, layer_index: int) -> Strip:
-        """Render a dependency edge connector between layers.
+    def _render_phase_label(self, width: int, cycle_type: str) -> Strip:
+        """Render a cycle-type label (e.g. ``ASSESS``) in the dim cycle color."""
+        text = f"  {cycle_type}"
+        if len(text) < width:
+            text = text + " " * (width - len(text))
+        elif len(text) > width:
+            text = text[:width]
 
-        Draws box-drawing characters showing flow from the previous
-        layer into the next.  For fan-out (one parent layer → multiple
-        children) or fan-in (multiple parents → one child) uses
-        branching/merging glyphs.
-        """
-        if self._model is None or width <= 0:
-            return Strip([Segment(" " * max(width, 0), Style())], width)
-
-        layers = self._model.layers
-        deps = self._model.deps
-
-        # How many tasks in the previous and current layers?
-        prev_count = len(layers[layer_index - 1]) if layer_index > 0 else 0
-        curr_count = len(layers[layer_index]) if layer_index < len(layers) else 0
-
-        # Check if there are actual dependency edges crossing this gap.
-        curr_layer = layers[layer_index] if layer_index < len(layers) else []
-        prev_layer = layers[layer_index - 1] if layer_index > 0 else []
-        has_deps = any(
-            any(d in prev_layer for d in deps.get(t, []))
-            for t in curr_layer
-        )
-
-        r, g, b = luminance_to_rgb(_TEXT_MUTED_L)
-        style = Style(color=Color.from_rgb(r, g, b))
-
-        if not has_deps:
-            # No edges cross this gap — blank spacer.
-            return Strip([Segment(" " * width, style)], width)
-
-        # Build the connector line.
-        line = list(" " * width)
-        icon_col = 2  # The icon sits at column 2 ("  {icon}")
-
-        if prev_count == 1 and curr_count == 1:
-            # Simple linear: │
-            if icon_col < width:
-                line[icon_col] = "\u2502"  # │
-        elif prev_count == 1 and curr_count > 1:
-            # Fan-out: ├──┐  (one parent splits to multiple children)
-            if icon_col < width:
-                line[icon_col] = "\u251c"  # ├
-            end_col = min(icon_col + 4, width - 1)
-            for x in range(icon_col + 1, end_col):
-                line[x] = "\u2500"  # ─
-            if end_col < width:
-                line[end_col] = "\u2510"  # ┐
-        elif prev_count > 1 and curr_count == 1:
-            # Fan-in: └──┘  (multiple parents merge to one child)
-            if icon_col < width:
-                line[icon_col] = "\u2514"  # └
-            end_col = min(icon_col + 4, width - 1)
-            for x in range(icon_col + 1, end_col):
-                line[x] = "\u2500"  # ─
-            if end_col < width:
-                line[end_col] = "\u2518"  # ┘
+        token = _CYCLE_COLOR_MAP.get(cycle_type)
+        if token is not None:
+            col = PALETTE[token].dim()
+            r, g, b = _oklch_to_rgb(col)
         else:
-            # Many-to-many: just │
-            if icon_col < width:
-                line[icon_col] = "\u2502"  # │
+            r, g, b = luminance_to_rgb(_TEXT_MUTED_L)
 
-        text = "".join(line)
+        style = Style(color=Color.from_rgb(r, g, b))
         segments = [Segment(ch, style) for ch in text]
         return Strip(segments, width)
+
+    @staticmethod
+    def _clean_display_name(task_name: str) -> str:
+        """Strip agent hash suffixes from display names.
+
+        ``"Brutalist quality gate:a120b4a37b227f381"`` → ``"Brutalist quality gate"``
+        """
+        return _HASH_SUFFIX_RE.sub("", task_name)
 
     def _render_task(
         self, width: int, task_name: str, *, focus_boost: bool = False
     ) -> Strip:
-        """Render a single task row with icon, name, tool count, last tool."""
+        """Render a single task row: indent + icon + name.
+
+        Indentation encodes layer depth (2 chars per layer beyond base).
+        Pending tasks have no icon and use dimmer luminance.
+        Tool counts and last-tool are only visible in expansion.
+        """
         if self._model is None:
             return Strip([Segment(" " * width, Style())], width)
 
@@ -527,30 +548,31 @@ class TaskGraphWidget(Widget):
             return Strip([Segment(" " * width, Style())], width)
 
         status = state.status
-        icon = STATUS_ICONS.get(status, "\u25cb")
+        is_pending = status == "pending"
         is_active = status == "active"
+        icon = STATUS_ICONS.get(status, "")
+
+        # Clean the display name (strip hashes).
+        clean_name = self._clean_display_name(task_name)
+
+        # Compute indentation from layer depth.
+        layer_depth = self._task_layer_depth.get(task_name, 0)
+        indent = _BASE_INDENT + layer_depth * _LAYER_INDENT
 
         # Build the text columns.
-        # Icon column: "  {icon}" (2-space indent + icon = 3 chars).
-        icon_text = f"  {icon}"
+        if is_pending:
+            # Pending: no icon, just indent + space.
+            icon_text = " " * (indent + 1)
+        else:
+            # Active/complete/failed: indent spaces + icon.
+            icon_text = " " * indent + icon
 
-        # Task name: space + left-aligned, truncated at TASK_NAME_MAX.
-        display_name = task_name[:TASK_NAME_MAX].ljust(TASK_NAME_MAX)
+        # Task name: space + truncated.
+        display_name = clean_name[:TASK_NAME_MAX]
         name_text = f" {display_name}"
 
-        # Tool count: " [nn tools]" or blank.
-        if state.tool_count > 0:
-            tc_str = f" [{state.tool_count:>2} tools]"
-        else:
-            tc_str = " " * TOOL_COUNT_WIDTH
-
-        # Last tool: remaining space, truncated, dim.
-        last_tool_text = ""
-        if state.last_tool:
-            last_tool_text = f"  {state.last_tool}"
-
         # Compose full line.
-        line = icon_text + name_text + tc_str + last_tool_text
+        line = icon_text + name_text
         if len(line) < width:
             line = line + " " * (width - len(line))
         elif len(line) > width:
@@ -559,47 +581,60 @@ class TaskGraphWidget(Widget):
         # Luminance boost for focus.
         boost = _FOCUS_BOOST if focus_boost else 0.0
 
-        # Compute icon RGB.
-        if is_active:
-            # Active icon: breathe via breath_modulate.
-            base_col = PALETTE["accent-gold"]
-            modulated_l = breath_modulate(base_col.l, self.breath_phase)
-            boosted_l = min(1.0, modulated_l + boost)
-            breathing_col = OklchColor(boosted_l, base_col.c, base_col.h)
-            icon_rgb = _oklch_to_rgb(breathing_col)
-        elif focus_boost:
-            # Non-active but focused: boost the icon color luminance.
-            token = _STATUS_PALETTE.get(status, "text-muted")
-            base_col = PALETTE[token]
-            boosted_l = min(1.0, base_col.l + boost)
-            boosted_col = OklchColor(boosted_l, base_col.c, base_col.h)
-            icon_rgb = _oklch_to_rgb(boosted_col)
-        else:
-            icon_rgb = _status_icon_rgb(status)
+        # Compute icon RGB (only for non-pending).
+        icon_rgb: tuple[int, int, int] = (0, 0, 0)
+        if not is_pending:
+            if is_active:
+                base_col = PALETTE["accent-gold"]
+                modulated_l = breath_modulate(base_col.l, self.breath_phase)
+                boosted_l = min(1.0, modulated_l + boost)
+                breathing_col = OklchColor(boosted_l, base_col.c, base_col.h)
+                icon_rgb = _oklch_to_rgb(breathing_col)
+            elif focus_boost:
+                token = _STATUS_PALETTE.get(status, "text-muted")
+                base_col = PALETTE[token]
+                boosted_l = min(1.0, base_col.l + boost)
+                boosted_col = OklchColor(boosted_l, base_col.c, base_col.h)
+                icon_rgb = _oklch_to_rgb(boosted_col)
+            else:
+                icon_rgb = _status_icon_rgb(status)
 
         t = self._frame_time
         segments: list[Segment] = []
 
         # Column boundaries.
-        icon_end = len(icon_text)              # end of icon column
-        name_end = icon_end + len(name_text)   # end of name column
+        icon_end = len(icon_text)
+
+        # Secondary context: DAG tasks dim during non-EXECUTE phases.
+        # M50 I1 cycle-4 rework (F1/F15/F25): both this site and the
+        # layout switch at the composition step route through
+        # :func:`is_execute_family` (module-scope import at the top
+        # of the file).  EXECUTE, EXECUTE_REWORK, EXECUTE_VERIFY all
+        # render with DAG-primary treatment — rework/verify cycles
+        # are EXECUTE-phase dispatches with different telemetry
+        # discriminators, not different UI surfaces.
+        is_dag_task = task_name in self._model.task_states
+        is_secondary = (
+            bool(self.cycle_type)
+            and not is_execute_family(self.cycle_type)
+            and is_dag_task
+        )
+
+        # Base luminance: pending and secondary context are dimmer.
+        if is_pending or is_secondary:
+            base_name_l = _TEXT_PENDING_L
+        else:
+            base_name_l = _TEXT_DIM_L
 
         for x in range(width):
             char = line[x]
 
-            if x < icon_end:
-                # Icon column: status color.
+            if x < icon_end and not is_pending:
+                # Icon column: status color (icon is at icon_end - 1).
                 r, g, b = icon_rgb
-            elif x < name_end:
-                # Task name: text-dim luminance, with shimmer if active.
-                l_val = _TEXT_DIM_L + boost
-                if is_active and self.shimmer_active:
-                    l_val += compute_shimmer(x, t)
-                l_val = max(0.0, min(1.0, l_val))
-                r, g, b = luminance_to_rgb(l_val)
             else:
-                # Tool count + last tool: text-muted luminance.
-                l_val = _TEXT_MUTED_L + boost
+                # Name (or everything for pending): dim/pending luminance.
+                l_val = base_name_l + boost
                 if is_active and self.shimmer_active:
                     l_val += compute_shimmer(x, t)
                 l_val = max(0.0, min(1.0, l_val))
@@ -639,7 +674,10 @@ class TaskGraphWidget(Widget):
         is_active = state.status == "active"
         dot = "\u25cf " if is_active else "  "
         category_text = " \u00b7 ".join(parts)
-        text = f"    {dot}{category_text}"
+        # Indent to match parent task + 2 extra chars for drill-down nesting.
+        layer_depth = self._task_layer_depth.get(task_name, 0)
+        drill_indent = _BASE_INDENT + layer_depth * _LAYER_INDENT + 2
+        text = f"{' ' * drill_indent}{dot}{category_text}"
         if len(text) < width:
             text = text + " " * (width - len(text))
         elif len(text) > width:
@@ -654,10 +692,11 @@ class TaskGraphWidget(Widget):
         base_style = Style(color=Color.from_rgb(r_base, g_base, b_base))
 
         # Per-character rendering with breathing dot coloring.
+        dot_col = drill_indent  # Position of the breathing dot.
         segments: list[Segment] = []
         for x in range(len(text)):
             char = text[x]
-            if is_active and x == 4 and char == "\u25cf":
+            if is_active and x == dot_col and char == "\u25cf":
                 # Breathing dot: accent-gold with breath_modulate.
                 base_col = PALETTE["accent-gold"]
                 modulated_l = breath_modulate(base_col.l, self.breath_phase)
@@ -683,7 +722,10 @@ class TaskGraphWidget(Widget):
         if state is None or not state.summary:
             return Strip([Segment(" " * width, Style())], width)
 
-        text = f"    \u21b3 {state.summary}"
+        # Indent to match parent task + 2 extra chars for drill-down nesting.
+        layer_depth = self._task_layer_depth.get(task_name, 0)
+        drill_indent = _BASE_INDENT + layer_depth * _LAYER_INDENT + 2
+        text = f"{' ' * drill_indent}\u21b3 {state.summary}"
         if len(text) < width:
             text = text + " " * (width - len(text))
         elif len(text) > width:

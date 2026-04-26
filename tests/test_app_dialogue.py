@@ -10,8 +10,6 @@ from clou.ui.app import ClouApp
 from clou.ui.messages import (
     ClouAskUser,
     ClouCoordinatorSpawned,
-    ClouEscalationArrived,
-    ClouEscalationResolved,
     ClouHandoff,
     ClouMetrics,
     ClouProcessingStarted,
@@ -127,15 +125,9 @@ class TestInputSubmission:
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
 
-            # Trigger DECISION mode via escalation.
-            app.post_message(
-                ClouEscalationArrived(
-                    path=Path("/tmp/test.md"),
-                    classification="info",
-                    issue="test",
-                    options=[{"label": "Ok", "description": "ok"}],
-                )
-            )
+            # Drive DECISION mode directly — escalation arrival no longer
+            # triggers a user-modal (see project_escalations_are_agent_to_agent.md).
+            assert app.transition_mode(Mode.DECISION)
             await pilot.pause()
             assert app.mode == Mode.DECISION
 
@@ -145,7 +137,7 @@ class TestInputSubmission:
             await inp.action_submit()
             await pilot.pause()
 
-            # Mode should stay DECISION — input doesn't dismiss escalation.
+            # Mode should stay DECISION — input doesn't dismiss the decision card.
             assert app.mode == Mode.DECISION
 
             # Message is queued, not yet displayed.
@@ -528,15 +520,9 @@ class TestWorkerCrashRecovery:
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
 
-            # Drive the app into DECISION via a pending escalation.
-            app.post_message(
-                ClouEscalationArrived(
-                    path=Path("/tmp/test.md"),
-                    classification="info",
-                    issue="test",
-                    options=[{"label": "Ok", "description": "ok"}],
-                )
-            )
+            # Drive the app into DECISION directly. Escalation arrival no
+            # longer surfaces a user-modal (I4, 41-escalation-remolding).
+            assert app.transition_mode(Mode.DECISION)
             await pilot.pause()
             assert app.mode == Mode.DECISION
 
@@ -557,7 +543,6 @@ class TestWorkerCrashRecovery:
             await pilot.pause()
 
             assert app.mode == Mode.DIALOGUE
-            assert len(app._escalation_queue) == 0
 
     @pytest.mark.asyncio
     async def test_worker_error_widget_not_mounted(
@@ -594,37 +579,34 @@ class TestWorkerCrashRecovery:
 
 
 class TestDecisionModeReturn:
-    """After DECISION resolves, mode should return to the pre-decision mode."""
+    """DECISION transition machinery still tracks pre-decision mode.
+
+    The escalation-arrival pathway that used to drive DECISION was
+    retired (I4, 41-escalation-remolding); these tests now exercise
+    the transition machinery itself so future decision-card callers
+    (e.g. brutalist findings) keep the pre-decision-mode memory.
+    """
 
     @pytest.mark.asyncio
-    async def test_dialogue_to_decision_returns_to_dialogue(self) -> None:
-        """DIALOGUE -> DECISION -> resolved should return to DIALOGUE."""
+    async def test_dialogue_to_decision_preserves_pre_decision_mode(self) -> None:
+        """DIALOGUE -> DECISION records DIALOGUE as the pre-decision mode."""
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
             assert app.mode == Mode.DIALOGUE
 
-            # Simulate escalation arriving while in DIALOGUE.
-            app.post_message(
-                ClouEscalationArrived(
-                    path=Path("/tmp/test.md"),
-                    classification="info",
-                    issue="test",
-                    options=[{"label": "Ok", "description": "ok"}],
-                )
-            )
+            assert app.transition_mode(Mode.DECISION)
             await pilot.pause()
             assert app.mode == Mode.DECISION
+            assert app._pre_decision_mode == Mode.DIALOGUE
 
-            # Resolve the escalation.
-            app.post_message(
-                ClouEscalationResolved(path=Path("/tmp/test.md"), disposition="Ok")
-            )
+            # Transition back — machinery is intact.
+            assert app.transition_mode(Mode.DIALOGUE)
             await pilot.pause()
             assert app.mode == Mode.DIALOGUE
 
     @pytest.mark.asyncio
-    async def test_breath_to_decision_returns_to_breath(self) -> None:
-        """BREATH -> DECISION -> resolved should return to BREATH."""
+    async def test_breath_to_decision_preserves_pre_decision_mode(self) -> None:
+        """BREATH -> DECISION records BREATH as the pre-decision mode."""
         async with ClouApp().run_test() as pilot:
             app: ClouApp = pilot.app  # type: ignore[assignment]
 
@@ -633,22 +615,13 @@ class TestDecisionModeReturn:
             await pilot.pause()
             assert app.mode == Mode.BREATH
 
-            # Simulate escalation arriving while in BREATH.
-            app.post_message(
-                ClouEscalationArrived(
-                    path=Path("/tmp/test.md"),
-                    classification="info",
-                    issue="test",
-                    options=[{"label": "Ok", "description": "ok"}],
-                )
-            )
+            assert app.transition_mode(Mode.DECISION)
             await pilot.pause()
             assert app.mode == Mode.DECISION
+            assert app._pre_decision_mode == Mode.BREATH
 
-            # Resolve the escalation.
-            app.post_message(
-                ClouEscalationResolved(path=Path("/tmp/test.md"), disposition="Ok")
-            )
+            # Transition back — machinery is intact.
+            assert app.transition_mode(Mode.BREATH)
             await pilot.pause()
             assert app.mode == Mode.BREATH
 
@@ -673,22 +646,14 @@ class TestDecisionToBreathPhaseAlignment:
             await pilot.pause()
             assert app.mode == Mode.BREATH
 
-            # Escalation arrives — enters DECISION.
-            app.post_message(
-                ClouEscalationArrived(
-                    path=Path("/tmp/test.md"),
-                    classification="info",
-                    issue="test",
-                    options=[{"label": "Ok", "description": "ok"}],
-                )
-            )
+            # Transition to DECISION — escalation-arrival no longer does this
+            # automatically (I4), so drive it via the transition API directly.
+            assert app.transition_mode(Mode.DECISION)
             await pilot.pause()
             assert app.mode == Mode.DECISION
 
-            # Resolve — returns to BREATH.
-            app.post_message(
-                ClouEscalationResolved(path=Path("/tmp/test.md"), disposition="Ok")
-            )
+            # Return to BREATH.
+            assert app.transition_mode(Mode.BREATH)
             await pilot.pause()
             assert app.mode == Mode.BREATH
             # Stop the timer so ticks don't drift the value further.

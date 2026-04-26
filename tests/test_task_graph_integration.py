@@ -74,21 +74,12 @@ class TestTaskGraphVisibility:
     async def test_task_graph_dimmed_in_decision(self) -> None:
         """Widget visible but dimmed in decision mode."""
         async with ClouApp().run_test() as pilot:
-            from pathlib import Path
-
-            from clou.ui.messages import ClouEscalationArrived
-
             pilot.app.post_message(ClouCoordinatorSpawned(milestone="test"))
             await pilot.pause()
             await pilot.pause()
-            pilot.app.post_message(
-                ClouEscalationArrived(
-                    path=Path("/tmp/test.md"),
-                    classification="blocking",
-                    issue="Test issue",
-                    options=[{"label": "Fix", "description": "Fix it"}],
-                )
-            )
+            # Drive DECISION via the transition API — escalation arrival no
+            # longer auto-pushes a modal (I4, 41-escalation-remolding).
+            assert pilot.app.transition_mode(Mode.DECISION)
             await pilot.pause()
             await pilot.pause()
             assert pilot.app.mode is Mode.DECISION

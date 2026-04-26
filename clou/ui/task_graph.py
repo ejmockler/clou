@@ -73,6 +73,7 @@ class TaskState:
     last_tool: str | None = None
     summary: str | None = None
     tool_invocations: list[ToolInvocation] = field(default_factory=list)
+    spawn_cycle: str = ""  # cycle_type when agent spawned (PLAN/EXECUTE/ASSESS/VERIFY)
 
     @property
     def tool_calls(self) -> list[tuple[str, str]]:

@@ -7,7 +7,6 @@ types.  Uses duck-typing throughout so SDK classes need not be imported
 Public API:
     extract_coordinator_status(msg_content, cycle_type) -> str | None
     extract_stream_text(event)                          -> str | None
-    parse_escalation(path)                              -> dict
     route_supervisor_message(msg, post)                 -> None
     route_coordinator_message(msg, milestone, cycle_type, post) -> None
 """
@@ -107,18 +106,6 @@ def _strip_ansi(text: str | None) -> str:
     if '\x1b' in result:
         result = result.replace('\x1b', '')
     return result
-
-
-# Re-usable pattern for numbered list items in escalation Options section.
-_OPTION_RE = re.compile(
-    r"^\s*(\d+)\.\s*\*\*(.+?)\*\*[:\s]*(.*)$",
-    re.MULTILINE,
-)
-# Plain numbered list (system-generated escalations without bold markup).
-_OPTION_PLAIN_RE = re.compile(
-    r"^\s*(\d+)\.\s+(.+)$",
-    re.MULTILINE,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -257,75 +244,6 @@ def extract_stream_text(event: dict[str, Any]) -> str | None:
     if isinstance(text, str):
         return text
     return None
-
-
-# ---------------------------------------------------------------------------
-# Escalation parsing
-# ---------------------------------------------------------------------------
-
-
-def parse_escalation(path: Path) -> dict[str, Any]:
-    """Parse an escalation markdown file into structured data.
-
-    Expected sections: ``## Classification``, ``## Issue``,
-    ``## Options``, ``## Recommendation``.
-    """
-    raw = path.read_text(encoding="utf-8")
-    sections: dict[str, str] = {}
-    current_key: str | None = None
-    current_lines: list[str] = []
-    preamble_lines: list[str] = []
-
-    for line in raw.splitlines():
-        if line.startswith("## "):
-            if current_key is not None:
-                sections[current_key] = "\n".join(current_lines).strip()
-            current_key = line[3:].strip().lower()
-            current_lines = []
-        elif current_key is None:
-            preamble_lines.append(line)
-        else:
-            current_lines.append(line)
-
-    if current_key is not None:
-        sections[current_key] = "\n".join(current_lines).strip()
-
-    # System-generated escalations use **Key:** value in the preamble
-    # instead of ## Key sections.  Extract them as fallbacks.
-    _BOLD_KV = re.compile(r"^\*\*(.+?)\*\*[:\s]*(.*)$")
-    for line in preamble_lines:
-        m = _BOLD_KV.match(line.strip())
-        if m:
-            key = m.group(1).strip().rstrip(":").lower()
-            if key not in sections:
-                sections[key] = m.group(2).strip()
-
-    options: list[dict[str, str]] = []
-    options_text = sections.get("options", "")
-    bold_matches = list(_OPTION_RE.finditer(options_text))
-    if bold_matches:
-        for match in bold_matches:
-            options.append(
-                {
-                    "label": match.group(2).strip(),
-                    "description": match.group(3).strip(),
-                }
-            )
-    else:
-        for match in _OPTION_PLAIN_RE.finditer(options_text):
-            options.append(
-                {
-                    "label": match.group(2).strip(),
-                    "description": "",
-                }
-            )
-
-    return {
-        "classification": sections.get("classification", ""),
-        "issue": sections.get("issue", "") or sections.get("problem", ""),
-        "options": options,
-        "recommendation": sections.get("recommendation", ""),
-    }
 
 
 # ---------------------------------------------------------------------------

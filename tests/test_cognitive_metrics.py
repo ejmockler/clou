@@ -402,12 +402,14 @@ class TestCompositionEventPreference:
 
 
 class TestExistingMetricsForAssess:
-    """Verify read_set.composition and read_set.reference_density
-    are operational for ASSESS cycles (not just EXECUTE).
+    """Verify read_set.composition is operational for ASSESS cycles
+    (not just EXECUTE).
 
-    These events are emitted unconditionally on all cycle types
-    in coordinator.py. We verify the emission is not gated by
-    cycle type.
+    read_set.composition is emitted unconditionally on all cycle
+    types in coordinator.py. (The prior read_set.reference_density
+    metric was deleted as a broken proxy — it measured literal
+    filename substring matches in output text, which rarely reflects
+    actual content use.)
     """
 
     def test_read_set_composition_emits_for_assess(self, tmp_path: Path) -> None:
@@ -435,34 +437,5 @@ class TestExistingMetricsForAssess:
             assert len(comp_events) == 1
             assert comp_events[0]["cycle_type"] == "ASSESS"
             assert comp_events[0]["file_count"] == 4
-        finally:
-            telemetry._log = old
-
-    def test_read_set_reference_density_emits_for_assess(self, tmp_path: Path) -> None:
-        """read_set.reference_density is emitted for all cycle types
-        including ASSESS."""
-        old = telemetry._log
-        try:
-            log = init("test-refdens-assess", tmp_path)
-
-            # Simulate the emission from coordinator.py.
-            event(
-                "read_set.reference_density",
-                milestone="m1",
-                cycle_num=3,
-                referenced_count=3,
-                total_count=4,
-                density=0.75,
-                unreferenced=["assessment.md"],
-            )
-
-            records = read_log(log.path)
-            rd_events = [
-                r for r in records
-                if r.get("event") == "read_set.reference_density"
-            ]
-            assert len(rd_events) == 1
-            assert rd_events[0]["density"] == 0.75
-            assert rd_events[0]["total_count"] == 4
         finally:
             telemetry._log = old

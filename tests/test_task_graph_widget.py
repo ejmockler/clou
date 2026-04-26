@@ -131,17 +131,13 @@ class TestTaskRowWidth:
                 return
         raise AssertionError("No task row found")
 
-    def test_edge_matches_width(self) -> None:
+    def test_all_rows_match_width(self) -> None:
         w = _make_sized_widget(80)
         model = _make_model()
         w.update_model(model)
         for y in range(len(w._row_map)):
-            row_type, _ = w._row_map[y]
-            if row_type == "edge":
-                strip = w.render_line(y)
-                assert strip.cell_length == 80
-                return
-        raise AssertionError("No edge row found")
+            strip = w.render_line(y)
+            assert strip.cell_length == 80
 
 
 # ---------------------------------------------------------------------------
@@ -149,33 +145,30 @@ class TestTaskRowWidth:
 # ---------------------------------------------------------------------------
 
 
-class TestPendingIconColor:
-    """Pending task icon uses text-muted palette token."""
+class TestPendingRendering:
+    """Pending tasks render as dim text with no icon."""
 
-    def test_pending_icon_is_circle(self) -> None:
+    def test_pending_has_no_icon(self) -> None:
         w = _make_sized_widget(80)
         model = _make_model()
         w.update_model(model)
-        # All tasks start as pending.
+        # All tasks start as pending -- no status icon should appear.
         for y in range(len(w._row_map)):
             row_type, _data = w._row_map[y]
             if row_type == "task":
                 strip = w.render_line(y)
                 text = _strip_text(strip)
-                assert "\u25cb" in text  # ○
+                # No circle, no checkmark, no cross.
+                assert "\u25cb" not in text  # ○
+                assert "\u25c9" not in text  # ◉
+                assert "\u2713" not in text  # ✓
+                assert "\u2717" not in text  # ✗
                 break
 
-    def test_pending_icon_rgb_matches_palette(self) -> None:
-        """The pending icon RGB must match PALETTE['text-muted']."""
-        expected_rgb = _status_icon_rgb("pending")
-        palette_hex = PALETTE["text-muted"].to_hex()
-        er = int(palette_hex[1:3], 16)
-        eg = int(palette_hex[3:5], 16)
-        eb = int(palette_hex[5:7], 16)
-        assert expected_rgb == (er, eg, eb)
+    def test_pending_uses_dim_luminance(self) -> None:
+        """Pending task text uses _TEXT_PENDING_L luminance."""
+        from clou.ui.widgets.task_graph import _TEXT_PENDING_L
 
-    def test_pending_icon_segment_color(self) -> None:
-        """The actual rendered segment for the icon uses text-muted."""
         w = _make_sized_widget(80)
         model = _make_model()
         w.update_model(model)
@@ -184,18 +177,15 @@ class TestPendingIconColor:
             row_type, _data = w._row_map[y]
             if row_type == "task":
                 strip = w.render_line(y)
-                # Icon is at index 2 (after 2-space indent).
-                segs = strip._segments
-                icon_seg = segs[2]
-                assert icon_seg.text == "\u25cb"
-                # Check color matches text-muted.
-                r, g, b = _status_icon_rgb("pending")
-                expected_style_str = str(
-                    icon_seg.style
-                )
-                assert f"#{r:02x}{g:02x}{b:02x}" in expected_style_str.lower() or (
-                    # Rich might format rgb differently
-                    f"rgb({r},{g},{b})" in expected_style_str.replace(" ", "")
+                # Name region char at index 3 (after 3-space indent).
+                seg = strip._segments[3]
+                expected_rgb = luminance_to_rgb(_TEXT_PENDING_L)
+                er, eg, eb = expected_rgb
+                expected_hex = f"#{er:02x}{eg:02x}{eb:02x}"
+                actual_style = str(seg.style).lower()
+                assert expected_hex in actual_style or (
+                    f"rgb({er},{eg},{eb})"
+                    in actual_style.replace(" ", "")
                 )
                 return
         raise AssertionError("No pending task row found")
@@ -403,29 +393,27 @@ class TestShimmerOnActiveRow:
 
 
 # ---------------------------------------------------------------------------
-# test_phase_grouping
+# test_layer_indentation
 # ---------------------------------------------------------------------------
 
 
-class TestEdgeConnectors:
-    """Tasks connected by dependency edge lines instead of phase headers."""
+class TestLayerIndentation:
+    """Layers distinguished by indentation depth."""
 
-    def test_three_layer_model(self) -> None:
+    def test_three_layer_model_no_spacers(self) -> None:
+        """Three-layer chain has no spacers between layers."""
         model = _make_model()
-        # build_model (layer 0) → build_widget (layer 1) → integrate (layer 2)
         assert len(model.layers) == 3
 
         w = _make_sized_widget(80)
         w.update_model(model)
 
         row_types = [rt for rt, _ in w._row_map]
-        # task, edge, task, edge, task
-        assert row_types.count("edge") == 2
+        assert row_types.count("spacer") == 0
         assert row_types.count("task") == 3
-        assert row_types.count("header") == 0
 
     def test_single_layer_model(self) -> None:
-        """All independent tasks in one layer -- no edges."""
+        """All independent tasks in one layer -- no spacers."""
         model = TaskGraphModel(
             tasks=[{"name": "a"}, {"name": "b"}, {"name": "c"}],
             deps={"a": [], "b": [], "c": []},
@@ -436,26 +424,51 @@ class TestEdgeConnectors:
         w.update_model(model)
 
         row_types = [rt for rt, _ in w._row_map]
-        assert row_types.count("edge") == 0
+        assert row_types.count("spacer") == 0
         assert row_types.count("task") == 3
 
-    def test_edge_contains_box_drawing(self) -> None:
-        """Edge rows render box-drawing connector characters."""
+    def test_layer_depth_increases_indent(self) -> None:
+        """Deeper layers produce more leading whitespace."""
         w = _make_sized_widget(80)
         model = _make_model()
         w.update_model(model)
+
+        texts: dict[str, str] = {}
         for y in range(len(w._row_map)):
-            row_type, data = w._row_map[y]
-            if row_type == "edge":
+            rt, data = w._row_map[y]
+            if rt == "task":
                 strip = w.render_line(y)
-                text = _strip_text(strip)
-                # Should contain a box-drawing character, not "Phase".
-                assert "Phase" not in text
-                assert any(
-                    ch in text for ch in "\u2502\u251c\u2514\u2500"
-                ), f"No box-drawing char in edge: {text!r}"
-                return
-        raise AssertionError("No edge row found")
+                texts[str(data)] = _strip_text(strip)
+
+        indent_0 = len(texts["build_model"]) - len(texts["build_model"].lstrip())
+        indent_1 = len(texts["build_widget"]) - len(texts["build_widget"].lstrip())
+        indent_2 = len(texts["integrate"]) - len(texts["integrate"].lstrip())
+        assert indent_1 > indent_0
+        assert indent_2 > indent_1
+
+    def test_parallel_tasks_same_indent(self) -> None:
+        """Tasks in the same layer share the same indentation."""
+        model = TaskGraphModel(
+            tasks=[{"name": "a"}, {"name": "b"}, {"name": "c"}, {"name": "d"}],
+            deps={"a": [], "b": [], "c": ["a", "b"], "d": ["a", "b"]},
+        )
+        w = _make_sized_widget(80)
+        w.update_model(model)
+
+        texts: dict[str, str] = {}
+        for y in range(len(w._row_map)):
+            rt, data = w._row_map[y]
+            if rt == "task":
+                strip = w.render_line(y)
+                texts[str(data)] = _strip_text(strip)
+
+        indent_a = len(texts["a"]) - len(texts["a"].lstrip())
+        indent_b = len(texts["b"]) - len(texts["b"].lstrip())
+        indent_c = len(texts["c"]) - len(texts["c"].lstrip())
+        indent_d = len(texts["d"]) - len(texts["d"].lstrip())
+        assert indent_a == indent_b  # same layer
+        assert indent_c == indent_d  # same layer
+        assert indent_c > indent_a   # deeper layer
 
     def test_tasks_preserve_layer_order(self) -> None:
         """Tasks appear in dependency-layer order."""
@@ -505,24 +518,24 @@ class TestNoAdhocHex:
     def test_rendered_segments_use_palette_derived_colors(self) -> None:
         """Spot-check that rendered task row segments use palette-derived RGB.
 
-        For non-active tasks, name characters should use luminance_to_rgb
-        with _TEXT_DIM_L, and tool-count characters should use _TEXT_MUTED_L.
+        Pending tasks use _TEXT_PENDING_L.  Active tasks use _TEXT_DIM_L.
         """
+        from clou.ui.widgets.task_graph import _TEXT_PENDING_L
+
         w = _make_sized_widget(80)
         model = _make_model()
-        model.update_progress("build_model", 5, "Read")
         w.update_model(model)
 
-        # Find the build_model task row.
+        # Find the build_model task row (pending).
         for y in range(len(w._row_map)):
             row_type, data = w._row_map[y]
             if row_type == "task" and data == "build_model":
                 strip = w.render_line(y)
                 segs = strip._segments
 
-                # Name region character (index 4, first char of name).
-                name_seg = segs[4]
-                expected_rgb = luminance_to_rgb(0.60)
+                # Name region character (index 3, first name char after indent).
+                name_seg = segs[3]
+                expected_rgb = luminance_to_rgb(_TEXT_PENDING_L)
                 er, eg, eb = expected_rgb
                 expected_style = f"#{er:02x}{eg:02x}{eb:02x}"
                 actual_style = str(name_seg.style).lower()
@@ -539,6 +552,30 @@ class TestNoAdhocHex:
 # ---------------------------------------------------------------------------
 
 
+class TestHashStripping:
+    """Agent hash suffixes stripped from display names."""
+
+    def test_strips_hex_hash(self) -> None:
+        assert TaskGraphWidget._clean_display_name(
+            "Brutalist quality gate:a120b4a37b227f381"
+        ) == "Brutalist quality gate"
+
+    def test_strips_short_hash(self) -> None:
+        assert TaskGraphWidget._clean_display_name(
+            "Classify findings:a77fecd37b2"
+        ) == "Classify findings"
+
+    def test_preserves_non_hash(self) -> None:
+        assert TaskGraphWidget._clean_display_name(
+            "create_metrics_module"
+        ) == "create_metrics_module"
+
+    def test_preserves_colon_without_hex(self) -> None:
+        assert TaskGraphWidget._clean_display_name(
+            "task:setup_database"
+        ) == "task:setup_database"
+
+
 class TestWidgetEdgeCases:
     """Edge cases for widget rendering."""
 
@@ -547,8 +584,8 @@ class TestWidgetEdgeCases:
         strip = w.render_line(0)
         assert strip.cell_length == 0
 
-    def test_tool_count_displayed(self) -> None:
-        """Tool count is shown when > 0."""
+    def test_tool_count_not_in_default_row(self) -> None:
+        """Tool count is hidden in the default task row (shown on expansion)."""
         w = _make_sized_widget(80)
         model = _make_model()
         model.update_progress("build_model", 7, "Read")
@@ -558,12 +595,12 @@ class TestWidgetEdgeCases:
             if row_type == "task" and data == "build_model":
                 strip = w.render_line(y)
                 text = _strip_text(strip)
-                assert "7 tools" in text
+                assert "7 tools" not in text
                 return
         raise AssertionError("No build_model task row found")
 
-    def test_last_tool_displayed(self) -> None:
-        """Last tool name appears in the row."""
+    def test_last_tool_not_in_default_row(self) -> None:
+        """Last tool name is hidden in the default task row."""
         w = _make_sized_widget(80)
         model = _make_model()
         model.update_progress("build_model", 3, "Grep")
@@ -573,7 +610,7 @@ class TestWidgetEdgeCases:
             if row_type == "task" and data == "build_model":
                 strip = w.render_line(y)
                 text = _strip_text(strip)
-                assert "Grep" in text
+                assert "Grep" not in text
                 return
         raise AssertionError("No build_model task row found")
 
@@ -608,3 +645,95 @@ class TestWidgetEdgeCases:
                 assert "a" * 40 in text
                 return
         raise AssertionError("No task row found")
+
+
+# ---------------------------------------------------------------------------
+# test_phase_aware_layout
+# ---------------------------------------------------------------------------
+
+
+class TestPhaseAwareLayout:
+    """Phase label and ordering change with cycle_type."""
+
+    def test_no_phase_label_without_cycle_type(self) -> None:
+        """No phase_label row when cycle_type is empty."""
+        w = _make_sized_widget()
+        model = _make_model()
+        w.update_model(model)
+        assert not any(rt == "phase_label" for rt, _ in w._row_map)
+
+    def test_phase_label_present_with_cycle_type(self) -> None:
+        """Phase label row appears when cycle_type is set."""
+        w = _make_sized_widget()
+        model = _make_model()
+        w.update_model(model)
+        w.cycle_type = "EXECUTE"
+        assert w._row_map[0] == ("phase_label", "EXECUTE")
+
+    def test_phase_label_renders_cycle_name(self) -> None:
+        """Phase label row contains the cycle type text."""
+        w = _make_sized_widget(80)
+        model = _make_model()
+        w.update_model(model)
+        w.cycle_type = "ASSESS"
+        strip = w.render_line(0)
+        text = _strip_text(strip)
+        assert "ASSESS" in text
+
+    def test_execute_dag_first(self) -> None:
+        """During EXECUTE, DAG tasks come before unmapped agents."""
+        w = _make_sized_widget()
+        model = _make_model()
+        from clou.ui.task_graph import TaskState
+
+        model.unmapped_agents["assessment:x"] = TaskState(status="active")
+        w.update_model(model)
+        w.cycle_type = "EXECUTE"
+        task_entries = [(rt, d) for rt, d in w._row_map if rt == "task"]
+        assert task_entries[0] == ("task", "build_model")
+
+    def test_assess_unmapped_first(self) -> None:
+        """During ASSESS, unmapped agents come before DAG tasks."""
+        w = _make_sized_widget()
+        model = _make_model()
+        from clou.ui.task_graph import TaskState
+
+        model.unmapped_agents["Classify:x"] = TaskState(status="active")
+        w.update_model(model)
+        w.cycle_type = "ASSESS"
+        task_entries = [(rt, d) for rt, d in w._row_map if rt == "task"]
+        assert task_entries[0] == ("task", "Classify:x")
+
+    def test_dag_dim_during_assess(self) -> None:
+        """DAG tasks use pending luminance when in ASSESS phase."""
+        from clou.ui.widgets.task_graph import _TEXT_PENDING_L
+
+        w = _make_sized_widget(80)
+        model = _make_model()
+        model.activate_task("build_model", "agent-1")
+        model.complete_task("build_model", "complete", "done")
+        from clou.ui.task_graph import TaskState
+
+        model.unmapped_agents["gate:x"] = TaskState(status="active")
+        w.update_model(model)
+        w.cycle_type = "ASSESS"
+
+        # Find build_model (a DAG task, now secondary).
+        for y in range(len(w._row_map)):
+            rt, data = w._row_map[y]
+            if rt == "task" and data == "build_model":
+                strip = w.render_line(y)
+                # Name char after icon column should use _TEXT_PENDING_L.
+                segs = strip._segments
+                # Find first non-space content char.
+                for seg in segs[3:10]:
+                    if seg.text.strip():
+                        expected_rgb = luminance_to_rgb(_TEXT_PENDING_L)
+                        er, eg, eb = expected_rgb
+                        expected_hex = f"#{er:02x}{eg:02x}{eb:02x}"
+                        actual = str(seg.style).lower()
+                        assert expected_hex in actual, (
+                            f"Expected {expected_hex} in {actual}"
+                        )
+                        return
+        raise AssertionError("No build_model task row found")

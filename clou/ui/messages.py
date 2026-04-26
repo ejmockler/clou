@@ -250,37 +250,6 @@ class ClouCoordinatorComplete(Message):
 
 
 # ---------------------------------------------------------------------------
-# Escalation messages
-# ---------------------------------------------------------------------------
-
-
-class ClouEscalationArrived(Message):
-    """Escalation requires user decision."""
-
-    def __init__(
-        self,
-        path: Path,
-        classification: str,
-        issue: str,
-        options: list[dict[str, object]],
-    ) -> None:
-        self.path = path
-        self.classification = classification
-        self.issue = issue
-        self.options = options
-        super().__init__()
-
-
-class ClouEscalationResolved(Message):
-    """User resolved an escalation."""
-
-    def __init__(self, path: Path, disposition: str) -> None:
-        self.path = path
-        self.disposition = disposition
-        super().__init__()
-
-
-# ---------------------------------------------------------------------------
 # Handoff messages
 # ---------------------------------------------------------------------------
 

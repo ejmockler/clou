@@ -1,8 +1,7 @@
 """ClouApp — the Textual application shell.
 
 Composes the conversation widget, breath widget, status bar, and input
-field.  Manages mode transitions, breathing animation, and escalation
-modal lifecycle.
+field.  Manages mode transitions and breathing animation.
 """
 
 from __future__ import annotations
@@ -40,8 +39,6 @@ from clou.ui.messages import (
     ClouCoordinatorComplete,
     ClouCoordinatorSpawned,
     ClouDagUpdate,
-    ClouEscalationArrived,
-    ClouEscalationResolved,
     ClouHandoff,
     ClouMetrics,
     ClouProcessingStarted,
@@ -60,7 +57,6 @@ from clou.ui.task_graph import TaskGraphModel, TaskState
 from clou.ui.widgets.breath import BreathWidget
 from clou.ui.widgets.task_graph import TaskGraphWidget
 from clou.ui.widgets.conversation import ConversationWidget
-from clou.ui.widgets.escalation import EscalationModal
 from clou.ui.widgets.handoff import HandoffWidget
 from clou.ui.widgets.resize_handle import ResizeHandle
 from clou.ui.widgets.status_bar import ClouStatusBar
@@ -158,9 +154,6 @@ class ClouApp(App[None]):
         self._animation_timer: Timer | None = None
         self._animation_time: float = 0.0
         self._breath_machine = BreathStateMachine()
-        self._escalation_queue: deque[
-            tuple[Path, str, str, list[dict[str, object]]]
-        ] = deque()
         self._release_start_time: float = 0.0
         self._release_start_value: float = 0.0
         self._settle_start_time: float = 0.0
@@ -230,11 +223,10 @@ class ClouApp(App[None]):
                 conversation.reset_turn_state()
             except LookupError:
                 pass  # Widget may not be mounted yet
-            # Drain the dead queue and stale escalations.
+            # Drain the dead queue.
             self._user_input_queue.clear()
             self._user_input_ready.clear()
             self._queue_count = 0
-            self._escalation_queue.clear()
             try:
                 self.query_one(ConversationWidget).update_queue_count(0)
             except LookupError:
@@ -261,22 +253,6 @@ class ClouApp(App[None]):
     # ------------------------------------------------------------------
     # Mode transitions
     # ------------------------------------------------------------------
-
-    def _push_pending_escalation(self) -> None:
-        """Push the next queued escalation modal."""
-        if not self._escalation_queue:
-            return
-        if self._has_screen(EscalationModal):
-            return  # Already showing an escalation; next will fire on resolve
-        path, classification, issue, options = self._escalation_queue.popleft()
-        self.push_screen(
-            EscalationModal(
-                path=path,
-                classification=classification,
-                issue=issue,
-                options=options,
-            )
-        )
 
     def transition_mode(self, target: Mode) -> bool:
         """Attempt a validated mode transition.
@@ -309,12 +285,10 @@ class ClouApp(App[None]):
         elif old is Mode.BREATH and new is Mode.DECISION:
             self._pre_decision_mode = Mode.BREATH
             self._breath_machine.transition(BreathState.HOLDING)
-            self._push_pending_escalation()
 
         # --- DIALOGUE -> DECISION ---
         elif old is Mode.DIALOGUE and new is Mode.DECISION:
             self._pre_decision_mode = Mode.DIALOGUE
-            self._push_pending_escalation()
 
         # --- DIALOGUE -> HANDOFF ---
         elif old is Mode.DIALOGUE and new is Mode.HANDOFF:
@@ -349,7 +323,6 @@ class ClouApp(App[None]):
         # --- HANDOFF -> DECISION ---
         elif old is Mode.HANDOFF and new is Mode.DECISION:
             self._pre_decision_mode = Mode.HANDOFF
-            self._push_pending_escalation()
 
     def _apply_conversation_height_override(self, mode: Mode) -> None:
         """Apply or clear the user-dragged conversation height for *mode*.
@@ -799,7 +772,6 @@ class ClouApp(App[None]):
         # Reset app-level state.
         self._session_start_time = time.monotonic()
         self._compact.reset()
-        self._escalation_queue.clear()
         self._dag_tasks = []
         self._dag_deps = {}
         self._task_graph_model = None
@@ -863,11 +835,15 @@ class ClouApp(App[None]):
     # ------------------------------------------------------------------
 
     def on_clou_status_update(self, msg: ClouStatusUpdate) -> None:
-        """Update status bar with coordinator cycle status."""
+        """Update status bar and task graph with coordinator cycle status."""
         bar = self.query_one(ClouStatusBar)
         bar.cycle_type = msg.cycle_type
         bar.cycle_num = msg.cycle_num
         bar.phase = msg.phase
+        try:
+            self.query_one(TaskGraphWidget).cycle_type = msg.cycle_type
+        except LookupError:
+            pass
 
     def on_clou_metrics(self, msg: ClouMetrics) -> None:
         """Update status bar token/cost metrics."""
@@ -978,8 +954,16 @@ class ClouApp(App[None]):
             desc = description.strip()[:60] or "agent"
             key = f"{desc}:{task_id}"
             self._agent_task_map[task_id] = key
+            # Tag with current cycle type so the widget knows which phase
+            # this agent belongs to.
+            cycle = ""
+            try:
+                cycle = self.query_one(ClouStatusBar).cycle_type
+            except LookupError:
+                pass
             model.unmapped_agents[key] = TaskState(
                 status="active", agent_id=task_id,
+                spawn_cycle=cycle,
             )
 
     def on_clou_agent_spawned(self, msg: ClouAgentSpawned) -> None:
@@ -1029,6 +1013,13 @@ class ClouApp(App[None]):
 
         self._agent_task_map[task_id] = key
         self._task_graph_model.activate_task(key, task_id)
+        # Tag synthetic task with current cycle type.
+        state = self._task_graph_model.task_states.get(key)
+        if state is not None:
+            try:
+                state.spawn_cycle = self.query_one(ClouStatusBar).cycle_type
+            except LookupError:
+                pass
         try:
             self.query_one(TaskGraphWidget).update_model(
                 self._task_graph_model
@@ -1131,36 +1122,6 @@ class ClouApp(App[None]):
             task_name=msg.task_name,
             task_state=state,
         ))
-
-    def on_clou_escalation_arrived(self, msg: ClouEscalationArrived) -> None:
-        """Escalation arrived — queue and enter decision mode."""
-        self._escalation_queue.append((
-            msg.path,
-            msg.classification,
-            msg.issue,
-            msg.options,
-        ))
-        # Already in DECISION — the queued escalation fires when the current one resolves.
-        if self.mode is Mode.DECISION:
-            return
-        if not self.transition_mode(Mode.DECISION):
-            _log.warning(
-                "Cannot transition to DECISION from %s — escalation queued for later",
-                self.mode,
-            )
-
-    def on_clou_escalation_resolved(self, msg: ClouEscalationResolved) -> None:
-        """Escalation resolved — show next queued or return to pre-decision mode."""
-        if self._escalation_queue:
-            # More escalations waiting — push the next one immediately.
-            self._push_pending_escalation()
-            return
-        target = (
-            self._pre_decision_mode
-            if self._pre_decision_mode != Mode.DECISION
-            else Mode.DIALOGUE
-        )
-        self.transition_mode(target)
 
     def on_clou_rate_limit(self, msg: ClouRateLimit) -> None:
         """Update status bar rate-limit state."""
