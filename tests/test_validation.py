@@ -155,9 +155,13 @@ def test_coordinator_all_keys_missing(tmp_path: Path) -> None:
 
 
 def test_coordinator_valid_next_step_rework(tmp_path: Path) -> None:
-    """'EXECUTE (rework)' is a valid next_step."""
+    """'EXECUTE_REWORK' is a valid next_step.
+
+    M50 I1: structured token replaces the legacy
+    ``EXECUTE (rework)`` form.
+    """
     content = VALID_CHECKPOINT.replace(
-        "next_step: VERIFY", "next_step: EXECUTE (rework)"
+        "next_step: VERIFY", "next_step: EXECUTE_REWORK"
     )
     _write(tmp_path / ".clou" / "milestones" / "m1" / "active" / "coordinator.md", content)
     assert validate_golden_context(tmp_path, "m1") == []

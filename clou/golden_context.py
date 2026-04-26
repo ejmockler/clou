@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from clou.recovery_checkpoint import Checkpoint
+    from clou.recovery_checkpoint import AcceptanceVerdict, Checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -41,12 +41,41 @@ if TYPE_CHECKING:
 # validation.py and recovery.py should import these, not redefine them.
 # ---------------------------------------------------------------------------
 
-VALID_STEPS = frozenset({"PLAN", "EXECUTE", "ASSESS", "REPLAN", "VERIFY", "EXIT"})
+VALID_STEPS = frozenset({"PLAN", "EXECUTE", "ASSESS", "REPLAN", "VERIFY", "EXIT", "ORIENT"})
+#: ``HALTED`` is the next_step written when the engine's
+#: trajectory-halt gate fires (M49b).  The supervisor disposes via
+#: ``clou_resolve_escalation`` and updates the checkpoint to restore
+#: the pre-halt next_step or route to PLAN/EXIT per user choice.
+#: M50 I1 vocabulary canonicalization — punctuated legacy tokens
+#: ``EXECUTE (rework)`` and ``EXECUTE (additional verification)`` are
+#: rejected by the parser and replaced with the structured identifiers
+#: ``EXECUTE_REWORK`` / ``EXECUTE_VERIFY``.  Mirrors
+#: ``clou.recovery_checkpoint._VALID_NEXT_STEPS`` (the validator the
+#: dispatch layer keys on).  See ``clou.vocabulary_migration`` for the
+#: one-shot rewrite of persisted artifacts.
+#: M50 I1 cycle-3 rework (F4/F15): ``'none'`` is NOT in the render-
+#: side vocabulary.  Accepting it here would let ``render_checkpoint``
+#: emit literal ``next_step: none`` to disk while ``parse_checkpoint``
+#: silently coerces ``none`` → ``COMPLETE``; two distinct persisted
+#: representations would map to one in-memory state, breaking
+#: idempotency of the render→parse→render fixed point.  ``'none'``
+#: remains tolerated on parse (legacy inputs from the EXIT prompt's
+#: ``next_step: none`` convention) via ``parse_checkpoint``'s
+#: pre-validation coercion; new writes MUST use ``COMPLETE``.
 VALID_NEXT_STEPS = frozenset({
-    "PLAN", "EXECUTE", "EXECUTE (rework)", "EXECUTE (additional verification)",
-    "ASSESS", "REPLAN", "VERIFY", "EXIT", "COMPLETE", "none",
+    "PLAN", "EXECUTE", "EXECUTE_REWORK", "EXECUTE_VERIFY",
+    "ASSESS", "REPLAN", "VERIFY", "EXIT", "COMPLETE", "ORIENT",
+    "HALTED",
 })
-VALID_CYCLE_OUTCOMES = frozenset({"ADVANCED", "INCONCLUSIVE", "INTERRUPTED", "FAILED"})
+#: ``HALTED_PENDING_REVIEW`` is the cycle_outcome written alongside
+#: ``next_step=HALTED`` when the trajectory-halt gate fires (M49b).
+#: Its staleness semantics match ``INCONCLUSIVE`` / ``INTERRUPTED``
+#: in ``update_staleness``: the counter resets, not accumulates —
+#: the halt is a pause-for-review, not a stall.
+VALID_CYCLE_OUTCOMES = frozenset({
+    "ADVANCED", "INCONCLUSIVE", "INTERRUPTED", "FAILED",
+    "HALTED_PENDING_REVIEW",
+})
 TASK_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
 PHASE_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
 
@@ -116,14 +145,29 @@ def render_checkpoint(
     cycle_outcome: str = "ADVANCED",
     valid_findings: int = -1,
     consecutive_zero_valid: int = 0,
+    pre_orient_next_step: str = "",
+    pre_halt_next_step: str = "",
+    last_acceptance_verdict: "AcceptanceVerdict | None" = None,
 ) -> str:
     """Render a coordinator checkpoint file.
 
     All fields are always written explicitly — no omissions, no aliases,
     no ambiguity for ``parse_checkpoint()`` or ``validate_checkpoint()``.
 
-    Retry counters, cycle_outcome, and convergence fields are keyword-only
-    to avoid breaking existing callers that pass positional arguments.
+    Retry counters, cycle_outcome, convergence, and the M36/M49b
+    stash fields are keyword-only to avoid breaking existing callers
+    that pass positional arguments.
+
+    ``pre_orient_next_step``: M36 I1 (F2 rework). Non-empty when the
+    session-start ORIENT rewrite has stashed the pre-ORIENT
+    ``next_step`` for the ORIENT-exit restoration path to restore on
+    the next iteration. Empty string = no pending restoration.
+
+    ``pre_halt_next_step``: M49b B6.  Non-empty when the engine halt
+    gate has fired and stashed the prior ``next_step`` for the
+    supervisor's ``clou_dispose_halt`` tool to restore under the
+    ``continue-as-is`` choice.  Empty string = no halt restoration
+    pending (cleared by the dispose verb after rewrite).
     """
     if cycle < 0:
         raise ValueError(f"cycle must be non-negative, got {cycle}")
@@ -142,6 +186,84 @@ def render_checkpoint(
         )
     if cycle_outcome not in VALID_CYCLE_OUTCOMES:
         raise ValueError(f"invalid cycle_outcome {cycle_outcome!r}")
+    if pre_orient_next_step and pre_orient_next_step not in VALID_NEXT_STEPS:
+        raise ValueError(
+            f"invalid pre_orient_next_step {pre_orient_next_step!r}"
+        )
+    if pre_halt_next_step and pre_halt_next_step not in VALID_NEXT_STEPS:
+        raise ValueError(
+            f"invalid pre_halt_next_step {pre_halt_next_step!r}"
+        )
+    # M49b B6: stashing HALTED would be self-referential — the
+    # supervisor's continue-as-is would restore HALTED, the gate
+    # would re-fire, infinite loop.  Reject explicitly.
+    if pre_halt_next_step == "HALTED":
+        raise ValueError(
+            "pre_halt_next_step must not be 'HALTED' (would loop)"
+        )
+    # M49b D3 (closes B7/F3): symmetric guard for pre_orient_next_step.
+    # The session-start ORIENT dispatch in run_coordinator stashes the
+    # current next_step into pre_orient_next_step before rewriting to
+    # ORIENT.  If next_step is HALTED at session start (a contract
+    # violation per C1, but reachable through the now-closed crash
+    # window in supervisor disposition), stashing HALTED would let
+    # ORIENT-exit restoration put it back → determine_next_cycle's
+    # HALTED case raises.  Without this guard, the supervisor's
+    # disposition crash window had a delayed-action loop.  Reject
+    # symmetrically with pre_halt_next_step.
+    if pre_orient_next_step == "HALTED":
+        raise ValueError(
+            "pre_orient_next_step must not be 'HALTED' (would loop "
+            "via ORIENT-exit restoration)"
+        )
+    # M36 F2 (round-4): ORIENT-into-ORIENT would let the ORIENT-exit
+    # restoration "restore" next_step=ORIENT back onto next_step=ORIENT.
+    # Because the restoration block reads pre_orient_next_step and
+    # rewrites next_step to that value, a poisoned stash of ORIENT
+    # produces a sink state: every iteration restores ORIENT over
+    # ORIENT, the cycle never advances, and the milestone burns _MAX_CYCLES.
+    # This is architecturally identical to the HALTED guard above —
+    # both close a self-reference loop on the stash.
+    if pre_orient_next_step == "ORIENT":
+        raise ValueError(
+            "pre_orient_next_step must not be 'ORIENT' (would loop "
+            "via ORIENT-exit restoration)"
+        )
+
+    # M52 F38: serialise ``last_acceptance_verdict`` as
+    # ``<phase>|<decision>|<content_sha>`` or the literal ``none``
+    # sentinel.  Pipes are forbidden in phase names by ``_PHASE_RE``,
+    # so the delimiter is unambiguous.  Reject malformed verdicts at
+    # render time so a poisoned verdict never lands on disk.
+    if last_acceptance_verdict is None:
+        verdict_serialised = "none"
+    else:
+        from clou.recovery_checkpoint import _VALID_VERDICT_DECISIONS
+        if last_acceptance_verdict.decision not in _VALID_VERDICT_DECISIONS:
+            raise ValueError(
+                f"invalid last_acceptance_verdict.decision "
+                f"{last_acceptance_verdict.decision!r} (must be one of "
+                f"{sorted(_VALID_VERDICT_DECISIONS)})"
+            )
+        if "|" in last_acceptance_verdict.phase:
+            raise ValueError(
+                "last_acceptance_verdict.phase must not contain '|' "
+                "(pipe is the wire-format delimiter)"
+            )
+        if "|" in last_acceptance_verdict.content_sha:
+            raise ValueError(
+                "last_acceptance_verdict.content_sha must not contain "
+                "'|' (pipe is the wire-format delimiter)"
+            )
+        if "\n" in last_acceptance_verdict.phase or "\n" in last_acceptance_verdict.content_sha:
+            raise ValueError(
+                "last_acceptance_verdict fields must not contain newlines"
+            )
+        verdict_serialised = (
+            f"{last_acceptance_verdict.phase}|"
+            f"{last_acceptance_verdict.decision}|"
+            f"{last_acceptance_verdict.content_sha}"
+        )
 
     return (
         f"cycle: {cycle}\n"
@@ -157,6 +279,9 @@ def render_checkpoint(
         f"cycle_outcome: {cycle_outcome}\n"
         f"valid_findings: {valid_findings}\n"
         f"consecutive_zero_valid: {consecutive_zero_valid}\n"
+        f"pre_orient_next_step: {pre_orient_next_step}\n"
+        f"pre_halt_next_step: {pre_halt_next_step}\n"
+        f"last_acceptance_verdict: {verdict_serialised}\n"
     )
 
 
@@ -181,8 +306,23 @@ def render_status(
     """
     if cycle < 0:
         raise ValueError(f"cycle must be non-negative, got {cycle}")
-    if next_step and next_step not in VALID_NEXT_STEPS:
-        raise ValueError(f"invalid next_step {next_step!r}")
+    # M50 I1 cycle-4 rework (F20): validate ``next_step`` with the
+    # same discipline as every other VALID_NEXT_STEPS check —
+    # empty-string is NOT a silent-tolerance sentinel.  The prior
+    # ``if next_step and ...`` short-circuit preserved the same
+    # silent-tolerance pattern that cycle-3's ``"none"`` narrowing
+    # was trying to eliminate.  Empty-string now fails alongside
+    # any other invalid value.  Callers that previously relied on
+    # the ``next_step=""`` default must supply an explicit token —
+    # the rendered status file simply omits the ``next_step:`` line
+    # when a dispatch is not yet scheduled, but the contract
+    # demands the caller name "no dispatch scheduled" explicitly.
+    if next_step not in VALID_NEXT_STEPS:
+        raise ValueError(
+            f"invalid next_step {next_step!r} (must be one of "
+            f"{sorted(VALID_NEXT_STEPS)} — empty string is NOT a "
+            f"silent-tolerance sentinel)"
+        )
     if phase_progress:
         for p_name, p_status in phase_progress.items():
             if p_status not in PHASE_STATUSES:

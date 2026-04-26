@@ -17,7 +17,9 @@ from clou.recovery import (
     Checkpoint,
     ConvergenceState,
     MemoryPattern,
+    ORIENT_PROTOCOL,
     _MEMORY_TYPE_FILTERS,
+    _VALID_NEXT_STEPS,
     _accumulate_distribution,
     _consolidated_milestones,
     _detect_contradiction,
@@ -69,7 +71,7 @@ VALID_CHECKPOINT = """\
 ## Cycle
 cycle: 3
 step: ASSESS
-next_step: EXECUTE (rework)
+next_step: EXECUTE_REWORK
 
 ## Phase Status
 current_phase: implementation
@@ -88,7 +90,7 @@ def test_parse_checkpoint_full() -> None:
     cp = parse_checkpoint(VALID_CHECKPOINT)
     assert cp.cycle == 3
     assert cp.step == "ASSESS"
-    assert cp.next_step == "EXECUTE (rework)"
+    assert cp.next_step == "EXECUTE_REWORK"
     assert cp.current_phase == "implementation"
     assert cp.phases_completed == 1
     assert cp.phases_total == 3
@@ -127,9 +129,92 @@ def test_parse_checkpoint_frozen() -> None:
 
 
 def test_parse_checkpoint_whitespace_in_value() -> None:
-    """Values with spaces (like 'EXECUTE (rework)') are preserved."""
-    cp = parse_checkpoint("next_step: EXECUTE (rework)\n")
-    assert cp.next_step == "EXECUTE (rework)"
+    """Values with spaces are preserved (M50 I1: legacy punctuated
+    cycle-type tokens are now rejected at parse time, so the test
+    uses a phase-name value with a space instead — the parsing path
+    for whitespace-containing values is otherwise unchanged)."""
+    cp = parse_checkpoint("current_phase: data ingestion\n")
+    assert cp.current_phase == "data ingestion"
+
+
+def test_parse_checkpoint_rejects_legacy_rework_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """M50 I1: legacy 'EXECUTE (rework)' token is rejected with a
+    warning naming the structured replacement and defaults to PLAN.
+    No silent coerce — the rejection is the signal that persisted
+    state drifted, and the migration helper is the canonical fix."""
+    with caplog.at_level("WARNING"):
+        cp = parse_checkpoint("next_step: EXECUTE (rework)\n")
+    assert cp.next_step == "PLAN"
+    msgs = " ".join(r.message for r in caplog.records)
+    assert "EXECUTE (rework)" in msgs
+    assert "EXECUTE_REWORK" in msgs
+
+
+def test_parse_checkpoint_rejects_legacy_verify_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """M50 I1: legacy 'EXECUTE (additional verification)' token is
+    rejected with a warning naming the structured replacement
+    and defaults to PLAN."""
+    with caplog.at_level("WARNING"):
+        cp = parse_checkpoint(
+            "next_step: EXECUTE (additional verification)\n"
+        )
+    assert cp.next_step == "PLAN"
+    msgs = " ".join(r.message for r in caplog.records)
+    assert "EXECUTE (additional verification)" in msgs
+    assert "EXECUTE_VERIFY" in msgs
+
+
+def test_parse_checkpoint_accepts_structured_rework_token() -> None:
+    """M50 I1: structured 'EXECUTE_REWORK' token parses without
+    warning and round-trips through the dataclass field."""
+    cp = parse_checkpoint("next_step: EXECUTE_REWORK\n")
+    assert cp.next_step == "EXECUTE_REWORK"
+
+
+def test_parse_checkpoint_accepts_structured_verify_token() -> None:
+    """M50 I1: structured 'EXECUTE_VERIFY' token parses without
+    warning and round-trips through the dataclass field."""
+    cp = parse_checkpoint("next_step: EXECUTE_VERIFY\n")
+    assert cp.next_step == "EXECUTE_VERIFY"
+
+
+def test_parse_checkpoint_rejects_legacy_pre_orient_stash(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """M50 I1: a legacy token in pre_orient_next_step is rejected
+    identically to next_step — the stash drops to empty so the
+    ORIENT-exit restoration path does not silently consume a
+    malformed pre-ORIENT value."""
+    with caplog.at_level("WARNING"):
+        cp = parse_checkpoint(
+            "next_step: ORIENT\npre_orient_next_step: EXECUTE (rework)\n"
+        )
+    assert cp.pre_orient_next_step == ""
+    msgs = " ".join(r.message for r in caplog.records)
+    assert "pre_orient_next_step" in msgs
+    assert "EXECUTE_REWORK" in msgs
+
+
+def test_parse_checkpoint_rejects_legacy_pre_halt_stash(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """M50 I1: a legacy token in pre_halt_next_step is rejected
+    identically — the stash drops to empty rather than coerce, so
+    clou_dispose_halt's continue-as-is path cannot resurrect a
+    malformed pre-halt value."""
+    with caplog.at_level("WARNING"):
+        cp = parse_checkpoint(
+            "next_step: HALTED\npre_halt_next_step: "
+            "EXECUTE (additional verification)\n"
+        )
+    assert cp.pre_halt_next_step == ""
+    msgs = " ".join(r.message for r in caplog.records)
+    assert "pre_halt_next_step" in msgs
+    assert "EXECUTE_VERIFY" in msgs
 
 
 # ---------------------------------------------------------------------------
@@ -167,15 +252,25 @@ def test_determine_next_cycle_execute(tmp_path: Path) -> None:
 
 
 def test_determine_next_cycle_execute_rework(tmp_path: Path) -> None:
-    """next_step='EXECUTE (rework)' also maps to EXECUTE."""
+    """next_step='EXECUTE_REWORK' preserves the structured token.
+
+    M50 I1 cycle-2 rework (F5/F12): the router returns the structured
+    token unchanged; prior implementation collapsed to plain
+    ``"EXECUTE"`` which made telemetry payloads indistinguishable
+    between rework, verification, and plain execute.  Downstream
+    consumers switch on the token via :func:`is_execute_family` for
+    the family verdict.
+    """
     cp_path = tmp_path / "coordinator.md"
     _write(
         cp_path,
-        "cycle: 3\nstep: ASSESS\nnext_step: EXECUTE (rework)\n"
+        "cycle: 3\nstep: ASSESS\nnext_step: EXECUTE_REWORK\n"
         "current_phase: implementation\n",
     )
     cycle_type, read_set = determine_next_cycle(cp_path, "m1")
-    assert cycle_type == "EXECUTE"
+    assert cycle_type == "EXECUTE_REWORK"
+    from clou.recovery_checkpoint import is_execute_family
+    assert is_execute_family(cycle_type) is True
     assert "phases/implementation/phase.md" in read_set
 
 
@@ -229,6 +324,166 @@ def test_determine_next_cycle_unknown_falls_back(tmp_path: Path) -> None:
     cycle_type, read_set = determine_next_cycle(cp_path, "m1")
     assert cycle_type == "PLAN"
     assert "milestone.md" in read_set
+
+
+# ---------------------------------------------------------------------------
+# M36 I1 — ORIENT cycle dispatch (observation-first prefix)
+# ---------------------------------------------------------------------------
+
+
+def test_orient_in_valid_next_steps() -> None:
+    """ORIENT joins the cycle-type vocabulary in _VALID_NEXT_STEPS."""
+    assert "ORIENT" in _VALID_NEXT_STEPS
+    # Symbolic alias is exported for callers that prefer the constant.
+    assert ORIENT_PROTOCOL == "ORIENT"
+
+
+def test_orient_preserved_in_parse_checkpoint() -> None:
+    """parse_checkpoint preserves next_step=ORIENT (no downgrade to PLAN)."""
+    cp = parse_checkpoint(
+        "cycle: 1\nstep: PLAN\nnext_step: ORIENT\n"
+    )
+    assert cp.next_step == "ORIENT"
+
+
+def test_determine_next_cycle_orient_branch(tmp_path: Path) -> None:
+    """next_step=ORIENT returns the adaptive observation read set.
+
+    Expected read_set contents: intents.md, status.md, every
+    phases/*/execution.md resolved at call time, and
+    active/git-diff-stat.txt.
+    """
+    ms_dir = tmp_path / "milestones" / "m1"
+    cp_path = ms_dir / "active" / "coordinator.md"
+    cp_path.parent.mkdir(parents=True)
+    cp_path.write_text(
+        "cycle: 1\nstep: PLAN\nnext_step: ORIENT\n"
+    )
+    # Milestone-root artifacts that ORIENT always consults.
+    (ms_dir / "intents.md").write_text("I1: observable outcome\n")
+    (ms_dir / "status.md").write_text("# Status\n")
+    # Two phases with execution.md — glob must pick them up.
+    (ms_dir / "phases" / "p1").mkdir(parents=True)
+    (ms_dir / "phases" / "p2").mkdir(parents=True)
+    (ms_dir / "phases" / "p1" / "execution.md").write_text("## Summary\n")
+    (ms_dir / "phases" / "p2" / "execution.md").write_text("## Summary\n")
+    # Diff file (orchestrator drops it at iteration start).
+    (ms_dir / "active" / "git-diff-stat.txt").write_text(
+        "src/foo.py | 3 +++\n"
+    )
+
+    cycle_type, read_set = determine_next_cycle(cp_path, "m1")
+
+    assert cycle_type == "ORIENT"
+    # The adaptive set — all four entries present.
+    assert "intents.md" in read_set
+    assert "status.md" in read_set
+    assert "phases/p1/execution.md" in read_set
+    assert "phases/p2/execution.md" in read_set
+    assert "active/git-diff-stat.txt" in read_set
+
+
+def test_determine_next_cycle_orient_sorts_execution_files(
+    tmp_path: Path,
+) -> None:
+    """ORIENT read set lists phases/*/execution.md in sorted order."""
+    ms_dir = tmp_path / "milestones" / "m1"
+    cp_path = ms_dir / "active" / "coordinator.md"
+    cp_path.parent.mkdir(parents=True)
+    cp_path.write_text(
+        "cycle: 1\nstep: PLAN\nnext_step: ORIENT\n"
+    )
+    (ms_dir / "intents.md").write_text("")
+    (ms_dir / "status.md").write_text("")
+    # Deliberately unsorted phase names.
+    for phase in ("zebra", "alpha", "mid"):
+        phase_dir = ms_dir / "phases" / phase
+        phase_dir.mkdir(parents=True)
+        (phase_dir / "execution.md").write_text("")
+
+    _cycle_type, read_set = determine_next_cycle(cp_path, "m1")
+
+    # Extract execution.md paths in order; they should be alpha, mid, zebra.
+    exec_paths = [p for p in read_set if p.endswith("/execution.md")]
+    assert exec_paths == [
+        "phases/alpha/execution.md",
+        "phases/mid/execution.md",
+        "phases/zebra/execution.md",
+    ]
+
+
+def test_determine_next_cycle_orient_without_phases(tmp_path: Path) -> None:
+    """Fresh milestone with no phases/ dir: ORIENT still returns the core set."""
+    ms_dir = tmp_path / "milestones" / "m1"
+    cp_path = ms_dir / "active" / "coordinator.md"
+    cp_path.parent.mkdir(parents=True)
+    cp_path.write_text(
+        "cycle: 1\nstep: PLAN\nnext_step: ORIENT\n"
+    )
+    # No intents.md, no status.md, no phases/, no diff file — the branch
+    # must still list the adaptive paths so the downstream reader can
+    # handle missing inputs uniformly (empty / absent content).
+    cycle_type, read_set = determine_next_cycle(cp_path, "m1")
+
+    assert cycle_type == "ORIENT"
+    # Core always-listed paths.
+    assert "intents.md" in read_set
+    assert "status.md" in read_set
+    assert "active/git-diff-stat.txt" in read_set
+    # No execution.md entries because no phases/ exists yet.
+    exec_paths = [p for p in read_set if p.endswith("/execution.md")]
+    assert exec_paths == []
+
+
+def test_determine_next_cycle_orient_without_diff_file(
+    tmp_path: Path,
+) -> None:
+    """ORIENT always lists active/git-diff-stat.txt even when missing.
+
+    Documents the chosen convention: listed unconditionally so the
+    read_set composition stays deterministic across cycles. The
+    downstream reader handles an absent / empty file.
+    """
+    ms_dir = tmp_path / "milestones" / "m1"
+    cp_path = ms_dir / "active" / "coordinator.md"
+    cp_path.parent.mkdir(parents=True)
+    cp_path.write_text(
+        "cycle: 2\nstep: PLAN\nnext_step: ORIENT\n"
+    )
+    (ms_dir / "intents.md").write_text("")
+    (ms_dir / "status.md").write_text("")
+
+    _cycle_type, read_set = determine_next_cycle(cp_path, "m1")
+    # Graceful-degradation contract: the path is always in the list.
+    assert "active/git-diff-stat.txt" in read_set
+
+
+def test_determine_next_cycle_orient_respects_cycle_number(
+    tmp_path: Path,
+) -> None:
+    """ORIENT branch doesn't mutate the cycle counter itself.
+
+    The checkpoint field ``cycle`` is preserved; only ``next_step`` is
+    rewritten by ``run_coordinator``. A crash re-entry with cycle=3
+    still reports cycle_type=ORIENT while leaving the checkpoint's
+    cycle field alone for downstream prompt builders.
+    """
+    ms_dir = tmp_path / "milestones" / "m1"
+    cp_path = ms_dir / "active" / "coordinator.md"
+    cp_path.parent.mkdir(parents=True)
+    cp_path.write_text(
+        "cycle: 3\nstep: EXECUTE\nnext_step: ORIENT\n"
+        "current_phase: build\n"
+    )
+    (ms_dir / "intents.md").write_text("")
+    (ms_dir / "status.md").write_text("")
+    # parse_checkpoint returns cycle=3 regardless of ORIENT branch.
+    cp_after = parse_checkpoint(cp_path.read_text())
+    assert cp_after.cycle == 3
+    assert cp_after.next_step == "ORIENT"
+
+    cycle_type, _read_set = determine_next_cycle(cp_path, "m1")
+    assert cycle_type == "ORIENT"
 
 
 # ---------------------------------------------------------------------------
@@ -663,11 +918,15 @@ def test_convergence_state_is_frozen() -> None:
 
 
 def test_rework_overridden_when_converged(tmp_path: Path) -> None:
-    """EXECUTE (rework) becomes VERIFY when decisions.md shows convergence."""
+    """EXECUTE_REWORK becomes VERIFY when decisions.md shows convergence.
+
+    M50 I1: structured token replaces ``EXECUTE (rework)``; the
+    convergence override semantics are unchanged.
+    """
     cp_path = tmp_path / "coordinator.md"
     _write(
         cp_path,
-        "cycle: 5\nstep: ASSESS\nnext_step: EXECUTE (rework)\ncurrent_phase: impl\n",
+        "cycle: 5\nstep: ASSESS\nnext_step: EXECUTE_REWORK\ncurrent_phase: impl\n",
     )
     decisions_path = tmp_path / "decisions.md"
     _write(decisions_path, _DECISIONS_CONVERGED)
@@ -683,11 +942,15 @@ def test_rework_overridden_when_converged(tmp_path: Path) -> None:
 
 
 def test_rework_proceeds_when_not_converged(tmp_path: Path) -> None:
-    """EXECUTE (rework) stays EXECUTE when decisions.md has accepted findings."""
+    """EXECUTE_REWORK preserves its structured token when not converged.
+
+    M50 I1 cycle-2 rework (F5/F12): the router returns
+    ``EXECUTE_REWORK`` unchanged (not the collapsed ``EXECUTE``).
+    """
     cp_path = tmp_path / "coordinator.md"
     _write(
         cp_path,
-        "cycle: 3\nstep: ASSESS\nnext_step: EXECUTE (rework)\ncurrent_phase: impl\n",
+        "cycle: 3\nstep: ASSESS\nnext_step: EXECUTE_REWORK\ncurrent_phase: impl\n",
     )
     decisions_path = tmp_path / "decisions.md"
     _write(decisions_path, _DECISIONS_NOT_CONVERGED)
@@ -697,19 +960,22 @@ def test_rework_proceeds_when_not_converged(tmp_path: Path) -> None:
         "m1",
         decisions_path=decisions_path,
     )
-    assert cycle_type == "EXECUTE"
+    assert cycle_type == "EXECUTE_REWORK"
     assert "phases/impl/phase.md" in read_set
 
 
 def test_rework_proceeds_when_no_decisions_path(tmp_path: Path) -> None:
-    """EXECUTE (rework) stays EXECUTE when decisions_path is not provided."""
+    """EXECUTE_REWORK preserves its token when decisions_path is not provided.
+
+    M50 I1 cycle-2 rework (F5/F12): structured-token preservation.
+    """
     cp_path = tmp_path / "coordinator.md"
     _write(
         cp_path,
-        "cycle: 5\nstep: ASSESS\nnext_step: EXECUTE (rework)\ncurrent_phase: impl\n",
+        "cycle: 5\nstep: ASSESS\nnext_step: EXECUTE_REWORK\ncurrent_phase: impl\n",
     )
     cycle_type, _ = determine_next_cycle(cp_path, "m1")
-    assert cycle_type == "EXECUTE"
+    assert cycle_type == "EXECUTE_REWORK"
 
 
 def test_normal_execute_unaffected_by_convergence(tmp_path: Path) -> None:
@@ -800,12 +1066,18 @@ def test_parse_checkpoint_unknown_next_step_defaults_to_plan() -> None:
 
 
 def test_parse_checkpoint_valid_next_steps_preserved() -> None:
-    """All valid next_step values are preserved as-is."""
+    """All valid next_step values are preserved as-is.
+
+    M50 I1: the structured tokens ``EXECUTE_REWORK`` and
+    ``EXECUTE_VERIFY`` replace the punctuated legacy forms; the
+    legacy forms are now rejected by ``parse_checkpoint`` (covered
+    by ``test_parse_checkpoint_rejects_legacy_*_token``).
+    """
     for step in (
         "PLAN",
         "EXECUTE",
-        "EXECUTE (rework)",
-        "EXECUTE (additional verification)",
+        "EXECUTE_REWORK",
+        "EXECUTE_VERIFY",
         "ASSESS",
         "VERIFY",
         "EXIT",
@@ -952,18 +1224,30 @@ def test_git_revert_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         return _HangingProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _hanging_subprocess)
-    # Use a very short internal timeout so the test doesn't wait 30s.
+    # Shorten the wait by intercepting asyncio.wait_for: when the
+    # caller passes the production timeout constant, substitute 0.05s.
+    # Importing the constant here (rather than hardcoding 30) means a
+    # future change to ``_GIT_SUBPROCESS_TIMEOUT`` does not silently
+    # turn this test into a slow test.
+    from clou.recovery_git import _GIT_SUBPROCESS_TIMEOUT
+
     _original_wait_for = asyncio.wait_for
 
     async def _fast_wait_for(coro: object, *, timeout: float | None = None) -> object:
-        # Replace the 30s timeout with 0.05s for this test
-        if timeout == 30:
+        if timeout == _GIT_SUBPROCESS_TIMEOUT:
             timeout = 0.05
         return await _original_wait_for(coro, timeout=timeout)  # type: ignore[arg-type]
 
     monkeypatch.setattr(asyncio, "wait_for", _fast_wait_for)
 
-    with pytest.raises(RuntimeError, match="git revert timed out"):
+    # The error message embeds the INTENDED timeout value
+    # (``_GIT_SUBPROCESS_TIMEOUT``), not the shortened monkeypatch
+    # value — operators should see the configured budget, not the
+    # test's fast-path shortcut.  Exact value pinning lives in
+    # ``tests/test_recovery_git.py::TestGitSubprocessTimeoutConstant``;
+    # here we only need to prove the timeout path fires and labels
+    # the operation.
+    with pytest.raises(RuntimeError, match=r"git revert timed out after \d"):
         asyncio.run(git_revert_golden_context(tmp_path, "m1"))
 
     assert killed
@@ -1016,16 +1300,22 @@ def test_git_commit_phase_timeout(
         return _HangingProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _hanging_subprocess)
+    # Import the production constant so this shortcut stays tied to
+    # the value under test (see test_git_revert_timeout for rationale).
+    from clou.recovery_git import _GIT_SUBPROCESS_TIMEOUT
+
     _original_wait_for = asyncio.wait_for
 
     async def _fast_wait_for(coro: object, *, timeout: float | None = None) -> object:
-        if timeout == 30:
+        if timeout == _GIT_SUBPROCESS_TIMEOUT:
             timeout = 0.05
         return await _original_wait_for(coro, timeout=timeout)  # type: ignore[arg-type]
 
     monkeypatch.setattr(asyncio, "wait_for", _fast_wait_for)
 
-    with pytest.raises(RuntimeError, match="timed out"):
+    # See test_git_revert_timeout above: message reports configured
+    # timeout, not test-shortcut value.
+    with pytest.raises(RuntimeError, match=r"timed out after \d"):
         asyncio.run(git_commit_phase(tmp_path, "m1", "impl"))
 
     assert killed
@@ -1412,37 +1702,126 @@ def test_parse_checkpoint_none_maps_to_complete() -> None:
     assert cp.next_step == "COMPLETE"
 
 
-def test_parse_checkpoint_none_case_insensitive() -> None:
-    """next_step normalization is case-insensitive."""
-    for variant in ("none", "None", "NONE"):
-        cp = parse_checkpoint(f"next_step: {variant}\n")
-        assert cp.next_step == "COMPLETE", f"Failed for {variant!r}"
+def test_parse_checkpoint_none_emits_warning(caplog) -> None:
+    """M50 I1 cycle-4 rework (F12): coercion of 'none' emits a warning.
+
+    The coercion is a one-way legacy-input tolerance, not a
+    bidirectional vocabulary member.  The warning is the audit-trail
+    signal that persisted state drifted; without it, the coercion
+    would silently terminate milestones with no evidence.  The fix
+    keeps the coercion behavior but adds the warning log naming the
+    legacy token, the structured replacement, and the migration
+    helper.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="clou.recovery_checkpoint"):
+        cp = parse_checkpoint("cycle: 7\nstep: EXIT\nnext_step: none\n")
+
+    assert cp.next_step == "COMPLETE"
+    # The warning names both the legacy token and the canonical
+    # replacement, plus a pointer to the migration helper.
+    joined = "\n".join(r.message for r in caplog.records)
+    assert "none" in joined
+    assert "COMPLETE" in joined
+    assert "migrate_legacy_tokens" in joined
+
+
+def test_parse_checkpoint_capital_None_does_not_silently_coerce(caplog) -> None:
+    """M50 I1 cycle-4 rework (F12): 'None' is NOT silently coerced.
+
+    Python's ``None`` convention is extremely plausible for a human
+    debugger editing a checkpoint.  The cycle-3 narrowing of the
+    vocabulary removed ``"none"`` from ``_VALID_NEXT_STEPS`` but
+    kept a case-INsensitive ``next_step.lower() == "none"`` check
+    that would silently coerce ``next_step: None`` to ``COMPLETE``
+    with no audit trail — a milestone-terminating silent coercion.
+
+    The fix narrows the coercion to exact-match lowercase
+    ``"none"`` only.  ``"None"`` falls through to the
+    ``_VALID_NEXT_STEPS`` rejection branch, which defaults to
+    ``"PLAN"`` with an actionable ``Unknown next_step`` warning.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="clou.recovery_checkpoint"):
+        cp = parse_checkpoint("cycle: 7\nstep: EXIT\nnext_step: None\n")
+
+    # Did NOT silently coerce to COMPLETE — defaulted to PLAN via
+    # the invalid-value path.
+    assert cp.next_step == "PLAN"
+    # The user sees an actionable warning, not silent termination.
+    joined = "\n".join(r.message for r in caplog.records)
+    assert "Unknown next_step" in joined
+    assert "'None'" in joined or '"None"' in joined
+
+
+def test_parse_checkpoint_uppercase_NONE_does_not_silently_coerce(caplog) -> None:
+    """M50 I1 cycle-4 rework (F12): 'NONE' is NOT silently coerced.
+
+    Parallel to the 'None' guard.  Uppercase / SHOUTY variants fall
+    through to the ``Unknown next_step`` rejection path, keeping
+    the canonical vocabulary's case-sensitivity discipline.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="clou.recovery_checkpoint"):
+        cp = parse_checkpoint("cycle: 7\nstep: EXIT\nnext_step: NONE\n")
+
+    assert cp.next_step == "PLAN"
+    joined = "\n".join(r.message for r in caplog.records)
+    assert "Unknown next_step" in joined
+    assert "'NONE'" in joined or '"NONE"' in joined
 
 
 # ---------------------------------------------------------------------------
-# determine_next_cycle — EXECUTE (additional verification)
+# determine_next_cycle — EXECUTE_VERIFY (M50 I1: structured token
+# replaces the legacy ``EXECUTE (additional verification)`` form)
 # ---------------------------------------------------------------------------
 
 
 def test_determine_next_cycle_additional_verification(tmp_path: Path) -> None:
-    """EXECUTE (additional verification) routes to EXECUTE cycle."""
+    """EXECUTE_VERIFY preserves the structured token through the router.
+
+    M50 I1 cycle-2 rework (F5/F12): the router MUST preserve the
+    structured token (``EXECUTE_VERIFY``) rather than collapsing it
+    to plain ``"EXECUTE"``.  The prior collapse dropped the
+    discriminator before telemetry and prompt builders could see it;
+    downstream consumers that want the EXECUTE-family family-verdict
+    call :func:`is_execute_family` instead of string-equality.  The
+    dispatch read-set still routes through the EXECUTE-family branch
+    (verification phase file surfaces in the read set).
+    """
     cp_path = tmp_path / "coordinator.md"
     _write(
         cp_path,
-        "cycle: 6\nstep: VERIFY\nnext_step: EXECUTE (additional verification)\n"
+        "cycle: 6\nstep: VERIFY\nnext_step: EXECUTE_VERIFY\n"
         "current_phase: verification\n",
     )
     cycle_type, read_set = determine_next_cycle(cp_path, "m1")
-    assert cycle_type == "EXECUTE"
+    # Structured token preserved; family-verdict via helper.
+    assert cycle_type == "EXECUTE_VERIFY"
+    from clou.recovery_checkpoint import is_execute_family
+    assert is_execute_family(cycle_type) is True
     assert "phases/verification/phase.md" in read_set
 
 
 def test_additional_verification_not_affected_by_convergence(tmp_path: Path) -> None:
-    """EXECUTE (additional verification) is NOT overridden by convergence."""
+    """EXECUTE_VERIFY is NOT overridden by convergence.
+
+    M50 I1: convergence override gates only on ``EXECUTE_REWORK``
+    (the structured rework token); ``EXECUTE_VERIFY`` is a separate
+    cycle type that signals an additional verification pass and must
+    not be skipped just because ASSESS findings are quiet.
+
+    M50 I1 cycle-2 rework (F5/F12): structured-token preservation —
+    the returned cycle_type carries ``EXECUTE_VERIFY`` not plain
+    ``EXECUTE``.
+    """
     cp_path = tmp_path / "coordinator.md"
     _write(
         cp_path,
-        "cycle: 6\nstep: VERIFY\nnext_step: EXECUTE (additional verification)\n"
+        "cycle: 6\nstep: VERIFY\nnext_step: EXECUTE_VERIFY\n"
         "current_phase: verification\n",
     )
     decisions_path = tmp_path / "decisions.md"
@@ -1451,7 +1830,7 @@ def test_additional_verification_not_affected_by_convergence(tmp_path: Path) -> 
     cycle_type, _ = determine_next_cycle(
         cp_path, "m1", decisions_path=decisions_path,
     )
-    assert cycle_type == "EXECUTE"  # NOT overridden to VERIFY
+    assert cycle_type == "EXECUTE_VERIFY"  # NOT overridden to VERIFY
 
 
 # ---------------------------------------------------------------------------
@@ -5015,3 +5394,478 @@ class TestLifecyclePipelineCleanup:
 
         asyncio.run(run_lifecycle_pipeline(tmp_path))
         assert target.exists()
+
+
+# ---------------------------------------------------------------------------
+# M36 F2 (typed pre_orient_next_step): round-trip preservation tests
+# ---------------------------------------------------------------------------
+
+
+class TestPreOrientNextStepTypedField:
+    """Verify pre_orient_next_step survives every render/parse round-trip.
+
+    The four wipe sites identified by cycle-2 assessment
+    (_persist_retry_counters, escalation reset, self-heal, and the MCP
+    clou_write_checkpoint tool) must all preserve the field so the
+    ORIENT-exit restoration block (F1) can read it on the iteration
+    after a session-start rewrite.
+    """
+
+    def test_default_empty_string(self) -> None:
+        """Checkpoint dataclass defaults pre_orient_next_step to ``""``."""
+        cp = Checkpoint()
+        assert cp.pre_orient_next_step == ""
+
+    def test_parse_emits_typed_field(self) -> None:
+        """parse_checkpoint extracts the field as a typed attribute."""
+        cp = parse_checkpoint(
+            "cycle: 0\nstep: PLAN\nnext_step: ORIENT\n"
+            "pre_orient_next_step: EXECUTE\n"
+        )
+        assert cp.pre_orient_next_step == "EXECUTE"
+
+    def test_parse_missing_field_defaults_to_empty(self) -> None:
+        """Backward-compat: pre-M36 checkpoints lack the field → empty."""
+        cp = parse_checkpoint(
+            "cycle: 0\nstep: PLAN\nnext_step: PLAN\n"
+        )
+        assert cp.pre_orient_next_step == ""
+
+    def test_parse_rejects_unknown_value(self) -> None:
+        """Invalid pre_orient values are dropped (not silently round-tripped)."""
+        cp = parse_checkpoint(
+            "cycle: 0\nstep: PLAN\nnext_step: ORIENT\n"
+            "pre_orient_next_step: NOT_A_VALID_STEP\n"
+        )
+        assert cp.pre_orient_next_step == ""
+
+    def test_render_emits_field(self) -> None:
+        """render_checkpoint includes pre_orient_next_step in output."""
+        from clou.golden_context import render_checkpoint
+
+        body = render_checkpoint(
+            cycle=0,
+            step="PLAN",
+            next_step="ORIENT",
+            current_phase="",
+            phases_completed=0,
+            phases_total=0,
+            pre_orient_next_step="ASSESS",
+        )
+        assert "pre_orient_next_step: ASSESS\n" in body
+
+    def test_render_rejects_invalid_value(self) -> None:
+        """render_checkpoint validates pre_orient_next_step against vocab."""
+        from clou.golden_context import render_checkpoint
+
+        with pytest.raises(ValueError):
+            render_checkpoint(
+                cycle=0,
+                step="PLAN",
+                next_step="ORIENT",
+                current_phase="",
+                phases_completed=0,
+                phases_total=0,
+                pre_orient_next_step="BOGUS",
+            )
+
+    def test_round_trip(self) -> None:
+        """render → parse preserves pre_orient_next_step exactly.
+
+        M50 I1: ``EXECUTE_REWORK`` and ``EXECUTE_VERIFY`` replace
+        the punctuated legacy forms in the round-trip vocabulary.
+        """
+        from clou.golden_context import render_checkpoint
+
+        for value in (
+            "",
+            "PLAN",
+            "EXECUTE",
+            "EXECUTE_REWORK",
+            "EXECUTE_VERIFY",
+            "ASSESS",
+            "REPLAN",
+            "VERIFY",
+            "EXIT",
+        ):
+            body = render_checkpoint(
+                cycle=1,
+                step="PLAN",
+                next_step="ORIENT",
+                current_phase="",
+                phases_completed=0,
+                phases_total=0,
+                pre_orient_next_step=value,
+            )
+            cp = parse_checkpoint(body)
+            assert cp.pre_orient_next_step == value, (
+                f"Round-trip failed for {value!r}: got "
+                f"{cp.pre_orient_next_step!r}"
+            )
+
+    def test_selfheal_preserves_field(self) -> None:
+        """recovery_selfheal._normalise_checkpoint round-trips the field."""
+        from clou.recovery_selfheal import _normalise_checkpoint
+        from clou.golden_context import render_checkpoint
+
+        original = render_checkpoint(
+            cycle=2,
+            step="ASSESS",
+            next_step="ORIENT",
+            current_phase="impl",
+            phases_completed=0,
+            phases_total=1,
+            pre_orient_next_step="ASSESS",
+        )
+        normalised, _fixes = _normalise_checkpoint(original)
+        cp_after = parse_checkpoint(normalised)
+        assert cp_after.pre_orient_next_step == "ASSESS"
+
+    def test_empty_current_phase_does_not_swallow_next_line(self) -> None:
+        r"""Parser must not greedily consume newlines on empty values.
+
+        Regression guard: a checkpoint with ``current_phase: \n`` (empty
+        value followed by newline) must parse current_phase as empty,
+        NOT as the next line's text. The pre-F2 parser used ``\s*`` for
+        the separator which greedily matched across newlines and
+        captured the next line as the value.
+        """
+        body = (
+            "cycle: 0\n"
+            "step: PLAN\n"
+            "next_step: PLAN\n"
+            "current_phase: \n"
+            "phases_completed: 3\n"
+        )
+        cp = parse_checkpoint(body)
+        assert cp.current_phase == ""
+        assert cp.phases_completed == 3
+
+
+class TestOrientExitRestoration:
+    """F1: ORIENT-exit restoration mutates next_step back after ORIENT.
+
+    The orchestrator's run_coordinator loop contains a pre-dispatch
+    block that, on every iteration AFTER the first-iteration seed,
+    checks whether next_step is still ``"ORIENT"`` with a non-empty
+    pre_orient_next_step stash — and if so, restores next_step to the
+    stashed value and clears the stash. This class exercises the
+    checkpoint-level behaviour the block needs to produce.
+    """
+
+    def test_stash_survives_default_field_addition(self) -> None:
+        """After a render/parse round-trip, stash is available for read."""
+        from clou.golden_context import render_checkpoint
+
+        body = render_checkpoint(
+            cycle=3,
+            step="ASSESS",
+            next_step="ORIENT",
+            current_phase="impl",
+            phases_completed=0,
+            phases_total=2,
+            pre_orient_next_step="EXECUTE",
+        )
+        cp = parse_checkpoint(body)
+        # Simulate restoration: rewrite with next_step=stashed, clear stash.
+        restored = render_checkpoint(
+            cycle=cp.cycle,
+            step=cp.step,
+            next_step=cp.pre_orient_next_step,
+            current_phase=cp.current_phase,
+            phases_completed=cp.phases_completed,
+            phases_total=cp.phases_total,
+            pre_orient_next_step="",
+        )
+        cp_after = parse_checkpoint(restored)
+        assert cp_after.next_step == "EXECUTE"
+        assert cp_after.pre_orient_next_step == ""
+
+    def test_restoration_idempotent_on_empty_stash(self) -> None:
+        """Subsequent iterations see no pending restoration."""
+        from clou.golden_context import render_checkpoint
+
+        body = render_checkpoint(
+            cycle=4,
+            step="EXECUTE",
+            next_step="ASSESS",  # already restored
+            current_phase="impl",
+            phases_completed=1,
+            phases_total=2,
+            pre_orient_next_step="",  # stash already consumed
+        )
+        cp = parse_checkpoint(body)
+        assert cp.next_step == "ASSESS"
+        assert cp.pre_orient_next_step == ""
+
+
+class TestReworkDetectionUsesTypedField:
+    """F18 backcompat: rework detection reads typed field, not raw regex.
+
+    When session-start rewrites next_step=ORIENT, the original rework
+    request (M50 I1: structured ``EXECUTE_REWORK``) is preserved in
+    pre_orient_next_step.  The coordinator's rework-detection block
+    at ~1237-1251 must read the typed field so rework semantics
+    survive M36.
+    """
+
+    def test_rework_survives_orient_rewrite(self) -> None:
+        """Checkpoint with ORIENT+rework-stash preserves rework intent.
+
+        M50 I1 cycle-2 rework (F6/F8/F33/F35): this test calls the
+        production :func:`is_rework_requested` helper so it exercises
+        the actual dispatch predicate the coordinator uses.  The prior
+        version of this test re-implemented the effective-step fallback
+        inline and asserted on a local Python literal, which meant a
+        regression in the production block would not surface here.
+        """
+        from clou.golden_context import render_checkpoint
+        from clou.recovery_checkpoint import is_rework_requested
+
+        body = render_checkpoint(
+            cycle=5,
+            step="ASSESS",
+            next_step="ORIENT",
+            current_phase="impl",
+            phases_completed=0,
+            phases_total=1,
+            pre_orient_next_step="EXECUTE_REWORK",
+        )
+        cp = parse_checkpoint(body)
+        # The production rework-detection helper reads from the parsed
+        # checkpoint: it walks next_step with pre_orient_next_step
+        # fallback and returns True iff the effective step equals
+        # EXECUTE_REWORK.  Calling it here couples the test to
+        # production behaviour rather than asserting a Python literal
+        # is itself.
+        assert is_rework_requested(cp) is True
+
+        # Sanity: if the stash is EXECUTE (not rework), the helper
+        # must return False — the parse-then-helper round-trip MUST
+        # distinguish rework from plain execute.
+        body_plain = render_checkpoint(
+            cycle=5,
+            step="ASSESS",
+            next_step="ORIENT",
+            current_phase="impl",
+            phases_completed=0,
+            phases_total=1,
+            pre_orient_next_step="EXECUTE",
+        )
+        cp_plain = parse_checkpoint(body_plain)
+        assert is_rework_requested(cp_plain) is False
+
+
+# ---------------------------------------------------------------------------
+# M36 round-4 F2 (ORIENT self-reference sink-state hazard)
+# ---------------------------------------------------------------------------
+
+
+class TestPreOrientNextStepOrientSelfReferenceGuard:
+    """F2: ORIENT-into-ORIENT stash is rejected symmetrically with HALTED.
+
+    Without this guard, a poisoned stash of ORIENT creates a sink
+    state: the ORIENT-exit restoration block reads next_step=ORIENT,
+    sees pre_orient_next_step=ORIENT, "restores" next_step to ORIENT
+    over itself, the cycle never advances, and the milestone burns
+    through _MAX_CYCLES.  The render-side guard prevents writing the
+    value; the parse-side guard prevents round-tripping an externally
+    authored malformed file.
+    """
+
+    def test_render_rejects_orient_stash(self) -> None:
+        """render_checkpoint raises ValueError for pre_orient_next_step='ORIENT'."""
+        from clou.golden_context import render_checkpoint
+
+        with pytest.raises(ValueError, match=r"(?i)ORIENT"):
+            render_checkpoint(
+                cycle=1,
+                step="PLAN",
+                next_step="ORIENT",
+                current_phase="",
+                phases_completed=0,
+                phases_total=0,
+                pre_orient_next_step="ORIENT",
+            )
+
+    def test_parse_drops_orient_stash(self) -> None:
+        """parse_checkpoint drops pre_orient_next_step='ORIENT' to empty.
+
+        Mirrors HALTED handling at the same call site — externally
+        authored checkpoints with a self-reference stash must not
+        silently round-trip to the restoration block.
+        """
+        body = (
+            "cycle: 0\n"
+            "step: PLAN\n"
+            "next_step: ORIENT\n"
+            "pre_orient_next_step: ORIENT\n"
+        )
+        cp = parse_checkpoint(body)
+        assert cp.pre_orient_next_step == ""
+
+    def test_halted_stash_still_rejected_after_orient_guard(self) -> None:
+        """Regression: adding the ORIENT guard must not weaken the HALTED guard."""
+        from clou.golden_context import render_checkpoint
+
+        with pytest.raises(ValueError, match=r"(?i)HALTED"):
+            render_checkpoint(
+                cycle=1,
+                step="PLAN",
+                next_step="ORIENT",
+                current_phase="",
+                phases_completed=0,
+                phases_total=0,
+                pre_orient_next_step="HALTED",
+            )
+
+    def test_parse_still_drops_halted_stash(self) -> None:
+        """Regression: HALTED stash still drops to empty."""
+        body = (
+            "cycle: 0\n"
+            "step: PLAN\n"
+            "next_step: ORIENT\n"
+            "pre_orient_next_step: HALTED\n"
+        )
+        cp = parse_checkpoint(body)
+        assert cp.pre_orient_next_step == ""
+
+
+# ---------------------------------------------------------------------------
+# M36 round-4 F4 (selfheal preserves all 15 fields — convergence adjacents)
+# ---------------------------------------------------------------------------
+
+
+class TestSelfhealPreservesAllCheckpointFields:
+    """F4: recovery_selfheal._normalise_checkpoint round-trips ALL 15 fields.
+
+    The prior implementation passed 12 of 15 render_checkpoint kwargs,
+    silently wiping cycle_outcome, valid_findings, and
+    consecutive_zero_valid.  These three fields drive ASSESS
+    convergence and halt-pending-review recovery — losing them
+    produces confident-wrong convergence state.
+    """
+
+    def test_selfheal_preserves_cycle_outcome(self) -> None:
+        """HALTED_PENDING_REVIEW survives a self-heal round-trip."""
+        from clou.recovery_selfheal import _normalise_checkpoint
+        from clou.golden_context import render_checkpoint
+
+        original = render_checkpoint(
+            cycle=5,
+            step="ASSESS",
+            next_step="ORIENT",
+            current_phase="impl",
+            phases_completed=0,
+            phases_total=1,
+            cycle_outcome="HALTED_PENDING_REVIEW",
+            valid_findings=0,
+            consecutive_zero_valid=2,
+            pre_orient_next_step="ASSESS",
+        )
+        normalised, _fixes = _normalise_checkpoint(original)
+        cp_after = parse_checkpoint(normalised)
+        assert cp_after.cycle_outcome == "HALTED_PENDING_REVIEW"
+        assert cp_after.valid_findings == 0
+        assert cp_after.consecutive_zero_valid == 2
+        # And the sibling-F2 field still preserved:
+        assert cp_after.pre_orient_next_step == "ASSESS"
+
+    def test_selfheal_preserves_inconclusive(self) -> None:
+        """INCONCLUSIVE outcome also survives round-trip (no wipe)."""
+        from clou.recovery_selfheal import _normalise_checkpoint
+        from clou.golden_context import render_checkpoint
+
+        original = render_checkpoint(
+            cycle=2,
+            step="EXECUTE",
+            next_step="ASSESS",
+            current_phase="impl",
+            phases_completed=0,
+            phases_total=1,
+            cycle_outcome="INCONCLUSIVE",
+            valid_findings=3,
+            consecutive_zero_valid=0,
+        )
+        normalised, _fixes = _normalise_checkpoint(original)
+        cp_after = parse_checkpoint(normalised)
+        assert cp_after.cycle_outcome == "INCONCLUSIVE"
+        assert cp_after.valid_findings == 3
+        assert cp_after.consecutive_zero_valid == 0
+
+
+# ---------------------------------------------------------------------------
+# M36 round-4 F29 (atomic checkpoint writes)
+# ---------------------------------------------------------------------------
+
+
+class TestAtomicCheckpointWrite:
+    """F29: checkpoint writes must be all-or-nothing on signal/crash.
+
+    Without atomicity, a signal between open() and flush leaves the
+    checkpoint truncated; parse_checkpoint silently defaults missing
+    fields so the truncated file reads as cycle=0, step=PLAN —
+    indistinguishable from a legitimate fresh milestone.  The helper
+    writes to a tmp file in the same dir and os.replace-s into place.
+    """
+
+    def test_atomic_write_final_file_fully_written(self, tmp_path: Path) -> None:
+        """Successful write leaves the target with exact final content."""
+        from clou.coordinator import _atomic_write
+
+        target = tmp_path / "checkpoint.md"
+        final_body = "cycle: 3\nstep: PLAN\nnext_step: ORIENT\n"
+        _atomic_write(target, final_body)
+        assert target.read_text() == final_body
+
+    def test_atomic_write_preserves_prior_content_on_simulated_crash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Mid-write crash keeps the prior content intact (never truncated).
+
+        Simulates a crash between open() and os.replace by patching
+        os.replace to raise; asserts the target's prior content is
+        preserved and no stray tmp file is left behind.
+        """
+        import os
+        from clou.coordinator import _atomic_write
+
+        target = tmp_path / "checkpoint.md"
+        prior = "cycle: 0\nstep: PLAN\nnext_step: PLAN\n"
+        target.write_text(prior)
+        mid_write_body = "cycle: 1\nstep: EXECUTE\nnext_step: ASSESS\n"
+
+        def _boom(src: str, dst: str) -> None:
+            raise OSError("simulated mid-rename crash")
+
+        monkeypatch.setattr(os, "replace", _boom)
+        with pytest.raises(OSError, match="simulated mid-rename crash"):
+            _atomic_write(target, mid_write_body)
+
+        # Prior content survives — truncation did NOT occur.
+        assert target.read_text() == prior
+        # No stray tmp file (the helper cleans up its own temp).
+        tmp_files = list(tmp_path.glob(".checkpoint.md.*.tmp"))
+        assert tmp_files == [], (
+            f"atomic_write left temp files behind: {tmp_files}"
+        )
+
+    def test_atomic_write_new_file_or_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """On a fresh write (no prior file), mid-write crash → no file at all."""
+        import os
+        from clou.coordinator import _atomic_write
+
+        target = tmp_path / "fresh.md"
+
+        def _boom(src: str, dst: str) -> None:
+            raise OSError("rename failed")
+
+        monkeypatch.setattr(os, "replace", _boom)
+        with pytest.raises(OSError):
+            _atomic_write(target, "content")
+
+        assert not target.exists()
+        tmp_files = list(tmp_path.glob(".fresh.md.*.tmp"))
+        assert tmp_files == []

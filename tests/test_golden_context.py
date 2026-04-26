@@ -66,8 +66,14 @@ class TestRenderCheckpoint:
         assert errors == []
 
     def test_all_valid_next_steps(self) -> None:
-        for ns in ("PLAN", "EXECUTE", "EXECUTE (rework)", "ASSESS",
-                    "VERIFY", "EXIT", "COMPLETE", "none"):
+        # M50 I1 cycle-3 rework (F4/F15): structured
+        # ``EXECUTE_REWORK`` / ``EXECUTE_VERIFY`` tokens replace the
+        # punctuated legacy forms in the ``VALID_NEXT_STEPS``
+        # vocabulary, and ``'none'`` is no longer a valid write-time
+        # value — it is parse-only legacy tolerance, tested separately
+        # in :meth:`test_none_next_step_parse_only_tolerance`.
+        for ns in ("PLAN", "EXECUTE", "EXECUTE_REWORK", "EXECUTE_VERIFY",
+                    "ASSESS", "VERIFY", "EXIT", "COMPLETE"):
             content = render_checkpoint(cycle=1, step="PLAN", next_step=ns)
             findings = validate_checkpoint(content)
             errors = [f for f in findings if f.severity == Severity.ERROR]
@@ -109,7 +115,13 @@ class TestRenderCheckpoint:
 class TestRenderStatus:
 
     def test_minimal(self) -> None:
-        content = render_status(milestone="auth", phase="impl", cycle=1)
+        # M50 I1 cycle-4 rework (F20): render_status requires an
+        # explicit valid next_step.  The former empty-default
+        # silent-tolerance pattern was removed; callers must name
+        # "no dispatch scheduled" via an actual vocabulary token.
+        content = render_status(
+            milestone="auth", phase="impl", cycle=1, next_step="PLAN",
+        )
         assert "# Status: auth" in content
         assert "## Current State" in content
         assert "phase: impl" in content
@@ -136,18 +148,56 @@ class TestRenderStatus:
         assert errors == []
 
     def test_minimal_passes_validation(self) -> None:
-        content = render_status(milestone="auth", phase="impl", cycle=1)
+        # M50 I1 cycle-4 rework (F20): explicit next_step required.
+        content = render_status(
+            milestone="auth", phase="impl", cycle=1, next_step="PLAN",
+        )
         findings = validate_status_checkpoint(content)
         errors = [f for f in findings if f.severity == Severity.ERROR]
         assert errors == []
 
     def test_with_notes(self) -> None:
+        # M50 I1 cycle-4 rework (F20): explicit next_step required.
         content = render_status(
-            milestone="auth", phase="impl", cycle=1,
+            milestone="auth", phase="impl", cycle=1, next_step="PLAN",
             notes="Rework needed for F3.",
         )
         assert "## Notes" in content
         assert "Rework needed" in content
+
+
+    def test_render_status_rejects_empty_next_step(self) -> None:
+        """M50 I1 cycle-4 rework (F20): empty next_step is NOT a silent sentinel.
+
+        The prior ``if next_step and next_step not in VALID_NEXT_STEPS``
+        short-circuit let ``render_status(next_step="")`` slip through
+        validation — preserving the same silent-tolerance pattern
+        that cycle-3's ``"none"`` narrowing was trying to eliminate.
+        The "No silent coerce" requirement extends to render-path,
+        not just parse-path.
+
+        Now: empty-string fails the same as any other invalid value.
+        Callers must supply an explicit vocabulary token; "no
+        dispatch scheduled" is named, not implicit.
+        """
+        with pytest.raises(ValueError, match="invalid next_step"):
+            render_status(
+                milestone="auth", phase="impl", cycle=1, next_step="",
+            )
+
+
+    def test_render_status_rejects_default_next_step(self) -> None:
+        """M50 I1 cycle-4 rework (F20): the signature default is an error.
+
+        The function signature still has ``next_step: str = ""`` for
+        backward-compatible keyword invocation.  The default itself
+        is no longer a silent pass-through — callers that omit the
+        keyword trigger the same ValueError as
+        ``next_step="FOOBAR"`` would.  Pins the contract: empty
+        string is NOT allowed via default OR explicit argument.
+        """
+        with pytest.raises(ValueError, match="invalid next_step"):
+            render_status(milestone="auth", phase="impl", cycle=1)
 
 
 # ---------------------------------------------------------------------------
@@ -264,12 +314,28 @@ class TestCheckpointParserRoundTrip:
         assert cp.cycle == 0
         assert cp.next_step == "PLAN"
 
-    def test_none_next_step_round_trip(self) -> None:
-        """'none' next_step is converted to 'COMPLETE' by parse_checkpoint."""
+    def test_none_next_step_parse_only_tolerance(self) -> None:
+        """M50 I1 cycle-3 rework (F4/F15): 'none' is parse-only legacy tolerance.
+
+        ``render_checkpoint(next_step='none')`` now raises ``ValueError``;
+        ``parse_checkpoint`` coerces legacy ``next_step: none`` inputs
+        (e.g., from pre-M50 on-disk checkpoints) to ``COMPLETE`` so
+        trajectories resume, but new writes MUST use ``COMPLETE``
+        directly.  This test proves both halves of the one-way
+        tolerance: (a) render rejects, (b) parse coerces.
+        """
         from clou.recovery import parse_checkpoint
 
-        content = render_checkpoint(cycle=5, step="EXIT", next_step="none")
-        cp = parse_checkpoint(content)
+        # Render rejects 'none' at write time.
+        with pytest.raises(ValueError, match="invalid next_step 'none'"):
+            render_checkpoint(cycle=5, step="EXIT", next_step="none")
+
+        # Parse still coerces legacy 'none' inputs to COMPLETE so
+        # existing on-disk checkpoints (pre-M50) resume trajectory.
+        legacy_content = (
+            "cycle: 5\nstep: EXIT\nnext_step: none\ncurrent_phase: \n"
+        )
+        cp = parse_checkpoint(legacy_content)
         assert cp.next_step == "COMPLETE"
 
 
@@ -284,10 +350,13 @@ class TestInputValidation:
         with pytest.raises(ValueError, match="invalid phase status"):
             render_status(
                 milestone="m1", phase="impl", cycle=1,
+                next_step="PLAN",
                 phase_progress={"impl": "YOLO"},
             )
 
     def test_status_rejects_negative_cycle(self) -> None:
+        # cycle-validation short-circuits before next_step-validation,
+        # so no explicit next_step needed here.
         with pytest.raises(ValueError, match="non-negative"):
             render_status(milestone="m1", phase="impl", cycle=-1)
 

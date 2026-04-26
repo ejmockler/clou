@@ -108,6 +108,24 @@ _CHECKPOINT_OPTIONAL_KEYS = frozenset(
         "valid_findings", "consecutive_zero_valid",
     }
 )
+
+# M36 I1 (F2 rework): typed ORIENT-restoration stash field.  Recognized
+# but NOT in _CHECKPOINT_OPTIONAL_KEYS — its absence must not produce a
+# "missing" warning because backward-compat checkpoints (pre-M36) never
+# carried it and empty string is the canonical "no pending restoration"
+# signal.  Validated in-place below when present.
+_CHECKPOINT_RECOGNIZED_OPTIONAL_KEYS = _CHECKPOINT_OPTIONAL_KEYS | frozenset({
+    "pre_orient_next_step",
+    # M49b B6: halt-stash mirror of pre_orient_next_step.  Backward-compat
+    # checkpoints (pre-M49b) never carried it; empty string is the canonical
+    # "no halt restoration pending" signal.  Validated in-place where
+    # render_checkpoint is called.
+    "pre_halt_next_step",
+    # M52 F38/F41: phase-acceptance verdict.  Pre-M52 checkpoints
+    # never carried it; the parser treats absent OR literal ``none`` as
+    # ``None``.  Wire format validated by ``parse_checkpoint``.
+    "last_acceptance_verdict",
+})
 _CHECKPOINT_ALIASES: dict[str, str] = {"phase": "current_phase"}
 
 
@@ -421,7 +439,11 @@ def validate_checkpoint(content: str) -> list[ValidationFinding]:
     prefix = "active/coordinator.md"
 
     fields: dict[str, str] = {}
-    for match in re.finditer(r"(?m)^(\w[\w_]*):\s*(.+)$", content):
+    # M36 F2: use ``[ \t]*`` + ``.*`` so an empty value like
+    # ``current_phase: \n`` parses as empty and does not greedily
+    # consume the next line (which would mis-flag the next field
+    # as missing).
+    for match in re.finditer(r"(?m)^(\w[\w_]*):[ \t]*(.*)$", content):
         fields[match.group(1)] = match.group(2).strip()
 
     # Resolve aliases (e.g. phase -> current_phase) for downstream checks.
