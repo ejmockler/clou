@@ -3,7 +3,10 @@
 Creates timestamped markdown escalation files for cycle-limit, agent-crash,
 validation-failure, and staleness conditions.
 
-Internal module -- import from clou.recovery for public API.
+Internal module -- import from clou.recovery for public API.  All
+writers emit canonical :class:`clou.escalation.EscalationForm` layout
+via :func:`clou.escalation.render_escalation` --- see DB-21 drift-class
+remolding recipe.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from clou.escalation import EscalationForm, EscalationOption, render_escalation
 from clou.recovery_checkpoint import _validate_milestone
 
 
@@ -20,6 +24,57 @@ def _escalation_dir(project_dir: Path, milestone: str) -> Path:
     d = project_dir / ".clou" / "milestones" / milestone / "escalations"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _recovery_exclusive_write(
+    *,
+    esc_dir: Path,
+    base_stem: str,
+    content: str,
+) -> Path:
+    """Exclusive-create an escalation file, suffixing ``-N`` on collision.
+
+    F5 (cycle 2): recovery writers used to call ``path.write_text`` which
+    silently overwrote a same-second same-slug file.  During an
+    escalation storm (coordinator retry loop with staleness detection)
+    that dropped every event but the last.  We now open with
+    ``mode='x'`` (O_EXCL) and retry with ``-1``, ``-2``, ... on
+    ``FileExistsError`` --- mirroring the pattern the coordinator MCP
+    tool uses in :func:`clou.coordinator_tools._exclusive_write`.
+
+    *base_stem* is the ``{timestamp}-{slug}`` prefix; this function
+    owns the ``-N.md`` suffix logic.  Kept local (not an import from
+    ``clou.coordinator_tools``) to preserve the recovery module's
+    independence from the MCP tool surface --- recovery writers still
+    bypass the hook layer and MUST keep functioning even if
+    coordinator tooling is broken during failure recovery.
+    """
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    primary = esc_dir / f"{base_stem}.md"
+    try:
+        with open(primary, mode="x", encoding="utf-8") as fh:
+            fh.write(content)
+        return primary
+    except FileExistsError:
+        pass
+    suffix = 1
+    while True:
+        candidate = esc_dir / f"{base_stem}-{suffix}.md"
+        try:
+            with open(candidate, mode="x", encoding="utf-8") as fh:
+                fh.write(content)
+            return candidate
+        except FileExistsError:
+            suffix += 1
+            if suffix > 999:
+                # In practice this cannot happen --- it would require
+                # 1000 collisions within one second.  Surface as a
+                # RuntimeError (recovery path has no structured-error
+                # contract like the MCP handler does).
+                raise RuntimeError(
+                    "exhausted slug suffix range for recovery slug "
+                    f"{base_stem!r}"
+                )
 
 
 def _write_escalation(
@@ -34,38 +89,45 @@ def _write_escalation(
     options: list[str],
     recommendation: str,
 ) -> Path:
-    """Write a structured escalation markdown file and return its path."""
+    """Write a structured escalation markdown file and return its path.
+
+    Routes through :func:`clou.escalation.render_escalation` so every
+    in-process emitter produces canonical form.  Options arrive as plain
+    strings here (the public API surface predates the form schema); we
+    wrap each in an :class:`EscalationOption` with an empty description
+    to preserve the legacy plain-numbered rendering that the recovery
+    writers have always produced.
+
+    F5 (cycle 2): writes via :func:`_recovery_exclusive_write` to
+    prevent same-second same-slug collisions under an escalation storm
+    (cycle-limit retry-loop with staleness detection firing at the
+    same second).
+    """
     now = datetime.now(UTC)
     ts = now.strftime("%Y%m%d-%H%M%S")
     iso_filed = now.isoformat()
-    options_block = "\n".join(f"{i}. {opt}" for i, opt in enumerate(options, 1))
-    content = (
-        f"# Escalation: {title}\n"
-        f"\n"
-        f"**Classification:** {classification}\n"
-        f"**Filed:** {iso_filed}\n"
-        f"\n"
-        f"## Context\n"
-        f"{context}\n"
-        f"\n"
-        f"## Issue\n"
-        f"{issue}\n"
-        f"\n"
-        f"## Evidence\n"
-        f"{evidence}\n"
-        f"\n"
-        f"## Options\n"
-        f"{options_block}\n"
-        f"\n"
-        f"## Recommendation\n"
-        f"{recommendation}\n"
-        f"\n"
-        f"## Disposition\n"
-        f"status: open\n"
+
+    form = EscalationForm(
+        title=title,
+        classification=classification,
+        filed=iso_filed,
+        context=context,
+        issue=issue,
+        evidence=evidence,
+        options=tuple(EscalationOption(label=opt) for opt in options),
+        recommendation=recommendation,
+        disposition_status="open",
     )
-    path = _escalation_dir(project_dir, milestone) / f"{ts}-{slug}.md"
-    path.write_text(content)
-    return path
+    content = render_escalation(form)
+    esc_dir = _escalation_dir(project_dir, milestone)
+    # F5 (cycle 2): exclusive-create + ``-N`` suffix retry on collision.
+    # F21 (cycle 1): explicit UTF-8 encoding to match the sibling MCP
+    # writer and avoid UnicodeEncodeError on non-UTF-8 locales.
+    return _recovery_exclusive_write(
+        esc_dir=esc_dir,
+        base_stem=f"{ts}-{slug}",
+        content=content,
+    )
 
 
 async def write_cycle_limit_escalation(
