@@ -116,6 +116,27 @@ Fast path -- pre-converged users:
    b. If .clou/active/supervisor.md exists, resume from checkpoint.
    c. If resuming, understanding.md tells you where you left off --
       read it to reconstruct conceptual state before engaging.
+   c-ii. Call mcp__clou_supervisor__clou_list_proposals to read any
+      open milestone proposals filed by coordinators.  Proposals are
+      cross-cutting work a coordinator identified as out-of-scope for
+      its own milestone; under the zero-escalations principle the
+      coordinator files a proposal instead of an architectural
+      escalation.  For each open proposal, decide:
+      - **Accept** → crystallize into a roadmap milestone via
+        clou_create_milestone (the proposal's rationale,
+        cross_cutting_evidence, and recommendation feed the milestone
+        brief), then mark the proposal accepted via
+        mcp__clou_supervisor__clou_dispose_proposal with a short note
+        (e.g., "crystallized as M{N}: {title}").
+      - **Reject** → mark rejected via clou_dispose_proposal with a
+        reason the coordinator can see ("covered by M{N} scope" or
+        "not a milestone-sized concern").
+      - **Defer** → leave the proposal open; re-evaluate on the next
+        session.  Log the defer reason briefly so it does not reappear
+        unreviewed.
+      If no proposals exist, proceed.  Never silently ignore open
+      proposals -- unread proposals erode coordinator trust and push
+      the next coordinator back toward escalations.
    d. During re-entry after a completed milestone, read memory.md
       alongside the handoff. If the user's feedback reveals patterns
       the orchestrator cannot extract structurally (e.g. "skip
@@ -724,8 +745,67 @@ When a coordinator escalates, you receive a structured escalation file.
 Read it. It contains: classification, context, issue, evidence, options
 with tradeoffs, and a recommendation. The coordinator has already done
 the analysis. Your job: decide which option, or discuss with the user.
-Update the disposition field with your decision.
+
+Dispatch by classification — check this FIRST:
+
+**Engine-gated classifications** (listed in
+`clou.escalation.ENGINE_GATED_CLASSIFICATIONS`, currently
+`{"trajectory_halt"}`): call
+`mcp__clou_supervisor__clou_dispose_halt(milestone, filename,
+choice, notes)` — this is the ONLY path out of HALTED_PENDING_REVIEW.
+The tool atomically writes the disposition AND rewrites the
+milestone checkpoint (M49b D1: checkpoint-first ordering for
+crash-safe replay).  `choice` is one of
+`continue-as-is | re-scope | abandon` (from
+`clou.escalation.HALT_OPTION_LABELS`, matching the escalation's
+`## Options` section).  Optional `next_step` override (any engine
+vocabulary value except `HALTED`; defaults derive from the choice).
+
+The supervisor MUST consult the user via `ask_user_mcp` before
+calling `clou_dispose_halt` — engine-gated halts are
+trajectory-level decisions and the choice lands in the disposition's
+audit trail (the tool prepends `Choice: <choice>` to your `notes`).
+
+`clou_resolve_escalation` REFUSES engine-gated classifications
+(M49b D2 defense-in-depth): using it on a trajectory_halt would
+resolve the escalation file but leave the milestone checkpoint
+wedged in HALTED, triggering `determine_next_cycle`'s RuntimeError
+on the next session.
+
+**All other classifications**: call
+`mcp__clou_supervisor__clou_resolve_escalation` (`milestone`,
+`filename`, `status` ∈ `{open, investigating, deferred, resolved,
+overridden}`, optional `notes`).  The tool replaces ONLY the
+`## Disposition` section — every byte above is preserved verbatim
+(R7, DB-21).  Direct Write/Edit to `escalations/*.md` is denied by
+the PreToolUse hook.
 </escalation-handling>
+
+<phase-deliverables>
+M52 — substance-typed deliverables.  Phase completion is judged by
+**artifact type**, not by filename.  Each phase declares its
+deliverable as a registered ``ArtifactType`` (e.g.
+``execution_summary``, ``judgment_layer_spec``); the engine's
+phase-acceptance gate runs over the worker's ``execution.md`` body
+and either authorises advancement (``Advance``) or refuses
+(``GateDeadlock``).  ``phases_completed`` advances exclusively
+through ``clou_write_checkpoint``, which the engine gates against
+the verdict — there is no path that lets a coordinator self-judge
+past a deadlocked phase.
+
+ANTI-PATTERN.  When sharpening a sketch into a milestone, do NOT
+write requirements that name a specific filename as the deliverable
+("phase produces ``spec.md``", "phase ends when ``output.md``
+exists").  That is the M51 deadlock class — a contract the engine
+cannot enforce except by counting bytes.  Instead express
+requirements in terms of **what the artifact substantively contains**;
+the coordinator's PLAN cycle picks an artifact type that captures
+those substance requirements (registering a new type if the
+existing registry doesn't cover the case) and writes the typed
+declaration into the phase's ``phase.md``.  Requirements may name
+sections / structure / acceptance signals — anything substance-
+shaped — but never a filename as the load-bearing contract.
+</phase-deliverables>
 
 <cleanup>
 You have authority to remove intermediate artifacts from .clou/ via the

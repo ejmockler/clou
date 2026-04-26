@@ -55,6 +55,7 @@ def build_cycle_prompt(
     working_tree_state: str | None = None,
     current_phase: str | None = None,
     routing_context: dict[str, Any] | None = None,
+    cycle_num: int | None = None,
 ) -> str:
     """Construct targeted prompt for a single cycle.
 
@@ -68,22 +69,74 @@ def build_cycle_prompt(
         f"- .clou/{f}" if f in ("project.md", "memory.md") else f"- {milestone_prefix}/{f}"
         for f in read_set
     )
-    protocol_file = str(_BUNDLED_PROMPTS / f"coordinator-{cycle_type.lower()}.md")
+    # M50 I1 cycle-4 rework (F5): ``determine_next_cycle`` preserves the
+    # structured cycle-type discriminator (``EXECUTE_REWORK`` /
+    # ``EXECUTE_VERIFY``) through dispatch, so ``cycle_type.lower()``
+    # produces ``"execute_rework"`` / ``"execute_verify"`` — file names
+    # that do NOT exist under ``clou/_prompts/``.  The EXECUTE family
+    # shares a single protocol file (``coordinator-execute.md``); only
+    # the telemetry discriminator differs.  Route every EXECUTE-family
+    # token through the ``execute`` protocol stem to preserve the
+    # runtime contract that every dispatchable cycle type resolves to
+    # a real prompt file.  Structural existence test lives in
+    # ``tests/test_prompts.py``.
+    from clou.recovery_checkpoint import is_execute_family
+    if is_execute_family(cycle_type):
+        protocol_stem = "execute"
+    else:
+        protocol_stem = cycle_type.lower()
+    protocol_file = str(_BUNDLED_PROMPTS / f"coordinator-{protocol_stem}.md")
 
     # Resolved write paths — the exact paths the agent must use.
     # Protocol files say WHAT to write; the cycle prompt says WHERE.
-    write_paths = [
-        f"- {milestone_prefix}/active/coordinator.md  (checkpoint)",
-        f"- {milestone_prefix}/status.md  (progress journal)",
-    ]
     phase_name = current_phase or "{phase}"
+    if cycle_type == "ORIENT":
+        # M36 I1: ORIENT writes exactly one artifact — the cycle-
+        # specific judgment file. It does NOT touch the checkpoint
+        # (the session-start rewrite happens in run_coordinator
+        # BEFORE dispatch, and the post-ORIENT restore happens
+        # AFTER dispatch), and it does NOT touch status.md or
+        # decisions.md. Listing only the judgment path keeps the
+        # per-tier permission model honest: ORIENT cycles own this
+        # single file and nothing else.
+        #
+        # Writes route through mcp__clou_coordinator__clou_write_judgment
+        # per DB-14 ArtifactForm pattern (hook_and_permissions phase
+        # denies direct Write to this path). The path still appears in
+        # write_paths so readers of the prompt know the expected
+        # artifact destination.
+        if cycle_num is not None and cycle_num > 0:
+            judgment_rel = f"judgments/cycle-{cycle_num:02d}-judgment.md"
+        else:
+            # Without an explicit cycle_num we fall back to a
+            # template-like path so the coordinator can still see what
+            # filename shape it owns. The MCP tool formats the path
+            # from its own ``cycle`` argument at write time, so the
+            # prompt text is purely informational here.
+            judgment_rel = "judgments/cycle-{cycle:02d}-judgment.md"
+        write_paths = [
+            f"- {milestone_prefix}/{judgment_rel}  (judgment artifact — "
+            f"write via mcp__clou_coordinator__clou_write_judgment)",
+        ]
+    else:
+        write_paths = [
+            f"- {milestone_prefix}/active/coordinator.md  (checkpoint)",
+            f"- {milestone_prefix}/status.md  (progress journal)",
+        ]
+    # M50 I1 cycle-2 rework (F5/F12): cycle_type may be ``EXECUTE``,
+    # ``EXECUTE_REWORK``, or ``EXECUTE_VERIFY`` — all three dispatch
+    # an EXECUTE-family phase (agent writes to
+    # ``phases/{phase}/execution.md``).  Check the family so the
+    # write-path block fires on any of them.
+    # (``is_execute_family`` already imported above for the protocol
+    # stem derivation.)
     if cycle_type == "PLAN":
         write_paths += [
             f"- {milestone_prefix}/compose.py  (task graph)",
             f"- {milestone_prefix}/decisions.md  (judgment log)",
             f"- {milestone_prefix}/phases/{{phase}}/phase.md  (phase specs — one per phase you create)",
         ]
-    elif cycle_type == "EXECUTE":
+    elif is_execute_family(cycle_type):
         # List execution.md write paths for all phases in the current
         # layer so the coordinator knows which files workers will produce.
         if dag_data is not None and current_phase:
@@ -133,7 +186,7 @@ def build_cycle_prompt(
         f"Execute the {cycle_type} protocol."
     )
 
-    if dag_data is not None and cycle_type == "EXECUTE":
+    if dag_data is not None and is_execute_family(cycle_type):
         tasks_list, deps_dict = dag_data
         layers = _compute_layers(tasks_list, deps_dict)
         prompt += (
@@ -147,7 +200,10 @@ def build_cycle_prompt(
 
     # Extract intent→task mapping from compose.py docstrings.
     # Shared between EXECUTE (for dispatch) and ASSESS (for per-intent evaluation).
-    if cycle_type in ("EXECUTE", "ASSESS"):
+    # M50 I1 cycle-3 rework (F3): widen to the EXECUTE family
+    # (EXECUTE, EXECUTE_REWORK, EXECUTE_VERIFY).  Parallel to the
+    # DAG-context gate above which already uses ``is_execute_family``.
+    if is_execute_family(cycle_type) or cycle_type == "ASSESS":
         intent_map: dict[str, list[str]] = {}
         compose_path = (
             project_dir / ".clou" / "milestones" / milestone / "compose.py"

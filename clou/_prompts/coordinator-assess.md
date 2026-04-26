@@ -70,9 +70,17 @@ Determine: rework needed, phase complete, or escalation required.
    If the finding trajectory across assessment rounds shows convergence
    (consecutive rounds at terminal stage per calibrated pattern — e.g.,
    bugs→edge cases→test gaps→stop), you may suppress the brutalist
-   dispatch. Write a `### Convergence:` entry in decisions.md with the
-   trajectory and reasoning. Do not suppress before at least 2 assessment
-   rounds have completed.
+   dispatch. You MUST write a `### Convergence:` entry in decisions.md
+   for the current cycle **before** the cycle ends, with the trajectory
+   and reasoning. Do not suppress before at least 2 assessment rounds
+   have completed.
+
+   This is runtime-detected: the gate telemetry looks for the
+   `### Convergence:` heading in the current cycle's decisions.md
+   section.  If the heading is missing, the gate is recorded as
+   `drift_skipped` — not `converged` — and the telemetry flags the
+   cycle for review.  A missing convergence entry is a correctness
+   failure on your part, not a suppression.
 
 4. Dispatch the assessor-evaluator. The evaluator classifies findings
    cold — reading assessment.md, not discovering new issues.
@@ -92,13 +100,48 @@ Determine: rework needed, phase complete, or escalation required.
 
    Classify each finding using this schema:
 
-   | Classification | Action               | Criteria                                              |
-   |----------------|----------------------|-------------------------------------------------------|
-   | valid          | Create rework task   | Finding is correct, in scope, fix is proportionate     |
-   | noise          | Document dismissal   | Out of scope, stylistic, or fix cost exceeds value     |
-   | architectural  | Write escalation     | Valid but beyond coordinator authority                  |
-   | security       | Always valid         | Security findings never classified as noise             |
-   | convergence    | Suppress gate        | Finding trajectory plateaued; diminishing returns       |
+   | Classification    | Action                                      | Criteria                                                                |
+   |-------------------|---------------------------------------------|-------------------------------------------------------------------------|
+   | valid             | Create rework task                          | Finding is correct, in scope, fix is proportionate                      |
+   | noise             | Document dismissal                          | Out of scope, stylistic, or fix cost exceeds value                      |
+   | architectural     | **Propose follow-up milestone** OR escalate | Valid but beyond current milestone scope                                |
+   | security          | Always valid                                | Security findings never classified as noise                             |
+   | convergence       | Suppress gate                               | Finding trajectory plateaued; diminishing returns                       |
+   | trajectory_halt   | **Halt milestone** via `clou_halt_trajectory` | F28-class: same findings re-surface across cycles; file mtimes confirm zero production change; anti-fix pattern flagged |
+
+   **architectural routing (zero-escalations rule):**
+   - Default: file a **milestone proposal** via `clou_propose_milestone`
+     (cross-cutting work that belongs to a future milestone). The
+     supervisor dispositions proposals by crystallizing, rejecting, or
+     deferring them.
+   - Exception: file an **escalation** via `clou_file_escalation` only
+     when the finding is a TRUE in-milestone blocker that requires a
+     human decision you cannot make. Escalations are the fallback
+     channel, not the default.
+
+   **trajectory_halt routing (M49b engine-gated halt):**
+   - Use ONLY when the evaluator has classified a finding as
+     `trajectory_halt`. Criteria are strict: (a) the current cycle's
+     findings substantially overlap with the prior cycle's (24+ of 28
+     are re-surfaces, not new bugs), AND (b) `git log --stat` or file
+     mtimes confirm zero production change in the owning modules since
+     prior cycle, AND (c) brutalist output names an "anti-fix" pattern
+     (tests pinning broken behaviour as contract).
+   - Action: invoke `clou_halt_trajectory(reason, rationale,
+     evidence_paths, proposal_ref?, cycle_num)`. The tool files a
+     structured escalation that the engine's pre-dispatch gate honours
+     on the next cycle iteration (M49b).
+   - **After the halt tool returns success, your ONLY remaining
+     action MUST be `clou_write_checkpoint` with
+     `cycle_outcome=HALTED_PENDING_REVIEW` and `next_step=HALTED`,
+     then exit the cycle.** Do not invoke other tools. Do not dispatch
+     further workers. Do not update decisions.md beyond a one-line
+     `### Halt:` entry. The supervisor disposes the halt via
+     `clou_dispose_halt` (M49b: engine-gated, rewrites the checkpoint
+     atomically out of HALTED — `clou_resolve_escalation` is refused
+     for these classifications) after consulting the user; the next
+     dispatch restores the appropriate downstream state per the user's
+     choice (continue-as-is / re-scope / abandon).
 
    Write classified results back to:
    - .clou/milestones/{{milestone}}/assessment.md
@@ -125,12 +168,41 @@ Determine: rework needed, phase complete, or escalation required.
      quote), action taken, reasoning.
    - noise: document dismissal. Log the finding, reasoning for
      override.
-   - architectural: write escalation. Issue beyond coordinator
-     authority.
+   - architectural: route per the zero-escalations rule.
+     Default → file proposal via `clou_propose_milestone` (pass
+     title, rationale, cross_cutting_evidence, cycle_num, and optional
+     estimated_scope / depends_on / recommendation). Exception →
+     file escalation only for true in-milestone blockers needing a
+     human decision.
    - security: always create rework task. Security findings are
      never classified as noise.
+   - trajectory_halt: invoke `clou_halt_trajectory`. Provide a
+     short machine reason (`anti_convergence` / `scope_mismatch` /
+     `irreducible_blocker`), a free-text rationale citing the
+     re-surface counts + file mtimes, evidence_paths pointing to
+     the relevant assessment.md line range, cycle_num, and an
+     optional proposal_ref if you've already filed a follow-up
+     proposal. Log a one-line `### Halt: {finding title}` entry
+     in decisions.md, then skip the remainder of this step and go
+     directly to step 8 for a halt-checkpoint write.
    Cross-model agreement strengthens the case. Single-model findings
    deserve more scrutiny.
+
+   Example invocation:
+   ```
+   clou_halt_trajectory(
+     reason="anti_convergence",
+     rationale="Round 3 ASSESS produced 28 findings; 24 are re-surfaces of cycle-1 items with file mtimes confirming zero production change. Five new findings are anti-fix tests pinning the broken behaviour as contract. Three-model convergence across codex+claude+gemini.",
+     evidence_paths=["milestones/{milestone}/assessment.md:277-288"],
+     proposal_ref="proposals/phase-owner-affinity.md",
+     cycle_num={current_cycle}
+   )
+   ```
+
+   Wrong-path anti-example: invoking `clou_halt_trajectory` and
+   then continuing to dispatch rework workers "to make one more
+   attempt" is exactly the pathology the halt exists to prevent.
+   Land the halt, checkpoint-and-exit, let the supervisor dispose.
 
 8. Write checkpoint (path in cycle prompt):
      cycle: {current cycle number}
@@ -141,12 +213,38 @@ Determine: rework needed, phase complete, or escalation required.
      phases_completed: {from routing context + layer_size if advancing}
      phases_total: {from routing context}
 
+   **Phase advancement is gated by the engine's verdict (M52 F32).**
+   The engine runs `check_phase_acceptance` at the start of each
+   ASSESS cycle and persists a `last_acceptance_verdict` field in the
+   checkpoint envelope.  You do NOT decide whether the phase is
+   complete; you read the verdict and route.  The
+   `clou_write_checkpoint` tool refuses an advancing
+   `phases_completed` write that does not match an `Advance` verdict
+   for the current phase — there is no way to bypass this; do not
+   try.  Legacy phases without a typed deliverable take a one-shot
+   bootstrap grace (F41 migration shim) — that is engine-managed,
+   not your concern.
+
    next_step routing:
-   - If rework needed: next_step: EXECUTE (rework)
-   - If phase complete and more phases remain: advance current_phase,
-     increment phases_completed, next_step: EXECUTE
-   - If all phases complete: next_step: VERIFY
+   - If rework needed: next_step: EXECUTE_REWORK
+   - If gate verdict is `Advance` and more phases remain: advance
+     current_phase to the next layer, increment phases_completed by
+     one, next_step: EXECUTE.
+   - If gate verdict is `Advance` and all phases complete:
+     next_step: VERIFY.
+   - If gate verdict is `GateDeadlock`: do NOT advance; the body
+     failed the typed-deliverable contract.  Treat as rework
+     (`next_step: EXECUTE_REWORK`) when the deadlock is recoverable
+     (worker can re-emit valid execution.md), or escalate via
+     `clou_halt_trajectory` when the deadlock is structural (the
+     declared type is wrong, or the worker cannot produce the typed
+     output).  GateDeadlock NEVER permits an advance.
    - If blocked: write escalation, next_step depends on severity.
+   - **If halted (`clou_halt_trajectory` fired in step 7):**
+     `next_step: HALTED`, `cycle_outcome: HALTED_PENDING_REVIEW`.
+     Do not advance `current_phase` or `phases_completed` — the
+     supervisor restores state on disposition. Do not dispatch any
+     further agents. Exit immediately after the checkpoint write.
 
 9. Update status.md with phase progress.
 </procedure>
@@ -169,11 +267,17 @@ decisions.md entries (newest cycle first):
 **Action:** Dismissed — no changes
 **Reasoning:** {why this finding does not warrant action}
 
-### Architectural: {finding title}
+### Architectural (Proposal): {finding title}
 **Finding:** "{exact finding from assessment.md}"
 **Classification:** architectural
-**Action:** Escalation written
-**Reasoning:** {why this exceeds coordinator authority}
+**Action:** Proposal filed via clou_propose_milestone: {proposal title}
+**Reasoning:** {why this is cross-cutting and belongs to a future milestone}
+
+### Architectural (Escalation): {finding title}
+**Finding:** "{exact finding from assessment.md}"
+**Classification:** architectural
+**Action:** Escalation written — in-milestone blocker
+**Reasoning:** {why this is a true in-milestone blocker needing human decision, not a cross-cutting proposal}
 
 ### Security: {finding title}
 **Finding:** "{exact finding from assessment.md}"

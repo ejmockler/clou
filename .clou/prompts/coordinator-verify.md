@@ -30,7 +30,13 @@ handoff.
    - Accept (experience issue): create rework EXECUTE task. Log finding,
      action, reasoning.
    - Override: no changes. Log finding, reasoning for override.
-   - Escalate: issue beyond coordinator authority.
+   - Cross-cutting architectural: file a **milestone proposal** via
+     `clou_propose_milestone` (default for architectural findings
+     that belong to a future milestone). Do NOT escalate; the
+     supervisor dispositions proposals.
+   - In-milestone blocker: file escalation via `clou_file_escalation`
+     only for true blockers that require a human decision you
+     cannot make. Escalations are the fallback, not the default.
 7. Call clou_write_checkpoint:
      cycle: {current cycle number}
      step: VERIFY
@@ -41,10 +47,13 @@ handoff.
 
    next_step routing:
    - If code/experience rework needed: regress to implementation phase,
-     next_step: EXECUTE (rework)
-   - If perception gap: next_step: EXECUTE (additional verification)
+     next_step: EXECUTE_REWORK
+   - If perception gap: next_step: EXECUTE_VERIFY
    - If all criteria satisfied: next_step: EXIT
-   - If blocked: write escalation, next_step depends on severity.
+   - If blocked by cross-cutting work: file proposal via
+     clou_propose_milestone; next_step is typically EXIT.
+   - If blocked by true in-milestone failure: file escalation;
+     next_step depends on severity.
 8. Call clou_update_status with verification progress.
 </procedure>
 

@@ -208,6 +208,143 @@ def test_no_working_tree_state_when_clean(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# M36 I1 — ORIENT cycle prompt (observation-first prefix)
+# ---------------------------------------------------------------------------
+
+
+def test_orient_prompt_loads_protocol_file(tmp_path: Path) -> None:
+    """ORIENT cycle prompt points at coordinator-orient.md and the content
+    comes from the bundled protocol file shape."""
+    result = build_cycle_prompt(
+        project_dir=tmp_path,
+        milestone="m01",
+        cycle_type="ORIENT",
+        read_set=[
+            "intents.md", "status.md", "active/git-diff-stat.txt",
+        ],
+        cycle_num=1,
+    )
+    # Protocol file path in prompt points at the bundled ORIENT file.
+    expected_protocol = str(_BUNDLED_PROMPTS / "coordinator-orient.md")
+    assert expected_protocol in result
+    # And the file actually exists (the plumbing ships the prompt).
+    assert (_BUNDLED_PROMPTS / "coordinator-orient.md").exists()
+
+
+def test_orient_protocol_file_has_cycle_wrapper() -> None:
+    """coordinator-orient.md follows the <cycle type="ORIENT"> shape."""
+    text = (_BUNDLED_PROMPTS / "coordinator-orient.md").read_text()
+    assert '<cycle type="ORIENT">' in text
+    assert "</cycle>" in text
+    assert "<objective>" in text
+    assert "<procedure>" in text
+    # The procedure must reference the MCP judgment-writer tool.
+    assert "clou_write_judgment" in text
+
+
+def test_orient_prompt_write_paths_contain_judgment_file(
+    tmp_path: Path,
+) -> None:
+    """ORIENT write_paths names the cycle-specific judgment file."""
+    result = build_cycle_prompt(
+        project_dir=tmp_path,
+        milestone="m01",
+        cycle_type="ORIENT",
+        read_set=["intents.md"],
+        cycle_num=3,
+    )
+    # Cycle-03 judgment path (zero-padded two digits) under the milestone.
+    assert ".clou/milestones/m01/judgments/cycle-03-judgment.md" in result
+
+
+def test_orient_prompt_write_paths_pad_cycle_number(tmp_path: Path) -> None:
+    """Cycle numbers less than 10 are zero-padded (cycle-01, cycle-09)."""
+    for n in (1, 7, 9):
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m01",
+            cycle_type="ORIENT",
+            read_set=["intents.md"],
+            cycle_num=n,
+        )
+        assert f"judgments/cycle-{n:02d}-judgment.md" in result
+
+
+def test_orient_prompt_write_paths_exclude_checkpoint_and_status(
+    tmp_path: Path,
+) -> None:
+    """ORIENT does not write the checkpoint or status.md; those paths
+    must be absent from the write_paths list so the permission model
+    stays honest."""
+    result = build_cycle_prompt(
+        project_dir=tmp_path,
+        milestone="m01",
+        cycle_type="ORIENT",
+        read_set=["intents.md"],
+        cycle_num=1,
+    )
+    # The "Write your state to these exact paths:" section must not list
+    # the checkpoint file or status.md for ORIENT.
+    write_section = result.split(
+        "Write your state to these exact paths:", 1
+    )[1].split("Execute the")[0]
+    assert "active/coordinator.md" not in write_section
+    assert "status.md  (progress journal)" not in write_section
+    # Judgment file is the only write path.
+    assert "judgments/cycle-01-judgment.md" in write_section
+
+
+def test_orient_prompt_references_mcp_writer(tmp_path: Path) -> None:
+    """ORIENT write path line names the MCP writer tool so the
+    coordinator cannot miss the routing."""
+    result = build_cycle_prompt(
+        project_dir=tmp_path,
+        milestone="m01",
+        cycle_type="ORIENT",
+        read_set=["intents.md"],
+        cycle_num=2,
+    )
+    assert "clou_write_judgment" in result
+
+
+def test_orient_prompt_read_set_formatting(tmp_path: Path) -> None:
+    """Read-set file listing uses the same milestone-prefix shape as the
+    other cycle types — no special-casing ORIENT's read-set rendering."""
+    result = build_cycle_prompt(
+        project_dir=tmp_path,
+        milestone="m01",
+        cycle_type="ORIENT",
+        read_set=[
+            "intents.md",
+            "status.md",
+            "phases/p1/execution.md",
+            "active/git-diff-stat.txt",
+        ],
+        cycle_num=1,
+    )
+    assert "- .clou/milestones/m01/intents.md" in result
+    assert "- .clou/milestones/m01/status.md" in result
+    assert "- .clou/milestones/m01/phases/p1/execution.md" in result
+    assert "- .clou/milestones/m01/active/git-diff-stat.txt" in result
+
+
+def test_orient_prompt_fallback_template_when_no_cycle_num(
+    tmp_path: Path,
+) -> None:
+    """Without cycle_num, the write-path shape still mentions
+    judgments/cycle-XX-judgment.md (template form) so readers know the
+    destination filename shape. The MCP tool formats the real path
+    from its own cycle argument at write time."""
+    result = build_cycle_prompt(
+        project_dir=tmp_path,
+        milestone="m01",
+        cycle_type="ORIENT",
+        read_set=["intents.md"],
+    )
+    assert "judgments/cycle-" in result
+
+
+# ---------------------------------------------------------------------------
 # _compute_layers -- topological layer grouping
 # ---------------------------------------------------------------------------
 
@@ -599,3 +736,287 @@ class TestCanonicalExecutionPaths:
         )
         assert "execution-build-a.md" in result
         assert "execution-build-b.md" in result
+
+
+# ---------------------------------------------------------------------------
+# Zero-escalations routing: prompt content assertions (F1/F2).
+#
+# These tests protect against silent regressions of the routing rule:
+# a future edit that removes `clou_propose_milestone` references from
+# prompts, or re-introduces "write escalation" as the default for
+# architectural findings, would break one of these assertions.  They
+# are golden-file assertions that codify the routing contract in the
+# test suite so it survives prompt edits by reviewers who miss the
+# policy context.  Per the brutalist C3-review 3-of-3 finding: without
+# content assertions, the proposal infrastructure depends entirely on
+# prompt text that any edit could silently revert.
+# ---------------------------------------------------------------------------
+
+
+class TestZeroEscalationsRouting:
+    """Prompts route architectural findings to proposals by default."""
+
+    def _read_bundled(self, name: str) -> str:
+        return (_BUNDLED_PROMPTS / name).read_text()
+
+    def test_coordinator_system_invariant_names_propose_tool(self) -> None:
+        """The coordinator-system.xml invariants must reference
+        clou_propose_milestone so the coordinator's identity/role
+        prompt (always loaded) carries the routing rule.
+        """
+        text = self._read_bundled("coordinator-system.xml")
+        assert "clou_propose_milestone" in text
+        assert "Escalations are rare" in text
+
+    def test_coordinator_assess_advertises_proposal_default(self) -> None:
+        text = self._read_bundled("coordinator-assess.md")
+        # The routing-rule block must be present.
+        assert "clou_propose_milestone" in text
+        assert "clou_file_escalation" in text
+        # Architectural default is proposal, not escalation.
+        assert "Propose follow-up milestone" in text
+
+    def test_coordinator_assess_has_no_unqualified_write_escalation(
+        self,
+    ) -> None:
+        """The classification table must not advertise "Write escalation"
+        as the architectural action without qualification.  The rule
+        requires coordinators to choose propose vs escalate, not default
+        to escalate.
+        """
+        text = self._read_bundled("coordinator-assess.md")
+        # The specific legacy phrasing we replaced.
+        assert "| architectural  | Write escalation" not in text
+
+    def test_coordinator_verify_has_proposal_routing(self) -> None:
+        """VERIFY cycle also routes cross-cutting findings to proposals
+        (brutalist flagged this file was missed in the first sweep).
+        """
+        text = self._read_bundled("coordinator-verify.md")
+        assert "clou_propose_milestone" in text
+
+    def test_assess_evaluator_has_proposal_routing(self) -> None:
+        text = self._read_bundled("assess-evaluator.md")
+        assert "clou_propose_milestone" in text
+        assert "Propose follow-up milestone" in text
+
+    def test_supervisor_reads_proposals_on_startup(self) -> None:
+        """Consumer-starvation closure: supervisor prompt must tell
+        the supervisor to call clou_list_proposals.  Without this,
+        proposals accumulate unread.
+        """
+        text = self._read_bundled("supervisor.md")
+        assert "clou_list_proposals" in text
+        # And one of the disposition paths names the disposition tool.
+        assert "clou_dispose_proposal" in text
+
+    def test_file_escalation_tool_description_discourages_architectural(
+        self,
+    ) -> None:
+        """The clou_file_escalation tool description must point
+        architectural findings at clou_propose_milestone; otherwise
+        the LLM picks the escalation tool because its schema still
+        looks architectural.
+        """
+        # We inspect the tool list built for the coordinator.  A unit
+        # test covers the full schema in test_coordinator_tools.py;
+        # here we just assert the text advertises the routing rule.
+        import pytest
+        pytest.importorskip("claude_agent_sdk")
+        from clou.coordinator_tools import _build_coordinator_tools
+
+        tools = _build_coordinator_tools(Path("/tmp"), "ms")
+        file_esc = next(
+            t for t in tools if getattr(t, "name", "") == "clou_file_escalation"
+        )
+        description = getattr(file_esc, "description", "") or ""
+        # The description should name the proposal tool as the
+        # architectural route, and mark escalations as fallback.
+        assert "clou_propose_milestone" in description
+        assert "in-milestone" in description.lower()
+
+    def test_project_local_coordinator_assess_matches_bundled_routing(
+        self, tmp_path: Path,
+    ) -> None:
+        """Split-brain guard: the project-local .clou/prompts/ mirror
+        (the file coordinators actually read at runtime via the
+        cycle-prompt pointer) must carry the same proposal routing
+        as the bundled version.  Without this, coordinators read
+        stale protocol while orchestrator loads the new one.
+        """
+        # This is CLOU's own project; check in-tree not tmp_path.
+        project_local = Path(__file__).resolve().parents[1] / ".clou" / "prompts" / "coordinator-assess.md"
+        if not project_local.exists():
+            pytest.skip("no project-local .clou/prompts/ in this checkout")
+        text = project_local.read_text()
+        assert "clou_propose_milestone" in text, (
+            f"project-local coordinator-assess.md missing propose tool "
+            f"reference at {project_local}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# M50 I1: vocabulary canonicalization in prompt copy
+# ---------------------------------------------------------------------------
+
+
+class TestPromptCopyUsesStructuredCycleTokens:
+    """The bundled prompt copy displays structured cycle-type tokens.
+
+    M50 I1: ``EXECUTE (rework)`` / ``EXECUTE (additional verification)``
+    were renamed to ``EXECUTE_REWORK`` / ``EXECUTE_VERIFY``.  The
+    routing-copy bullets in coordinator-assess.md and
+    coordinator-verify.md must show the structured tokens verbatim
+    (these are the strings the LLM types into the checkpoint and
+    that ``parse_checkpoint`` then validates).
+
+    The legacy punctuated forms are tolerated only in two places:
+    (a) the ``_LEGACY_NEXT_STEPS`` mapping data in
+    ``recovery_checkpoint.py`` and the migration helper itself, and
+    (b) inline documentation in coordinator-orient.md that explains
+    the rename.  Neither of those is a routing-copy surface.
+    """
+
+    @pytest.mark.parametrize("filename", [
+        "coordinator-assess.md",
+        "coordinator-verify.md",
+    ])
+    def test_routing_prompt_displays_structured_rework_token(
+        self, filename: str,
+    ) -> None:
+        """Routing copy in ASSESS / VERIFY uses ``EXECUTE_REWORK``."""
+        text = (_BUNDLED_PROMPTS / filename).read_text()
+        assert "EXECUTE_REWORK" in text, (
+            f"{filename} should display the structured "
+            f"EXECUTE_REWORK token in its routing copy"
+        )
+
+    def test_verify_routing_prompt_displays_structured_verify_token(
+        self,
+    ) -> None:
+        """coordinator-verify.md uses ``EXECUTE_VERIFY`` (additional pass)."""
+        text = (_BUNDLED_PROMPTS / "coordinator-verify.md").read_text()
+        assert "EXECUTE_VERIFY" in text
+
+    @pytest.mark.parametrize("filename", [
+        "coordinator-assess.md",
+        "coordinator-verify.md",
+    ])
+    def test_routing_prompt_does_not_use_legacy_punctuated_token(
+        self, filename: str,
+    ) -> None:
+        """Routing copy never instructs the LLM to type the legacy form."""
+        text = (_BUNDLED_PROMPTS / filename).read_text()
+        assert "EXECUTE (rework)" not in text, (
+            f"{filename} contains the legacy punctuated token; "
+            f"the routing copy must use EXECUTE_REWORK"
+        )
+        assert "EXECUTE (additional verification)" not in text, (
+            f"{filename} contains the legacy punctuated token; "
+            f"the routing copy must use EXECUTE_VERIFY"
+        )
+
+    def test_orient_prompt_documents_legacy_rejection(self) -> None:
+        """coordinator-orient.md retains a doc note that the legacy
+        punctuated forms are rejected at parse time.
+
+        This is the ONE intentional reference to the legacy tokens
+        in the bundled prompts -- it informs the coordinator LLM why
+        the validator will refuse a paraphrased checkpoint write.
+        """
+        text = (_BUNDLED_PROMPTS / "coordinator-orient.md").read_text()
+        assert "EXECUTE_REWORK" in text
+        assert "EXECUTE_VERIFY" in text
+        assert "rejected" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Structural existence: every dispatchable cycle-type has a resolvable
+# protocol file.  M50 I1 cycle-4 rework (F5):
+# ``build_cycle_prompt`` derives ``coordinator-{cycle_type.lower()}.md``
+# for non-EXECUTE-family cycles.  When cycle-2/3 preserved the
+# structured EXECUTE tokens (``EXECUTE_REWORK`` / ``EXECUTE_VERIFY``)
+# through ``determine_next_cycle``, the naive lower-casing produced
+# ``coordinator-execute_rework.md`` and ``coordinator-execute_verify.md``
+# — filenames that do NOT exist under ``clou/_prompts/``.  The fix
+# routes every EXECUTE-family token through the ``execute`` protocol
+# stem via ``is_execute_family``.  This test pins the runtime contract
+# that every dispatchable cycle type resolves to a real prompt file on
+# disk, so the class of defect cannot return by reintroducing a new
+# structured token without a matching routing rule.
+# ---------------------------------------------------------------------------
+
+
+class TestEveryDispatchableCycleHasProtocolFile:
+    """For every dispatchable cycle-type token in
+    :data:`recovery_checkpoint._VALID_NEXT_STEPS`, the protocol-file
+    path that :func:`build_cycle_prompt` embeds in the cycle prompt
+    must point to an existing file under ``clou/_prompts/``.
+
+    ``COMPLETE`` and ``HALTED`` are not dispatchable — they signal
+    milestone termination / engine halt, so the orchestrator does not
+    build a cycle prompt for them.  Every other token in the set
+    triggers a ``build_cycle_prompt`` call at runtime.
+    """
+
+    def test_every_dispatchable_cycle_type_resolves_to_existing_protocol_file(
+        self, tmp_path: Path,
+    ) -> None:
+        from clou.recovery_checkpoint import _VALID_NEXT_STEPS
+
+        # Terminal / engine-halt tokens do not dispatch a cycle, so
+        # ``build_cycle_prompt`` is never invoked for them.
+        dispatchable = _VALID_NEXT_STEPS - {"COMPLETE", "HALTED"}
+
+        missing: list[tuple[str, str]] = []
+        for token in sorted(dispatchable):
+            prompt_text = build_cycle_prompt(
+                project_dir=tmp_path,
+                milestone="m-probe",
+                cycle_type=token,
+                read_set=[],
+            )
+            # Extract the protocol-file path the prompt tells the
+            # coordinator to read.  It is a single ``- /abs/path`` line
+            # under the "Read your protocol file first:" header.
+            marker = "Read your protocol file first:\n- "
+            assert marker in prompt_text, (
+                f"build_cycle_prompt({token!r}) did not emit the "
+                f"expected protocol-file marker; prompt shape changed"
+            )
+            after = prompt_text.split(marker, 1)[1]
+            path_str = after.split("\n", 1)[0].strip()
+            protocol_path = Path(path_str)
+            if not protocol_path.exists():
+                missing.append((token, path_str))
+
+        assert not missing, (
+            "Every dispatchable cycle-type token must resolve to an "
+            "existing bundled protocol file.  Missing:\n"
+            + "\n".join(f"  - {t} -> {p}" for t, p in missing)
+        )
+
+    @pytest.mark.parametrize(
+        "cycle_type",
+        ["EXECUTE", "EXECUTE_REWORK", "EXECUTE_VERIFY"],
+    )
+    def test_execute_family_tokens_route_to_execute_protocol_stem(
+        self, cycle_type: str, tmp_path: Path,
+    ) -> None:
+        """All EXECUTE-family tokens share ``coordinator-execute.md``.
+
+        The three tokens carry distinct telemetry/dispatch semantics
+        (plain execute, post-ASSESS rework, post-VERIFY additional
+        pass) but they all run the same EXECUTE protocol — only the
+        discriminator differs.  Regression guard against a future
+        change that reintroduces ``coordinator-execute_rework.md``.
+        """
+        result = build_cycle_prompt(
+            project_dir=tmp_path,
+            milestone="m-probe",
+            cycle_type=cycle_type,
+            read_set=[],
+        )
+        assert "coordinator-execute.md" in result
+        assert "coordinator-execute_rework.md" not in result
+        assert "coordinator-execute_verify.md" not in result

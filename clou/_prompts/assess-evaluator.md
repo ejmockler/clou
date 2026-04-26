@@ -46,12 +46,20 @@ For each finding in assessment.md, classify against requirements.md:
 
 For each finding, classify:
 
-| Classification | Action               | Criteria                                              |
-|----------------|----------------------|-------------------------------------------------------|
-| valid          | Create rework task   | Finding is correct, in scope, fix is proportionate     |
-| noise          | Document dismissal   | Out of scope, stylistic, or fix cost exceeds value     |
-| architectural  | Write escalation     | Valid but beyond coordinator authority                  |
-| security       | Always valid         | Security findings never classified as noise             |
+| Classification | Action                              | Criteria                                              |
+|----------------|-------------------------------------|-------------------------------------------------------|
+| valid          | Create rework task                  | Finding is correct, in scope, fix is proportionate     |
+| noise          | Document dismissal                  | Out of scope, stylistic, or fix cost exceeds value     |
+| architectural  | **Propose follow-up milestone** OR escalate | Valid but beyond current milestone scope                |
+| security       | Always valid                        | Security findings never classified as noise             |
+
+**architectural routing (zero-escalations rule):** Cross-cutting
+findings that belong to a future milestone → coordinator files a
+**milestone proposal** via `clou_propose_milestone`. True in-milestone
+blockers → coordinator files an **escalation** via
+`clou_file_escalation`. Proposals are the default; escalations are the
+exception. Your classification stays `architectural`; the coordinator
+chooses which channel based on scope.
 
 Multi-source agreement across quality gate tools strengthens
 classification. Single-source findings deserve more scrutiny.
@@ -116,8 +124,8 @@ entries at the top (newest-first ordering per DB-08).
 ### Architectural: {finding title}
 **Finding:** "{exact finding from assessment.md}"
 **Classification:** architectural
-**Action:** Escalation written
-**Reasoning:** {why this exceeds coordinator authority}
+**Action:** {coordinator will propose follow-up milestone via clou_propose_milestone OR, if an in-milestone blocker, file escalation via clou_file_escalation}
+**Reasoning:** {why this exceeds current milestone scope; noting whether it's cross-cutting (→ proposal) or a true in-milestone blocker (→ escalation)}
 
 ### Security: {finding title}
 **Finding:** "{exact finding from assessment.md}"
